@@ -1,0 +1,58 @@
+# MCP protocol and client setup
+
+The local stdio adapter uses the official [Swift MCP SDK 0.12.1](https://github.com/modelcontextprotocol/swift-sdk/tree/0.12.1) without modifying its initialization state. Its declared specification support is a dependency claim; interoperability qualification applies only to the profiles and composition below. The service protocol version in `AgentValues` is independent of MCP negotiation.
+
+## Protocol profiles and lifecycle
+
+The bounded adapter accepts `2025-11-25` and the limited `2025-06-18` profile. The actual Swift SDK client exercises November; the separately qualified local host requests June. Both exercise the same twelve tools against the Debug synthetic engine. June acceptance covers discovery, reads, keyed synchronization and receive allocation/replay, preparation/cancellation, one uncertain submission and retained-key recovery. It requires explicit host approval for those synthetic tools and sequential observation of asynchronous operations; initialization or discovery alone is insufficient. SDK support for `2025-03-26` or `2024-11-05` does not qualify those profiles: they and unknown versions receive a fixed unsupported-profile `-32602` error with supported versions and the connection closes. No requested or returned version is rewritten. The SDK's own initializer performs successful negotiation and establishes its internal state.
+
+The [MCP lifecycle](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle) requires initialization first and `notifications/initialized` after the response. The gateway enforces that sequence before tool dispatch; pings are allowed during initialization. It advertises only tools and never requests sampling, roots or elicitation. Implementation names and capability metadata have no identity or wallet authority.
+
+A narrow compatibility rule ignores a nonempty optional `initialize.params.capabilities.experimental` map when every value is an object, reproducing an unsupported SDK decoding shape. String-valued experimental maps pass unchanged; mixed or malformed maps fail. Known roots, sampling and elicitation fields stay strict. The repair cannot alter business arguments, versions, grants, approval or known capabilities. Unknown optional capability metadata is informational and unused. Standard object-valued `_meta` is accepted on initialization, initialized notification, ping, tool listing, tool calls and cancellation; it is ignored as authority. The twelve-tool discovery catalog is one page and never issues or accepts a continuation cursor. Malformed metadata and additional wallet-command fields still fail.
+
+[Stdio transport](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports) is UTF-8 newline-delimited JSON-RPC, with protocol messages only on stdout. Diagnostics use fixed stderr messages. The adapter bounds each input frame to 65,536 bytes before accumulating more stdin, each output frame to 262,144 bytes, input queues and outstanding requests to sixteen. MCP requires session-unique request IDs; the bounded session retains up to 4,096 IDs, then requires reconnect. Response handoff finishes before the next input frame is admitted. Tool projections are budgeted before text serialization; complete SDK output is checked again before writing. One writer serializes frames with a five-second write deadline. Oversized, incomplete final or over-capacity frames close the connection. EOF stops the server and cancels/joins adapter-owned tool work; no helper process is spawned by the adapter.
+
+`notifications/cancelled` cancels local request waiting through the SDK. It does not revoke a grant, cancel a durable wallet operation or prove an effect was absent. A cancelled request may have no response; its bounded transport slot is retained until reconnect if no response arrives. Reconnect and recover by the retained operation key. Invalid or unknown notifications produce no response. JSON-RPC parse/request/method/parameter errors use fixed messages, with no reflected payload or internal error description.
+
+## Tool values and errors
+
+All unknown wallet fields, including nested selectors and claimed authorization fields, fail before service dispatch. Networks are explicit `mainnet`, `testnet` or `chipnet`. IDs are opaque strings; they never confer authority. Pages have limits from one to forty and optional service-issued cursors. The bridge performs no address normalization or signing; the service uses Base to validate the address/network and bind the normalized BCH payment.
+
+Amounts and fee rates at the MCP boundary are exact canonical decimal integer strings. For example, `"amountSatoshis":"10000"` is valid; `10000`, `"1.0"`, `"1e4"`, whitespace, signs, leading zeros and overflow are invalid. Amounts follow the public service BCH supply bound; fee rate is positive Int64. Returned satoshi values are strings, including signed transaction deltas when known. UInt64 sequence, generation, revision and attempt/admission counters are also decimal strings; the adapter never routes them through Double. Bounded indexes, page limits, heights and exact Int64 timestamps use JSON integers. Unknown observed values remain null.
+
+Successful results contain the same safe JSON envelope in `structuredContent` and one text fallback: `{"ok":true,"method":"get_balance","result":{...}}`. Service failures return `isError:true` and `{"ok":false,"error":{"code":"unavailable"}}` using the fixed public error-code vocabulary. Unknown tools fail without service effects. No result contains a canonical journal row, signing plan, immutable transaction bytes, seed, credential or arbitrary error description. UTXO reservations disclose an operation ID only when the service permits origin visibility.
+
+| Tool | Arguments | Safe result |
+| --- | --- | --- |
+| `list_wallets` | `{limit?,cursor?}` | Authorized wallet page |
+| `list_accounts` | `{wallet,page}` | Authorized account page |
+| `get_balance` | Account scope | Retained exact balance, observation and readiness |
+| `list_transactions` | `{account,page}` | Retained transaction page and observation |
+| `list_utxos` | `{account,page}` | Retained UTXO page and scoped reservations |
+| `get_sync_status` | Account scope | Cached observation and separate readiness |
+| `synchronize_account` | `{account,requestKey}` | Keyed synchronization operation |
+| `create_receive_request` | `{account,requestKey}` | Keyed receive operation/allocation |
+| `prepare_payment` | `{account,requestKey,destinationAddress,amountSatoshis,feeRateSatoshisPerByte?,expiresAt?}` | Immutable safe payment preview/state |
+| `submit_payment` | Operation selector | Current payment state, liability and admissions |
+| `get_operation` | `{operation:<selector>}` or `{account,effect,requestKey}` | Effect kind and authorized retained operation |
+| `cancel_operation` | Operation selector | Current operation; only provably unsubmitted work can close |
+
+A wallet scope is `{walletID,network}`; an account scope is `{wallet:<scope>,accountID}`; an operation selector is `{account:<scope>,operationID}`. A page is `{limit?,cursor?}`, including `{}` for the default. Effect strings are `synchronizeAccount`, `createReceiveRequest` and `preparePayment` as declared by `EffectKind`. Discovery schemas are the machine-readable shape reference.
+
+A client must durably retain a new 32-character lowercase hexadecimal request key before sending an effect. Retrying the same retained key/payload recovers one operation; a conflicting payload fails. After a lost reply, reconnect, authenticate and call `get_operation` with the original account/effect/key before deciding anything else. A new key creates a new intention and may legitimately pay the same recipient/amount again. Rotation preserves the integration namespace under current service authorization; reenrollment and incomplete restoration do not manufacture forgotten request identities or grant access to another principal's history.
+
+## Local client configuration and authority
+
+A stdio client launches the installed `AgentBridge` executable and connects its stdin/stdout. The eventual host configuration must select the exact installed executable, avoid shell interpolation, keep diagnostics separate and inject only its owner-issued credential. The host owns confidential credential storage and explicit delivery; a supplied grant ID cannot fetch another integration's secret. Do not place a bearer credential in arguments, checked-in configuration or logs. Arbitrary processes under the same macOS user are not strongly isolated; a stolen credential used through an accepted bridge remains a threat.
+
+The current shipping entry offers protocol discovery with an unavailable capability client. It has no accepted production deployment/custody provider and does not read a credential to start a partial live runtime. Native connection construction separately requires trusted signed-artifact/prerequisite configuration, pins the exact service requirement, checks same-user kernel evidence, then proves credential possession. Service-side policy binds the integration session to the physical connection, grant/credential generation, wallet and allowed accounts/scopes. Owner controls use a separate native interface and fresh trusted Wallet consent for effects; the separate owner API includes account discovery and bounded payment activity, but there is no MCP owner discovery, approval, enrollment or recovery tool. See [Deployment](Deployment.md#reciprocal-peer-verification) for signed-runtime prerequisites.
+
+An autonomous grant authorizes its named accounts, including later deposits, until expiry or revocation. Approval-required wallets remain a service policy option. Tool metadata, process launch, closing a host, transport cancellation and local previews never grant approval or revoke funds already relayed.
+
+## Development fixture and proof limits
+
+`AgentProtocolFixture` is an explicit nonshipping Debug executable. It requires `--state-directory <new-absolute-temporary-directory>` and `--scenario <autonomous|approval-required|missing-snapshot|uncertain>`. It rejects an existing directory; it never opens existing wallet state. Optional `--trace-file` must name a newly created file directly inside that directory. Traces contain fixed method/status/effect-count summaries only. The Release entry reports unavailable; distribution must exclude this product and `StoreLockProbe`.
+
+The fixture uses actual SQLite, the durable service engine and public Base account/transaction adapters. Its published disposable seed, wrapping key source, continuity anchor, authenticated peers, public chain and relay are injected synthetic facts. It starts without a retained snapshot; synchronization is an explicit keyed effect. Tests may use a separate in-process owner client for review and consent; the stdio channel exposes only the twelve integration tools. Accepted or uncertain fixture relay outcomes do not move network funds.
+
+Wire qualification and source tests do not prove evaluated XPC signatures, service installation, first-unlock/locked-screen Keychain behavior, live chain completeness, real human authentication or end-to-end Wallet deployment. No production autonomy or funding readiness follows. The [deployment proof matrix](Deployment.md#proof-matrix-and-release-gate) remains authoritative for those pending gates.

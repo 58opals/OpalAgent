@@ -142,8 +142,10 @@ struct CanonicalState: Codable, Equatable, Sendable {
             payments[index].disposition = .invalidated
             payments[index].terminalReason = "authorizationInvalidated"
         }
-        for index in requests.indices where requests[index].paymentID.map(affected.contains) == true &&
-            requests[index].disposition == .unsubmitted {
+        for index in requests.indices where requests[index].disposition == .unsubmitted &&
+            (requests[index].paymentID.map(affected.contains) == true ||
+             (requests[index].originGrantID == grantID &&
+              ["create_receive_request", "synchronize_account"].contains(requests[index].method))) {
             requests[index].disposition = .invalidated
         }
         for index in approvals.indices where affected.contains(approvals[index].paymentID) {
@@ -244,6 +246,7 @@ struct CanonicalState: Codable, Equatable, Sendable {
             }
         }
         guard paymentPolicy.revision > 0 else { throw ContinuityError.invalidState }
+        try validateAccountOperationRecords(self)
         for payment in payments {
             if payment.request != nil {
                 let numbers = payment.attempts.map(\.number).sorted()
@@ -833,6 +836,8 @@ private func validateRetention(from old: CanonicalState, to new: CanonicalState,
                   $0.method == request.method && $0.key == request.key && $0.paymentID == request.paymentID && $0.binding == request.binding &&
                   $0.formatVersion == request.formatVersion && $0.ownerGeneration == request.ownerGeneration &&
                   $0.originGrantID == request.originGrantID && (!request.tombstone || $0.tombstone) &&
+                  (request.formatVersion != 2 || !["create_receive_request", "synchronize_account"].contains(request.method) ||
+                    request.disposition == .unsubmitted || ($0.disposition == request.disposition && $0.result == request.result)) &&
                   (request.consumedAttemptID == nil || $0.consumedAttemptID == request.consumedAttemptID) }
           }),
           old.payments.allSatisfy({ payment in

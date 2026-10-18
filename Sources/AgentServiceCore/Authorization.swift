@@ -57,6 +57,12 @@ struct OwnerAuthenticationEvidence: Sendable {
     let peer: PeerEvidence
     let authenticationSucceeded: Bool
     let authenticatedAt: Int64
+    let authorizationCheck: @Sendable () throws -> Void
+    init(peer: PeerEvidence, authenticationSucceeded: Bool, authenticatedAt: Int64,
+         authorizationCheck: @escaping @Sendable () throws -> Void = {}) {
+        self.peer = peer; self.authenticationSucceeded = authenticationSucceeded
+        self.authenticatedAt = authenticatedAt; self.authorizationCheck = authorizationCheck
+    }
 }
 
 struct IntegrationPrincipal: Codable, Equatable, Sendable {
@@ -116,6 +122,7 @@ struct AuthorizationAuthority: Sendable {
     }
 
     func requireOwner(owner: OwnerAuthenticationEvidence, now: Int64) throws {
+        try owner.authorizationCheck()
         try requirePeer(owner.peer, identity: trustedOwnerIdentity)
         let age = now.subtractingReportingOverflow(owner.authenticatedAt)
         guard owner.authenticationSucceeded,

@@ -123,6 +123,30 @@ struct PaymentSnapshot: Codable, Equatable, Sendable {
     var blocker: String?
     var ownerReceipt: RequestRecord? = nil
     var liabilityContextDigest: Data = Data()
+    var walletID: String = ""
+    var currentWalletGeneration: UInt64 = 0
+    var currentPolicyRevision: UInt64 = 0
+    var previewContextDigest: Data = Data()
+}
+
+private struct PreviewReviewBinding: Codable {
+    var walletID: String
+    var generation: UInt64
+    var policyRevision: UInt64
+    var originGrantID: String?
+    var originCredentialGeneration: UInt64
+    var request: PaymentRequest?
+    var preview: PaymentPreview
+}
+
+func paymentPreviewContextDigest(_ payment: PaymentRecord, state: CanonicalState) -> Data {
+    guard let preview = payment.preview else { return Data() }
+    let binding = PreviewReviewBinding(walletID: state.authorization.walletID,
+        generation: state.authorization.generation, policyRevision: state.paymentPolicy.revision,
+        originGrantID: payment.originGrantID, originCredentialGeneration: payment.originCredentialGeneration,
+        request: payment.request, preview: preview)
+    guard let encoded = try? paymentEncoding(binding) else { return Data() }
+    return paymentDigest(encoded)
 }
 
 enum PaymentFailure: Error, Equatable, Sendable {

@@ -1241,3 +1241,38 @@ func ambiguousCommittedPromotionBlocksTrustedReadsAndHandoff(phase: PaymentPromo
         #expect(f.boundary.sentPayments.count == 1)
     }
 }
+
+@Test func cancellationReturnsUnderCancelScopeWithoutRead() async throws {
+    let f = try paymentFixture(); defer { try? FileManager.default.removeItem(at: f.directory) }
+    try f.continuity.transaction { state in
+        state.authorization.grants[0].capabilities = ["prepare", "cancel"]
+    }
+    let id = try await f.prepare()
+    let result = try await f.engine.cancel(operationID: id, session: f.session,
+        connectionID: "connection", peer: f.peer)
+    #expect(result.payment.terminalReason == "cancelled")
+    await #expect(throws: PaymentFailure.unavailable) {
+        try await f.engine.get(operationID: id, session: f.session, connectionID: "connection", peer: f.peer)
+    }
+    #expect(f.boundary.sentPayments.isEmpty)
+}
+
+@Test func exactPreviewDigestIsComparedInsideApprovalAndRejectionTransactions() async throws {
+    let f = try paymentFixture(approvalRequired: true)
+    defer { try? FileManager.default.removeItem(at: f.directory) }
+    let id = try await f.prepare()
+    _ = try await f.engine.submit(operationID: id, session: f.session, connectionID: "connection", peer: f.peer)
+    let review = try await f.engine.ownerStatus(operationID: id, owner: f.owner)
+    #expect(review.previewContextDigest.count == 32)
+    await #expect(throws: PaymentFailure.staleContext) {
+        try await f.engine.reject(operationID: id, owner: f.owner,
+            expectedPreviewContextDigest: Data(repeating: 0xAB, count: 32))
+    }
+    #expect(try f.state().payments.first?.disposition == .pendingApproval)
+    try await f.engine.changePolicy(approvalRequired: false, owner: f.owner)
+    await #expect(throws: PaymentFailure.staleContext) {
+        try await f.engine.approve(operationID: id, owner: f.owner,
+            expectedPreviewContextDigest: review.previewContextDigest)
+    }
+    #expect(f.boundary.sentPayments.isEmpty)
+}

@@ -64,7 +64,8 @@ final class ServiceAuthority: Sendable {
             // Unknown, foreign and unauthorized results have the same unavailable shape.
             do {
                 guard let request = state.requests.first(where: { $0.id == requestID }),
-                      request.principalID == session.principal.grantID,
+                      request.principalID == session.principal.integrationID,
+                      request.originGrantID == session.principal.grantID,
                       let paymentID = request.paymentID,
                       let payment = state.payments.first(where: { $0.id == paymentID }),
                       payment.originGrantID == session.principal.grantID else {

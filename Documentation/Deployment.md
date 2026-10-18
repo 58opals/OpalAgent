@@ -1,6 +1,6 @@
 # Proposed deployment dossier
 
-Status: proposed macOS 27 distribution and custody design, with an internal source/synthetic durable BCH engine. No launch-agent property list, entitlement file, provisioning profile, installer or production adapter is delivered by the package. Neither shipping executable registers, installs, opens live Keychain/storage or starts a wallet runtime. No signed-service or distribution proof is claimed.
+Status: proposed macOS 27 distribution and custody design, with an internal source/synthetic durable BCH engine. Native adapter source is present; no launch-agent property list, entitlement file, provisioning profile, installer or qualified production composition is delivered by the package. Neither shipping executable registers, installs, opens live Keychain/storage or starts a wallet runtime. No signed-service or distribution proof is claimed.
 
 ## Artifact inventory
 
@@ -108,16 +108,22 @@ The local lock excludes writers of one local store only. No cross-device clone f
 
 | Claim | Source / synthetic qualification | Signed runtime qualification | Distribution qualification |
 | --- | --- | --- | --- |
-| Module isolation and fail-closed entry points | Manifest/import review, external-scratch build and deterministic tests | Inspect final linked artifacts | Confirm only shipping artifacts are embedded; exclude probe/tests. |
-| Principal/scope/session decisions | Injected peer and credential cases | Real reciprocal XPC identity rejection, owner authentication and connection binding | Exact designated requirements, certificate/Team provenance and compatibility. |
+| Module isolation and fail-closed entry points | Manifest/import/link review, external-scratch build and deterministic tests; development fixture excluded | Inspect final linked artifacts | Confirm only shipping artifacts are embedded; exclude probe/tests. |
+| Principal/scope/session decisions | Injected peer/credential, strict native frame and policy cases; compiled XPC requirement setup | Real reciprocal XPC identity rejection, owner authentication and connection binding | Exact designated requirements, certificate/Team provenance and compatibility. |
 | Encrypted seed boundary | Synthetic payload, protection-mode and corruption cases | Service-only Keychain access; denial from Wallet/bridge; first unlock, lock, restart and missing/unavailable key behavior | Evaluated service entitlements and provisioning profile; no personal groups or weak fallback. |
 | Continuity and recovery | Injected complete-state, staging, promotion and recovery-latch failures | Actual Keychain/database crash and ambiguous-write durability; restart recovery | Supported backup, update and migration behavior with retained liabilities. |
 | Single local writer | Competing development-probe processes | Installed helper contention and lifecycle | Launch/update/removal ownership with the same store identity. |
 | Wallet-closed unattended operation | Design only | Logged-in/awake, locked-screen, UI-closed, sleep/wake and logout behavior | Registration approval, installation, update and removal. |
-| Wallet/MCP functionality | Internal BCH/SQLite engine with injected boundaries; shipping entries unavailable | Real owner client, installed engine and MCP interoperability | End-to-end supported release acceptance. |
+| Wallet/MCP functionality | Actual BCH/SQLite fixture, strict MCP adapter and SDK-client wire scenarios; ordinary wallet channel unavailable | Real signed owner/service clients, installed engine and host interoperability through qualified native IPC | End-to-end supported release acceptance. |
 
 Current evidence is source and synthetic only. The matrix's signed-runtime and distribution columns remain pending; a package build or synthetic role cannot satisfy them. Apple documentation supplies prerequisites, not proof of their composition. Distribution qualification requires suitable Developer Program provisioning and remains pending. Do not weaken entitlements, use ad-hoc identity as equivalent proof, switch Keychain backends or add a transport fallback to bypass that gate. The product is not ready for funding or production autonomy.
 
 ## Apple reference basis
 
-Official documentation was retrieved on 2026-10-17; pages are current, unversioned publications rather than immutable SDK snapshots. API-specific metadata reports macOS 13 availability for `SMAppService.agent(plistName:)`, `register()`, `unregister()`, `NSXPCConnection.setCodeSigningRequirement(_:)` and `NSXPCListener.setConnectionCodeSigningRequirement(_:)`; metadata reports macOS 10.15 for `kSecUseDataProtectionKeychain` and `AES.GCM`. The installed macOS 27 SDK headers confirm the cited ServiceManagement and NSXPC declarations. No compiled production-adapter, evaluated signature, live Keychain or installed-service evidence follows from this reference inspection.
+Official documentation was retrieved on 2026-10-17 and the native-connection references rechecked on 2026-10-18; pages are current, unversioned publications rather than immutable SDK snapshots. API-specific metadata reports macOS 13 availability for `SMAppService.agent(plistName:)`, `register()`, `unregister()`, `NSXPCConnection.setCodeSigningRequirement(_:)` and `NSXPCListener.setConnectionCodeSigningRequirement(_:)`; metadata reports macOS 10.15 for `kSecUseDataProtectionKeychain` and `AES.GCM`. The installed macOS 27 SDK headers confirm the cited ServiceManagement and NSXPC declarations. Native adapter source now compiles against the macOS 27 declarations and has synthetic frame/connection-policy coverage. No evaluated signature, live Keychain or installed-service evidence follows from that compilation or reference inspection.
+
+## Source boundary versus native proof
+
+The shared native target and separate client/service endpoints are compileable source boundaries. Exact requirement values must come from the accepted final artifact policy; no Team ID, team-wide wildcard, role flag or fabricated production identity is selected by this package. A required trusted deployment provider must qualify signing, custody and lifecycle prerequisites before connection construction. No production implementation of that provider is supplied. Ordinary callers therefore receive unavailable rather than a socket, plaintext or permissive transport fallback.
+
+Source and synthetic tests can establish strict frame decoding, safe error mapping, no-secret handshake ordering, channel separation and the service's final context checks. They cannot establish that macOS rejects an actual wrong signature, that entitlements permit this composition or that the helper survives UI termination, screen lock or restart. The signed-runtime and distribution matrix remains the release gate. [MCP](MCP.md) separately describes protocol profiles and development fixture limits.

@@ -140,12 +140,17 @@ actor PaymentEngine {
         return snapshot
     }
 
-    func approve(operationID: String, owner: OwnerAuthenticationEvidence) throws -> PaymentSnapshot {
+    func approve(operationID: String, owner: OwnerAuthenticationEvidence,
+                 expectedPreviewContextDigest: Data? = nil) throws -> PaymentSnapshot {
         let now = clock.read().wall
         let snapshot = try command("payment.approve") { state in
             try Self.authority(state, policy: authorityPolicy).requireOwner(owner: owner, now: now)
             let index = try Self.index(operationID, state)
             let payment = state.payments[index]
+            if let expectedPreviewContextDigest {
+                guard expectedPreviewContextDigest == paymentPreviewContextDigest(payment, state: state),
+                      !expectedPreviewContextDigest.isEmpty else { throw PaymentFailure.staleContext }
+            }
             if !payment.disposition.isUnsubmitted,
                state.approvals.contains(where: { $0.paymentID == operationID && !$0.ownerRelay && $0.active &&
                     $0.generation == state.authorization.generation && $0.policyRevision == state.paymentPolicy.revision }) {
@@ -188,14 +193,25 @@ actor PaymentEngine {
             Self.closeUnsubmitted(operationID, reason: "cancelled", state: &state)
         }
         await disposeAndRelease(operationID)
-        return try get(operationID: operationID, session: session, connectionID: connectionID, peer: peer)
+        return try command("payment.cancelDisclosure") { state in
+            do {
+                let payment = try Self.visible(operationID, access: access, state: state,
+                    policy: authorityPolicy, capability: "cancel", now: clock.read().wall)
+                return Self.snapshot(payment, state: state)
+            } catch { throw PaymentFailure.unavailable }
+        }
     }
 
-    func reject(operationID: String, owner: OwnerAuthenticationEvidence) async throws -> PaymentSnapshot {
+    func reject(operationID: String, owner: OwnerAuthenticationEvidence,
+                expectedPreviewContextDigest: Data? = nil) async throws -> PaymentSnapshot {
         let now = clock.read().wall
         _ = try command("payment.cancel") { state in
             try Self.authority(state, policy: authorityPolicy).requireOwner(owner: owner, now: now)
             let index = try Self.index(operationID, state)
+            if let expectedPreviewContextDigest {
+                guard expectedPreviewContextDigest == paymentPreviewContextDigest(state.payments[index], state: state),
+                      !expectedPreviewContextDigest.isEmpty else { throw PaymentFailure.staleContext }
+            }
             if state.payments[index].terminalReason == "rejected" { return }
             guard state.payments[index].disposition.isUnsubmitted else { throw PaymentFailure.invalidTransition }
             Self.closeUnsubmitted(operationID, reason: "rejected", state: &state)
@@ -204,10 +220,14 @@ actor PaymentEngine {
         return try ownerStatus(operationID: operationID, owner: owner)
     }
 
-    func changePolicy(approvalRequired: Bool, owner: OwnerAuthenticationEvidence) async throws {
+    func changePolicy(approvalRequired: Bool, owner: OwnerAuthenticationEvidence,
+                      expectedRevision: UInt64? = nil) async throws {
         let now = clock.read().wall
         let invalidated: [String] = try command("payment.policy") { state in
             try Self.authority(state, policy: authorityPolicy).requireOwner(owner: owner, now: now)
+            if let expectedRevision {
+                guard expectedRevision == state.paymentPolicy.revision else { throw PaymentFailure.staleContext }
+            }
             guard state.paymentPolicy.revision < UInt64.max else { throw PaymentFailure.invalidTransition }
             state.paymentPolicy.revision += 1
             state.paymentPolicy.approvalRequired = approvalRequired
@@ -880,6 +900,9 @@ actor PaymentEngine {
     }
     private static func snapshot(_ payment: PaymentRecord, state: CanonicalState) -> PaymentSnapshot {
         PaymentSnapshot(payment: payment, accountRestricted: isHeld(payment.accountID, state: state), blocker: payment.blocker,
-            liabilityContextDigest: accountLiabilityContextDigest(accountID: payment.accountID, state: state))
+            liabilityContextDigest: accountLiabilityContextDigest(accountID: payment.accountID, state: state),
+            walletID: state.authorization.walletID, currentWalletGeneration: state.authorization.generation,
+            currentPolicyRevision: state.paymentPolicy.revision,
+            previewContextDigest: paymentPreviewContextDigest(payment, state: state))
     }
 }

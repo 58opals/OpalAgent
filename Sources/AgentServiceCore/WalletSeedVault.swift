@@ -114,12 +114,15 @@ struct OwnerWalletControl: Sendable {
 
     /// Public funds discovery is allowed in trusted restricted storage without issuing authority or addresses.
     func discover(accountID: String, network: String, boundary: any AccountChainBoundary,
-                  owner: OwnerAuthenticationEvidence, now: Int64) async throws -> AccountSyncRecord {
+                  owner: OwnerAuthenticationEvidence, now: Int64,
+                  authorizationCheck: @Sendable () throws -> Void = {}) async throws -> AccountSyncRecord {
+        try authorizationCheck()
         try requireOwner(owner, now: now)
         let token = try continuity.transaction(classification: "owner.discoveryBegin") { state in
             try beginAccountRefresh(&state, accountID: accountID, network: network)
         }
         let observed = try await boundary.refresh(accountID: accountID, network: network)
+        try authorizationCheck()
         try requireOwner(owner, now: now)
         return try continuity.transaction(classification: "owner.discoveryComplete") { state in
             try completeAccountRefresh(&state, token: token, observed: observed)
@@ -135,9 +138,12 @@ struct OwnerWalletControl: Sendable {
     }
 
     func createNew(vault: WalletSeedVault, network: String, owner: OwnerAuthenticationEvidence,
-                   now: Int64, walletID: String = UUID().uuidString) async throws -> WalletCustodyRecord {
+                   now: Int64, walletID: String = UUID().uuidString,
+                   authorizationCheck: @Sendable () throws -> Void = {}) async throws -> WalletCustodyRecord {
+        try authorizationCheck()
         try requireOwner(owner, now: now)
         let custody = try await vault.create(walletID: walletID, network: network)
+        try authorizationCheck()
         let initial = CanonicalState(installationID: UUID().uuidString,
             authorization: AuthorizationLedger(walletID: walletID, network: network, generation: 1, grants: []),
             mode: .restricted, history: .complete, custody: custody)
@@ -147,7 +153,9 @@ struct OwnerWalletControl: Sendable {
 
     func restoreSeed(mnemonic: Data, vault: WalletSeedVault, network: String,
                      owner: OwnerAuthenticationEvidence, now: Int64,
-                     walletID: String = UUID().uuidString) async throws -> CanonicalState {
+                     walletID: String = UUID().uuidString,
+                     authorizationCheck: @Sendable () throws -> Void = {}) async throws -> CanonicalState {
+        try authorizationCheck()
         try requireOwner(owner, now: now)
         let prior = try continuity.inspectRecoveryState()
         let expectedStored: RecoveryStoredExpectation
@@ -158,6 +166,7 @@ struct OwnerWalletControl: Sendable {
         let selectedNetwork = prior?.authorization.network ?? identity?.network ?? network
         guard selectedNetwork == network else { throw ContinuityError.invalidState }
         let custody = try await vault.protect(mnemonic: mnemonic, walletID: selectedWallet, network: network)
+        try authorizationCheck()
         if let old = prior?.custody {
             guard custody.accountID == old.accountID, custody.publicDescriptor == old.publicDescriptor else {
                 throw PayloadProtectionError.contextMismatch

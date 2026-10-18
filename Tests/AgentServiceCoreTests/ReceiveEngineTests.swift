@@ -3,7 +3,7 @@ import Foundation
 import Testing
 @testable import AgentServiceCore
 
-private final class ReceiveAnchor: ContinuityAnchorStore, @unchecked Sendable {
+final class ReceiveAnchor: ContinuityAnchorStore, @unchecked Sendable {
     private let lock = NSLock()
     let path: URL
     let fault: ReceiveWriteFault?
@@ -26,10 +26,10 @@ private final class ReceiveAnchor: ContinuityAnchorStore, @unchecked Sendable {
         }
     }
 }
-private struct ReceiveClock: PaymentClock {
+struct ReceiveClock: PaymentClock {
     func read() -> PaymentClockReading { .init(wall: 100, monotonic: 100) }
 }
-private actor ReceiveChain: AccountChainBoundary {
+actor ReceiveChain: AccountChainBoundary {
     var receiving: Int64 = -1
     var change: Int64 = -1
     var refreshes = 0
@@ -51,7 +51,7 @@ private actor ReceiveChain: AccountChainBoundary {
         return "synthetic-address-\(network)-\(index)"
     }
 }
-private struct ReceiveFixture {
+struct ReceiveFixture: Sendable {
     let folder: URL
     let journal: SQLiteJournal
     let anchor: ReceiveAnchor
@@ -65,7 +65,9 @@ private struct ReceiveFixture {
     let chain: ReceiveChain
     let engine: ReceiveEngine
 
-    static func make(fault: ReceiveWriteFault? = nil, withCustody: Bool = true) throws -> Self {
+    static func make(fault: ReceiveWriteFault? = nil, withCustody: Bool = true,
+                     capabilities: [String] = ["read", "sync", "receive"], expiry: Int64? = nil,
+                     clock: any PaymentClock = ReceiveClock()) throws -> Self {
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let anchor = ReceiveAnchor(path: folder.appendingPathComponent("independent-anchor.json"), fault: fault)
@@ -87,16 +89,16 @@ private struct ReceiveFixture {
         let identity = SignedPeerIdentity(teamIdentifier: "disposable-team", signingIdentifier: "owner")
         let bridge = SignedPeerIdentity(teamIdentifier: "disposable-team", signingIdentifier: "bridge")
         let policy = AuthorityPolicy(bridge: bridge, owner: identity, accountIDs: ["account"],
-            capabilities: ["read", "sync", "receive"], ownerAuthenticationAge: 30)
+            capabilities: ["read", "sync", "receive", "prepare", "submit", "cancel"], ownerAuthenticationAge: 30)
         let peer = PeerEvidence(identity: bridge, signatureValidated: true)
         let owner = OwnerAuthenticationEvidence(peer: .init(identity: identity, signatureValidated: true),
             authenticationSucceeded: true, authenticatedAt: 100)
         let authority = try ServiceAuthority(continuity: continuity, policy: policy)
         let issued = try authority.enroll(id: "receive-grant", integrationID: "receive-integration",
-            accounts: ["account"], capabilities: ["read", "sync", "receive"], expiry: nil, owner: owner, now: 100)
+            accounts: ["account"], capabilities: capabilities, expiry: expiry, owner: owner, now: 100)
         let session = try authority.authenticate(connectionID: "connection", peer: peer, credential: issued.rawValue, now: 100)
         let chain = ReceiveChain()
-        let engine = ReceiveEngine(continuity: continuity, policy: policy, boundary: chain, clock: ReceiveClock())
+        let engine = ReceiveEngine(continuity: continuity, policy: policy, boundary: chain, clock: clock)
         return Self(folder: folder, journal: journal, anchor: anchor, continuity: continuity,
             authority: authority, policy: policy, peer: peer, owner: owner, credential: issued.rawValue,
             session: session, chain: chain, engine: engine)
@@ -236,10 +238,10 @@ private func receiveHighWaterCannotOverflowOrEnterTheHardenedRange(_ high: UInt6
     let engine = ReceiveEngine(continuity: fixture.continuity, policy: fixture.policy, boundary: boundary, clock: ReceiveClock())
     let first = Task { try await engine.synchronize(accountID: "account", network: "mainnet", session: fixture.session,
         connectionID: "connection", peer: fixture.peer) }
-    await boundary.waitForCount(1)
+    try await boundary.waitForCount(1)
     let second = Task { try await engine.synchronize(accountID: "account", network: "mainnet", session: fixture.session,
         connectionID: "connection", peer: fixture.peer) }
-    await boundary.waitForCount(2)
+    try await boundary.waitForCount(2)
     await boundary.release(2, horizon: 19)
     #expect(try await second.value.receivingHorizon == 19)
     await boundary.release(1, horizon: 0)
@@ -255,18 +257,17 @@ private func receiveHighWaterCannotOverflowOrEnterTheHardenedRange(_ high: UInt6
     let engine = ReceiveEngine(continuity: fixture.continuity, policy: fixture.policy, boundary: boundary, clock: ReceiveClock())
     let request = fixture.request(1)
     let first = Task { try await engine.create(request, session: fixture.session, connectionID: "connection", peer: fixture.peer) }
-    await boundary.waitForCount(1)
+    try await boundary.waitForCount(1)
     let second = Task { try await engine.create(request, session: fixture.session, connectionID: "connection", peer: fixture.peer) }
-    await boundary.waitForCount(2)
-    await boundary.release(2, horizon: -1)
-    let allocation = try await second.value
     await boundary.release(1, horizon: -1)
-    await #expect(throws: PaymentFailure.staleContext) { try await first.value }
+    let allocation = try await first.value
+    #expect(try await second.value == allocation)
     let replay = try await engine.create(request, session: fixture.session, connectionID: "connection", peer: fixture.peer)
     #expect(replay == allocation)
     #expect(try fixture.journal.read()?.requests.count == 1)
     #expect(try fixture.journal.read()?.allocations.first?.issuedIndices == [0])
     #expect(await boundary.derivationCount == 1)
+    #expect(await boundary.refreshCount == 1)
 }
 
 @Test func receiveRevocationDuringRefreshPreventsResultDisclosureAndAllocation() async throws {
@@ -275,7 +276,7 @@ private func receiveHighWaterCannotOverflowOrEnterTheHardenedRange(_ high: UInt6
     let boundary = ControlledReceiveChain()
     let engine = ReceiveEngine(continuity: fixture.continuity, policy: fixture.policy, boundary: boundary, clock: ReceiveClock())
     let pending = Task { try await engine.create(fixture.request(1), session: fixture.session, connectionID: "connection", peer: fixture.peer) }
-    await boundary.waitForCount(1)
+    try await boundary.waitForCount(1)
     try fixture.authority.revoke(id: "receive-grant", owner: fixture.owner, now: 100)
     await boundary.release(1, horizon: 19)
     await #expect(throws: AuthorizationFailure.revoked) { try await pending.value }
@@ -341,24 +342,28 @@ private func receiveAllocationInterruptionPreservesAnUnrelatedLiabilityAndRecove
     #expect(try fixture.anchor.read()?.pending == nil && fixture.anchor.read()?.recovery == nil)
 }
 
-private enum ReceiveWriteFault: CaseIterable, Sendable { case stageBefore, databaseBefore, promotionBefore }
-private enum ReceiveInjectedFailure: Error { case stop }
+enum ReceiveWriteFault: CaseIterable, Sendable { case stageBefore, databaseBefore, promotionBefore }
+enum ReceiveInjectedFailure: Error { case stop, deadline }
 
-private actor ControlledReceiveChain: AccountChainBoundary {
-    private var count = 0
-    private var waiting: [(Int, CheckedContinuation<Void, Never>)] = []
+actor ControlledReceiveChain: AccountChainBoundary {
+    private(set) var refreshCount = 0
     private var pending: [Int: (String, String, CheckedContinuation<AccountSyncRecord, Never>)] = [:]
     private(set) var derivationCount = 0
     func refresh(accountID: String, network: String) async throws -> AccountSyncRecord {
-        count += 1
-        let ticket = count
-        for waiter in waiting where waiter.0 <= count { waiter.1.resume() }
-        waiting.removeAll { $0.0 <= count }
+        refreshCount += 1
+        let ticket = refreshCount
         return await withCheckedContinuation { pending[ticket] = (accountID, network, $0) }
     }
-    func waitForCount(_ target: Int) async {
-        if count >= target { return }
-        await withCheckedContinuation { waiting.append((target, $0)) }
+    func waitForCount(_ target: Int) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(5))
+        while refreshCount < target {
+            guard clock.now < deadline else {
+                Issue.record("Expected \(target) refreshes before the five-second fixture deadline")
+                throw ReceiveInjectedFailure.deadline
+            }
+            try await Task.sleep(for: .milliseconds(2))
+        }
     }
     func release(_ ticket: Int, horizon: Int64) {
         guard let value = pending.removeValue(forKey: ticket) else { preconditionFailure("Missing refresh fixture") }

@@ -1,7 +1,7 @@
 import CryptoKit
 import Foundation
 
-// Synthetic authoritative rows. No signer, chain engine, or persistence backend is supplied.
+// Authoritative service rows. External engine and persistence adapters own their effects.
 enum WalletMode: String, Codable, Sendable { case restricted, enabled }
 enum HistoryCoverage: String, Codable, Sendable { case complete, incomplete }
 enum HistoryProofKind: String, Codable, Sendable { case committed, stagedTarget, integrityOnly, unproven }
@@ -11,7 +11,12 @@ struct HistoryProvenance: Codable, Equatable, Sendable {
     var parentCommitment: Data? = nil
 }
 enum RequestDisposition: String, Codable, Sendable { case unsubmitted, invalidated, consumed, closed }
-enum PaymentDisposition: String, Codable, Sendable { case unsubmitted, invalidated, possiblyRelayed, closed }
+enum PaymentDisposition: String, Codable, Sendable {
+    case unsubmitted, invalidated, possiblyRelayed // Retained foundation records.
+    case preparing, prepared, pendingApproval, ready, submitting, uncertain, accepted, recoveryRequired, closed
+    var isUnsubmitted: Bool { [.unsubmitted, .preparing, .prepared, .pendingApproval, .ready].contains(self) }
+    var isPossiblyRelayed: Bool { [.possiblyRelayed, .submitting, .uncertain, .accepted, .recoveryRequired].contains(self) }
+}
 
 struct ApprovalRecord: Codable, Equatable, Sendable {
     var id: String
@@ -19,6 +24,8 @@ struct ApprovalRecord: Codable, Equatable, Sendable {
     var generation: UInt64
     var context: Data
     var active: Bool
+    var policyRevision: UInt64 = 1
+    var ownerRelay: Bool = false
 }
 
 struct RequestRecord: Codable, Equatable, Sendable {
@@ -32,6 +39,9 @@ struct RequestRecord: Codable, Equatable, Sendable {
     var result: Data
     var consumedAttemptID: String?
     var tombstone: Bool
+    var formatVersion: UInt64 = 1
+    var ownerGeneration: UInt64? = nil
+    var originGrantID: String? = nil
 }
 
 struct AttemptRecord: Codable, Equatable, Sendable {
@@ -39,6 +49,11 @@ struct AttemptRecord: Codable, Equatable, Sendable {
     var number: UInt64
     var commandID: String?
     var outcome: String
+    var route: String = "ordinary"
+    var admittedAt: Int64 = 0
+    var monotonicAt: UInt64 = 0
+    var runtimeID: String = ""
+    var nextEligibleAt: Int64? = nil
 }
 
 struct EvidenceRecord: Codable, Equatable, Sendable {
@@ -48,12 +63,16 @@ struct EvidenceRecord: Codable, Equatable, Sendable {
     var observedAt: Int64
     var contents: Data
     var valid: Bool
+    var observation: PaymentObservation? = nil
+    var revision: UInt64 = 0
+    var sequence: UInt64 = 0
 }
 
 struct ClosureRecord: Codable, Equatable, Sendable {
     var id: String
     var reason: String
     var evidenceIDs: [String]
+    var revision: UInt64 = 0
 }
 
 struct PaymentRecord: Codable, Equatable, Sendable {
@@ -70,6 +89,19 @@ struct PaymentRecord: Codable, Equatable, Sendable {
     var attempts: [AttemptRecord]
     var evidence: [EvidenceRecord]
     var closures: [ClosureRecord]
+    var request: PaymentRequest? = nil
+    var preview: PaymentPreview? = nil
+    var originCredentialGeneration: UInt64 = 0
+    var walletGeneration: UInt64 = 0
+    var policyRevision: UInt64 = 1
+    var terminalReason: String? = nil
+    var evidenceRevision: UInt64 = 0
+    var evidenceSupported: Bool = false
+    var blocker: String? = nil
+    var transactionID: String = ""
+    var ordinaryAdmissions: UInt64 = 0
+    var lastReconciliationAt: Int64? = nil
+    var observationSequence: UInt64 = 0
 }
 
 struct SpendingGate: Codable, Equatable, Sendable {
@@ -88,7 +120,7 @@ struct AllocationRecord: Codable, Equatable, Sendable {
 }
 
 struct CanonicalState: Codable, Equatable, Sendable {
-    var formatVersion: UInt64 = 1
+    var formatVersion: UInt64 = 2
     var installationID: String
     var authorization: AuthorizationLedger
     var commitID: String = UUID().uuidString
@@ -100,11 +132,15 @@ struct CanonicalState: Codable, Equatable, Sendable {
     var payments: [PaymentRecord] = []
     var gates: [SpendingGate] = []
     var allocations: [AllocationRecord] = []
+    var custody: WalletCustodyRecord? = nil
+    var paymentPolicy = PaymentPolicyRecord()
+    var publicSnapshots: [AccountSyncRecord] = []
 
     mutating func invalidateUnsubmitted(grantID: String) {
-        let affected = Set(payments.filter { $0.originGrantID == grantID && $0.disposition == .unsubmitted }.map(\.id))
+        let affected = Set(payments.filter { $0.originGrantID == grantID && $0.disposition.isUnsubmitted }.map(\.id))
         for index in payments.indices where affected.contains(payments[index].id) {
             payments[index].disposition = .invalidated
+            payments[index].terminalReason = "authorizationInvalidated"
         }
         for index in requests.indices where requests[index].paymentID.map(affected.contains) == true &&
             requests[index].disposition == .unsubmitted {
@@ -116,11 +152,12 @@ struct CanonicalState: Codable, Equatable, Sendable {
     }
 
     mutating func invalidateAllUnsubmitted() -> Bool {
-        let affected = Set(payments.filter { $0.disposition == .unsubmitted }.map(\.id))
+        let affected = Set(payments.filter { $0.disposition.isUnsubmitted }.map(\.id))
             .union(requests.filter { $0.disposition == .unsubmitted }.compactMap(\.paymentID))
         var changed = false
-        for index in payments.indices where payments[index].disposition == .unsubmitted {
+        for index in payments.indices where payments[index].disposition.isUnsubmitted {
             payments[index].disposition = .invalidated
+            payments[index].terminalReason = "invalidated"
             changed = true
         }
         for index in requests.indices where requests[index].disposition == .unsubmitted {
@@ -131,18 +168,33 @@ struct CanonicalState: Codable, Equatable, Sendable {
             approvals[index].active = false
             changed = true
         }
+        releaseUnsubmittedGates(affected)
+        for index in payments.indices where payments[index].disposition == .submitting {
+            payments[index].disposition = .uncertain
+            changed = true
+        }
         return changed
+    }
+
+    mutating func releaseUnsubmittedGates(_ ids: Set<String>) {
+        for index in gates.indices {
+            gates[index].liabilityIDs.removeAll { id in
+                ids.contains(id) && !payments.contains { $0.id == id && $0.liabilityUnresolved }
+            }
+        }
+        gates.removeAll { $0.liabilityIDs.isEmpty && $0.restrictions.isEmpty }
     }
 
     func canonicalized() -> Self {
         var copy = self
         copy.authorization = authorization.canonicalized()
+        copy.publicSnapshots.sort { $0.accountID < $1.accountID }
         copy.approvals.sort { $0.id < $1.id }
         copy.requests.sort { $0.id < $1.id }
         copy.payments = payments.map { payment in
             var row = payment
             row.selectedInputs.sort()
-            row.attempts.sort { $0.id < $1.id }
+            row.attempts.sort { ($0.number, $0.id) < ($1.number, $1.id) }
             row.evidence.sort { $0.id < $1.id }
             row.closures = row.closures.map { closure in
                 var value = closure
@@ -177,21 +229,39 @@ struct CanonicalState: Codable, Equatable, Sendable {
     }
 
     func validate() throws {
-        guard formatVersion == 1 else { throw ContinuityError.incompatibleSchema }
+        guard formatVersion == 2 else { throw ContinuityError.incompatibleSchema }
         guard !installationID.isEmpty, !authorization.walletID.isEmpty, !authorization.network.isEmpty,
               !commitID.isEmpty, unique(authorization.grants.map(\.id)), unique(approvals.map(\.id)),
-              unique(requests.map(\.id)), unique(payments.map(\.id)), unique(gates.map(\.accountID)),
+              unique(requests.map(\.id)), unique(requests.map { "\($0.principalID)\u{0}\($0.method)\u{0}\($0.key)" }),
+              unique(payments.map(\.id)), unique(gates.map(\.accountID)),
               unique(allocations.map { "\($0.accountID)\u{0}\($0.branch)" }) else {
             throw ContinuityError.invalidState
         }
-        for payment in payments {
-            guard !payment.accountID.isEmpty, payment.network == authorization.network,
-                  unique(payment.attempts.map(\.id)), unique(payment.evidence.map(\.id)),
-                  unique(payment.closures.map(\.id)),
-                  payment.disposition != .possiblyRelayed || payment.liabilityUnresolved else {
+        if let custody {
+            try custody.validate()
+            guard custody.walletID == authorization.walletID, custody.network == authorization.network else {
                 throw ContinuityError.invalidState
             }
-            if payment.liabilityUnresolved || payment.disposition == .possiblyRelayed || !payment.attempts.isEmpty {
+        }
+        guard paymentPolicy.revision > 0 else { throw ContinuityError.invalidState }
+        for payment in payments {
+            if payment.request != nil {
+                let numbers = payment.attempts.map(\.number).sorted()
+                let expected = numbers.isEmpty ? [] : Array(UInt64(1)...UInt64(numbers.count))
+                guard numbers == expected,
+                      payment.ordinaryAdmissions == UInt64(payment.attempts.filter { $0.route == "ordinary" }.count),
+                      payment.ordinaryAdmissions <= 3,
+                      payment.canonicalBytes.isEmpty || payment.transactionDigest == paymentDigest(payment.canonicalBytes) else {
+                    throw ContinuityError.invalidState
+                }
+            }
+            guard !payment.accountID.isEmpty, payment.network == authorization.network,
+                  unique(payment.attempts.map(\.id)), unique(payment.attempts.map(\.number)), unique(payment.evidence.map(\.id)),
+                  unique(payment.closures.map(\.id)),
+                  !payment.disposition.isPossiblyRelayed || payment.liabilityUnresolved else {
+                throw ContinuityError.invalidState
+            }
+            if payment.liabilityUnresolved || payment.disposition.isPossiblyRelayed || !payment.attempts.isEmpty {
                 guard !payment.canonicalBytes.isEmpty, !payment.transactionDigest.isEmpty else {
                     throw ContinuityError.invalidState
                 }
@@ -206,7 +276,7 @@ struct CanonicalState: Codable, Equatable, Sendable {
     }
 
     func hasCompleteGateCoverage() -> Bool {
-        payments.filter(\.liabilityUnresolved).allSatisfy { payment in
+        payments.filter { $0.liabilityUnresolved || ($0.request != nil && $0.disposition.isUnsubmitted) }.allSatisfy { payment in
             gates.contains { $0.accountID == payment.accountID && $0.liabilityIDs.contains(payment.id) }
         } && gates.allSatisfy { gate in
             gate.liabilityIDs.allSatisfy { id in
@@ -227,8 +297,9 @@ struct CanonicalState: Codable, Equatable, Sendable {
         for index in copy.requests.indices where copy.requests[index].disposition == .unsubmitted {
             copy.requests[index].disposition = .invalidated
         }
-        for index in copy.payments.indices where copy.payments[index].disposition == .unsubmitted {
+        for index in copy.payments.indices where copy.payments[index].disposition.isUnsubmitted {
             copy.payments[index].disposition = .invalidated
+            copy.payments[index].terminalReason = "invalidated"
         }
         for payment in copy.payments where payment.liabilityUnresolved {
             if let index = copy.gates.firstIndex(where: { $0.accountID == payment.accountID }) {
@@ -295,7 +366,7 @@ struct ContinuityAnchor: Codable, Equatable, Sendable {
         guard formatVersion == 1 else { throw ContinuityError.incompatibleSchema }
         let references = [committed, pending?.target, pending?.parent].compactMap { $0 }
             + originalProofs.flatMap { [$0.reference, $0.parent].compactMap { $0 } }
-        guard references.allSatisfy({ $0.formatVersion == 1 && $0.commitment.count == 32 }) else {
+        guard references.allSatisfy({ $0.formatVersion == 2 && $0.commitment.count == 32 }) else {
             throw ContinuityError.incompatibleSchema
         }
         if let pending {
@@ -367,15 +438,23 @@ enum ContinuityStatus: Equatable, Sendable {
 
 // All store operations and result projection are synchronous while the same lock is held.
 // Store implementations must make each individual write atomic; this is not a disk backend.
+enum RecoveryStoredExpectation: Sendable {
+    case absent
+    case matching(StateReference)
+}
+
 final class ContinuityCoordinator: @unchecked Sendable {
     private let lock = NSLock()
     private let database: any ContinuityDatabase
     private let anchor: any ContinuityAnchorStore
+    // Engines retain this coordinator, so the store lease outlives every operation using it.
+    private let storageLease: StoreLock?
     private var quarantine = false
 
-    init(database: any ContinuityDatabase, anchor: any ContinuityAnchorStore) {
+    init(database: any ContinuityDatabase, anchor: any ContinuityAnchorStore, storageLease: StoreLock? = nil) {
         self.database = database
         self.anchor = anchor
+        self.storageLease = storageLease
     }
 
     // Service startup must finish this barrier before exposing any client authority.
@@ -423,6 +502,31 @@ final class ContinuityCoordinator: @unchecked Sendable {
     func transaction<Intermediate, Result>(classification: String = "command",
                                            mutation: (inout CanonicalState) throws -> Intermediate,
                                            projection: (CanonicalState, Intermediate) throws -> Result) throws -> Result {
+        try executeTransaction(classification: classification, mutation: mutation, projection: projection,
+            validate: { old, new in try validateRetention(from: old, to: new) })
+    }
+
+    // Only typed engine commands use this path; the lifecycle validator independently
+    // checks signing, resolution and invalidation before common retention is applied.
+    func paymentTransaction<Intermediate, Result>(classification: String,
+            mutation: (inout CanonicalState) throws -> Intermediate,
+            projection: (CanonicalState, Intermediate) throws -> Result) throws -> Result {
+        try executeTransaction(classification: classification, mutation: mutation, projection: projection,
+            validate: { old, new in
+                try validatePaymentTransition(from: old, to: new, classification: classification)
+                try validateRetention(from: old, to: new, paymentTransitionValidated: true)
+            })
+    }
+
+    func paymentTransaction<Result>(classification: String,
+            mutation: (inout CanonicalState) throws -> Result) throws -> Result {
+        try paymentTransaction(classification: classification, mutation: mutation, projection: { _, value in value })
+    }
+
+    private func executeTransaction<Intermediate, Result>(classification: String,
+            mutation: (inout CanonicalState) throws -> Intermediate,
+            projection: (CanonicalState, Intermediate) throws -> Result,
+            validate: (CanonicalState, CanonicalState) throws -> Void) throws -> Result {
         lock.lock()
         defer { lock.unlock() }
         let original = try trusted()
@@ -435,7 +539,7 @@ final class ContinuityCoordinator: @unchecked Sendable {
               proposed.authorization.generation == original.state.authorization.generation,
               proposed.history == original.state.history,
               proposed.mode == original.state.mode else { throw ContinuityError.invalidState }
-        try validateRetention(from: original.state, to: proposed)
+        try validate(original.state, proposed)
         // Observational commands keep the complete verified state and project under this lock.
         if proposed.canonicalized() == original.state.canonicalized() {
             return try projection(original.state.canonicalized(), intermediate)
@@ -445,7 +549,44 @@ final class ContinuityCoordinator: @unchecked Sendable {
         return try projection(proposed.canonicalized(), intermediate)
     }
 
-    func enable(ownerAuthorized: Bool) throws -> CanonicalState {
+    // Raw rows remain internal to the authenticated owner facade and recovery implementation.
+    func inspectRecoveryState() throws -> CanonicalState? {
+        lock.lock()
+        defer { lock.unlock() }
+        return try readDatabase()
+    }
+
+    func recoveryIdentity() throws -> StateReference? {
+        lock.lock()
+        defer { lock.unlock() }
+        let value = try readAnchor()
+        return value?.committed ?? value?.pending?.target ?? value?.originalProofs.first?.reference
+    }
+
+    // Called only after the owner creation flow generated a new seed; restoration uses recover.
+    func initializeFreshWallet(_ state: CanonicalState) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard try readDatabase() == nil, try readAnchor() == nil,
+              state.mode == .restricted, state.history == .complete,
+              state.authorization.generation == 1, state.authorization.grants.isEmpty,
+              state.requests.isEmpty, state.payments.isEmpty, state.approvals.isEmpty,
+              state.gates.isEmpty, state.allocations.isEmpty, let custody = state.custody else {
+            throw ContinuityError.invalidState
+        }
+        try custody.validate()
+        try state.validate()
+        let latch = RecoveryLatch(id: state.commitID, targetGeneration: 1)
+        let initial = ContinuityAnchor(committed: nil, recovery: latch)
+        try writeAnchorAndVerify(initial)
+        try handshake(state, from: initial, classification: "newWallet")
+        var finished = try readAnchorRequired()
+        finished.recovery = nil
+        try writeAnchorAndVerify(finished)
+        quarantine = false
+    }
+
+    func enable(ownerAuthorized: Bool, custodyCheck: (CanonicalState) throws -> Void = { _ in }) throws -> CanonicalState {
         lock.lock()
         defer { lock.unlock() }
         guard ownerAuthorized else { throw ContinuityError.ownerRequired }
@@ -453,6 +594,7 @@ final class ContinuityCoordinator: @unchecked Sendable {
         guard original.state.history == .complete, original.state.hasCompleteGateCoverage() else {
             throw ContinuityError.incompleteHistory
         }
+        try custodyCheck(original.state)
         var proposed = original.state
         proposed.mode = .enabled
         proposed.commitID = UUID().uuidString
@@ -460,14 +602,54 @@ final class ContinuityCoordinator: @unchecked Sendable {
         return proposed
     }
 
+    // Only the authenticated owner seed-recovery facade uses this after baseline recovery.
+    // Generic commands still cannot replace custody. This transition preserves proven history.
+    func replaceRecoveredCustody(_ custody: WalletCustodyRecord, ownerAuthorized: Bool,
+                                 custodyCheck: () throws -> Void) throws -> CanonicalState {
+        lock.lock()
+        defer { lock.unlock() }
+        guard ownerAuthorized else { throw ContinuityError.ownerRequired }
+        let original = try trusted()
+        guard original.state.mode == .restricted, original.state.hasCompleteGateCoverage(),
+              original.state.authorization.grants.allSatisfy({ $0.revoked }),
+              original.state.approvals.allSatisfy({ !$0.active }) else { throw ContinuityError.invalidState }
+        try custody.validate()
+        guard custody.walletID == original.state.authorization.walletID,
+              custody.network == original.state.authorization.network else { throw ContinuityError.invalidState }
+        if let old = original.state.custody {
+            guard custody.profile == old.profile, custody.accountID == old.accountID,
+                  custody.publicDescriptor == old.publicDescriptor else { throw ContinuityError.invalidState }
+        } else {
+            guard original.state.history == .incomplete else { throw ContinuityError.incompleteHistory }
+        }
+        try custodyCheck()
+        if original.state.custody == custody { return original.state }
+        var proposed = original.state
+        proposed.custody = custody
+        proposed.commitID = UUID().uuidString
+        try handshake(proposed, from: original.anchor, classification: "ownerCustodyRewrap")
+        return proposed.canonicalized()
+    }
+
     func recover(ownerAuthorized: Bool, source: CanonicalState? = nil,
-                 recoveryID: String = UUID().uuidString) throws -> CanonicalState {
+                 recoveryID: String = UUID().uuidString,
+                 expectedStored: RecoveryStoredExpectation? = nil) throws -> CanonicalState {
         lock.lock()
         defer { lock.unlock() }
         guard ownerAuthorized else { throw ContinuityError.ownerRequired }
         var currentAnchor = try readAnchor() ?? ContinuityAnchor(committed: nil)
         try currentAnchor.validate()
         let stored = try readDatabase()
+        // Seed verification may suspend outside this lock. Never replace a newer located
+        // journal with that caller's earlier snapshot, even as incomplete recovery.
+        if let expectedStored {
+            switch expectedStored {
+            case .absent:
+                guard stored == nil else { throw ContinuityError.invalidState }
+            case .matching(let reference):
+                guard try stored?.reference() == reference else { throw ContinuityError.invalidState }
+            }
+        }
         let candidate = source ?? stored
         guard let candidate else { throw ContinuityError.invalidState }
         try candidate.validate()
@@ -475,8 +657,15 @@ final class ContinuityCoordinator: @unchecked Sendable {
         if let known = currentAnchor.committed ?? currentAnchor.originalProofs.first?.reference {
             guard candidateReference.sameWallet(as: known) else { throw ContinuityError.invalidState }
         }
-        // Preserve independent original endorsements before selecting or replacing a baseline.
+        // Preserve independently endorsed archives, but never replace newer located rows
+        // with an unrelated unproved caller snapshot. Default recovery retains current rows.
         let proofs = currentAnchor.proofs
+        if source != nil, let stored, try stored.reference() != candidateReference {
+            guard proofs.contains(where: { $0.reference == candidateReference }) else {
+                throw ContinuityError.invalidState
+            }
+        }
+        // Preserve independent original endorsements before selecting or replacing a baseline.
         if currentAnchor.recovery == nil {
             let maximum = proofs.map(\.reference.generation).max() ?? candidate.authorization.generation
             guard maximum < UInt64.max, !recoveryID.isEmpty else { throw ContinuityError.identifierExhausted }
@@ -614,7 +803,7 @@ final class ContinuityCoordinator: @unchecked Sendable {
 private func recoveredAuthorityDisabled(_ state: CanonicalState) -> Bool {
     state.authorization.grants.allSatisfy(\.revoked) && state.approvals.allSatisfy { !$0.active }
         && state.requests.allSatisfy { $0.disposition != .unsubmitted }
-        && state.payments.allSatisfy { $0.disposition != .unsubmitted }
+        && state.payments.allSatisfy { !$0.disposition.isUnsubmitted }
 }
 
 private func deduplicated(_ proofs: [RetainedProof]) -> [RetainedProof] {
@@ -623,15 +812,16 @@ private func deduplicated(_ proofs: [RetainedProof]) -> [RetainedProof] {
     return result
 }
 
-private func validateRetention(from old: CanonicalState, to new: CanonicalState) throws {
+private func validateRetention(from old: CanonicalState, to new: CanonicalState, paymentTransitionValidated: Bool = false) throws {
     try new.validate()
     if old.mode == .restricted {
         guard new.authorization == old.authorization, new.approvals.allSatisfy({ !$0.active }),
               new.requests.allSatisfy({ $0.disposition != .unsubmitted }),
-              new.payments.allSatisfy({ $0.disposition != .unsubmitted }) else {
+              new.payments.allSatisfy({ !$0.disposition.isUnsubmitted }) else {
             throw ContinuityError.invalidState
         }
     }
+    guard old.custody == nil || new.custody == old.custody else { throw ContinuityError.invalidState }
     guard new.hasCompleteGateCoverage(),
           Set(old.authorization.grants.map(\.id)).isSubset(of: Set(new.authorization.grants.map(\.id))),
           old.authorization.grants.filter(\.expiredObserved).allSatisfy({ grant in
@@ -641,18 +831,27 @@ private func validateRetention(from old: CanonicalState, to new: CanonicalState)
           old.requests.allSatisfy({ request in
               new.requests.contains { $0.id == request.id && $0.principalID == request.principalID &&
                   $0.method == request.method && $0.key == request.key && $0.paymentID == request.paymentID && $0.binding == request.binding &&
-                  (!request.tombstone || $0.tombstone) &&
+                  $0.formatVersion == request.formatVersion && $0.ownerGeneration == request.ownerGeneration &&
+                  $0.originGrantID == request.originGrantID && (!request.tombstone || $0.tombstone) &&
                   (request.consumedAttemptID == nil || $0.consumedAttemptID == request.consumedAttemptID) }
           }),
           old.payments.allSatisfy({ payment in
               new.payments.contains { row in
                   row.id == payment.id && row.accountID == payment.accountID && row.network == payment.network && row.originGrantID == payment.originGrantID &&
-                  row.canonicalBytes == payment.canonicalBytes && row.transactionDigest == payment.transactionDigest &&
-                  row.selectedInputs.sorted() == payment.selectedInputs.sorted() && row.change == payment.change &&
-                  (!payment.liabilityUnresolved || row.liabilityUnresolved) &&
-                  payment.attempts.allSatisfy({ row.attempts.contains($0) }) &&
-                  payment.closures.allSatisfy({ row.closures.contains($0) }) &&
-                  payment.evidence.allSatisfy({ row.evidence.contains($0) })
+                  (paymentTransitionValidated || (
+                      row.request == payment.request && row.preview == payment.preview &&
+                      row.originCredentialGeneration == payment.originCredentialGeneration &&
+                      row.walletGeneration == payment.walletGeneration && row.policyRevision == payment.policyRevision &&
+                      row.transactionID == payment.transactionID && row.ordinaryAdmissions == payment.ordinaryAdmissions &&
+                      row.evidenceRevision == payment.evidenceRevision && row.evidenceSupported == payment.evidenceSupported &&
+                      row.observationSequence == payment.observationSequence && row.lastReconciliationAt == payment.lastReconciliationAt &&
+                      row.canonicalBytes == payment.canonicalBytes && row.transactionDigest == payment.transactionDigest &&
+                      row.selectedInputs.sorted() == payment.selectedInputs.sorted() && row.change == payment.change &&
+                      (!payment.liabilityUnresolved || row.liabilityUnresolved) &&
+                      payment.attempts.allSatisfy({ row.attempts.contains($0) }) &&
+                      payment.closures.allSatisfy({ row.closures.contains($0) }) &&
+                      payment.evidence.allSatisfy({ row.evidence.contains($0) })
+                  ))
               }
           }),
           old.allocations.allSatisfy({ allocation in

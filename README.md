@@ -1,40 +1,44 @@
 # OpalAgent
 
-OpalAgent is the foundation for a dedicated Bitcoin Cash wallet service and local MCP bridge on macOS. The intended service owns its wallet, policy, secrets and operation history independently of Wallet's personal wallets. Wallet supplies the owner controls and proposed distribution bundle.
+OpalAgent is a dedicated Bitcoin Cash wallet service and local MCP bridge for macOS. The service owns its seed, accounts, policy, credentials and operation history independently of personal Wallet funds. Wallet supplies the proposed owner controls and distribution bundle.
 
-The current package provides transport-neutral values, an injected client, internal authorization/encryption/continuity models, serialized authority commands and a process-lock primitive. `AgentService` and `AgentBridge` fail closed because production adapters are unavailable. They do not install a service, open live Keychain items, operate a wallet or provide an interoperable MCP server.
+The internal durable BCH engine includes encrypted fixed-profile seed recovery, an actual SQLite journal, scoped authorization, bounded receive allocation, synchronization, exact-payment approval, immutable transaction submission and restricted recovery. External keys, continuity anchors, peer authentication, chain views and transport are injected. The shipping `AgentService` and `AgentBridge` entries still report unavailable; neither installs a service, opens live Keychain items, starts this runtime or provides an interoperable MCP server.
 
 ## Package
 
-Requires macOS 27.0, Xcode 27 and Swift 6.4. SwiftPM declares exactly five products: two public libraries, two intended shipping executables and one development-only executable. There are no third-party package dependencies in this foundation.
+Requires macOS 27.0, Xcode 27 and Swift 6.4. The five products remain:
 
 | Product | Purpose |
 | --- | --- |
-| `AgentValues` | Public value contracts; no engine, storage or protocol framework dependency. |
-| `AgentClient` | Public client with an injected transport; depends only on `AgentValues`. |
-| `AgentService` | Shipping service entry linked with the internal core; currently reports unavailable. |
-| `AgentBridge` | Shipping stdio bridge executable; depends on the client and currently reports unavailable. |
-| `StoreLockProbe` | Explicit development-only executable for disposable process-lock checks; excluded from the proposed Wallet distribution. |
+| `AgentValues` | Public transport values with no engine, storage or protocol dependency. |
+| `AgentClient` | Public injected client depending only on `AgentValues`. |
+| `AgentService` | Intended shipping service entry; linked to the internal core, currently unavailable. |
+| `AgentBridge` | Intended shipping stdio executable; depends on the client, currently unavailable. |
+| `StoreLockProbe` | Development-only competing-process lock probe; excluded from distribution. |
 
-`AgentServiceCore` is an internal target, not a library product. Neither the client nor bridge depends on it. The package does not yet depend on OpalBase or an MCP SDK.
+`AgentServiceCore` is an internal target with no library product. It uses the public `OpalBaseCore` ordinary-BCH product and system SQLite through `CSQLite`. Client and bridge cannot import the engine through a public product. No MCP SDK or privacy engine is part of their dependency boundary.
+
+The package pins public OpalBase revision `f1ec2dc05ce778eb2d29230b0fd9ba5fc1c02597`, which provides `OpalBaseCore`. The root `Package.resolved` records this package’s resolved dependency graph.
 
 ## Build and test
 
-Run from the package root. Replace `<external-directory>` with a writable absolute directory outside the source tree; use the same directory for related commands. Build products and caches belong there.
+Run from the package root using an absolute scratch directory outside the source tree:
 
 ```sh
 swift package --scratch-path "<external-directory>" dump-package
 swift package --scratch-path "<external-directory>" describe
 swift build --scratch-path "<external-directory>"
-swift test --scratch-path "<external-directory>"
+swift test --no-parallel --scratch-path "<external-directory>"
 ```
 
-The deterministic suites use synthetic principals, injected collaborators and disposable storage. The development probe checks competing processes against the same local store lock. These checks cannot establish Keychain entitlements, code-signature enforcement, crash durability, an installed service, payment execution or MCP interoperability.
+Deterministic tests use disposable synthetic keys/data, actual SQLite and injected chain/relay/anchor boundaries. They include process termination around SQL commits, concurrency, restart, stale evidence and recovery. Real Base integration exercises derivation, transaction construction and public reservation/submission APIs. These checks do not qualify a live Keychain anchor, real XPC signatures, an installed helper, remote chain completeness or MCP interoperability.
 
 ## Product boundaries
 
-Only the proposed service may open agent storage or hold signing authority. Clients receive authorized projections and opaque identifiers. A local store lock excludes competing writers of that store; it provides no protection against another device or a copied seed. Recovery preserves possible payment liabilities and disables copied authority instead of treating missing history as proof that funds were not spent.
+Only the service may open agent storage and hold signing authority. Clients receive authorized projections and opaque identifiers. An autonomous grant authorizes its named accounts, including later deposits, until expiry or revocation. Optional approval is enforced by the service; no payment budget policy is implied. The local writer lock does not fence a copied seed or another device.
 
-The intended unattended availability is a logged-in, awake Mac, including screen lock and Wallet UI termination. This is target behavior requiring signed runtime proof. Sleep, logout, unavailable keys or unavailable networking may prevent progress. The product adds no keep-awake behavior, analytics or tracking.
+Uncertain submission retains exact bytes and account restrictions. Recovery disables copied authority and preserves liabilities; missing history cannot establish that funds were not sent. Seed backup recovers keys and conditionally discoverable funds, while a journal backup preserves only its retained operational facts.
 
-See [Architecture](Documentation/Architecture.md) for module and trust boundaries and [Deployment](Documentation/Deployment.md) for the proposed artifact inventory, lifecycle duties, custody prerequisites and outstanding proof.
+Target unattended availability is a logged-in, awake Mac, including screen lock and Wallet termination. Signed runtime proof remains required. Sleep, logout, key unavailability or network loss can block progress. No keep-awake behavior, analytics or tracking is added.
+
+See [Architecture](Documentation/Architecture.md) for implemented internal contracts and [Deployment](Documentation/Deployment.md) for the proposed artifact inventory and outstanding custody, lifecycle and distribution proof. The product is not qualified for funding or production autonomy.

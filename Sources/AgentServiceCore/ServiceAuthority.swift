@@ -21,8 +21,9 @@ final class ServiceAuthority: Sendable {
 
     func enroll(id: String, integrationID: String, accounts: [String], capabilities: [String],
                 expiry: Int64?, owner: OwnerAuthenticationEvidence, now: Int64) throws -> IssuedCredential {
-        try withObservedExpirations(classification: "enrollment", now: now) { _, authority in
-            guard Set(accounts).isSubset(of: policy.accountIDs),
+        try withObservedExpirations(classification: "enrollment", now: now) { state, authority in
+            let inventory = state.custody.map { Set([$0.accountID]) } ?? policy.accountIDs
+            guard Set(accounts).isSubset(of: inventory),
                   Set(capabilities).isSubset(of: policy.capabilities) else {
                 throw AuthorizationFailure.scopeDenied
             }

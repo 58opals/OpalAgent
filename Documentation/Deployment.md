@@ -1,6 +1,6 @@
 # Proposed deployment dossier
 
-Status: proposed macOS 27 distribution and custody design, with source/synthetic foundation only. No launch-agent property list, entitlement file, provisioning profile, installer or production adapter is delivered by this slice. Neither shipping executable registers, installs, opens live Keychain/storage or starts a wallet runtime. No signed-service or distribution proof is claimed.
+Status: proposed macOS 27 distribution and custody design, with an internal source/synthetic durable BCH engine. No launch-agent property list, entitlement file, provisioning profile, installer or production adapter is delivered by the package. Neither shipping executable registers, installs, opens live Keychain/storage or starts a wallet runtime. No signed-service or distribution proof is claimed.
 
 ## Artifact inventory
 
@@ -87,7 +87,7 @@ These are future product duties; the package currently performs none of them.
 | Disable / revoke | Distinguish disabling wallet authority, revoking an integration and ending a transport. Persist the chosen decision and retain operation history, liabilities and recovery evidence. UI closure alone does not revoke a grant. |
 | Uninstall / removal | Stop new admissions and unregister the service through Wallet's owner flow. [`unregister()`](https://developer.apple.com/documentation/servicemanagement/smappservice/unregister()) terminates a running LaunchAgent; it does not prove pending work was never handed off. Preserve custody and recovery records unless the owner separately authorizes a designed retirement/deletion procedure. |
 
-No update, failed launch, uninstall or recovery path may silently clear storage, regenerate a key over encrypted funds, reset request identities or discard possible liabilities. There is no destructive automatic cleanup or removal command in this slice. Keep service/bridge protocol compatibility separate from MCP protocol and future engine API compatibility.
+No update, failed launch, uninstall or recovery path may silently clear storage, regenerate a key over encrypted funds, reset request identities or discard possible liabilities. There is no destructive automatic cleanup or removal command in the current implementation. Keep service/bridge protocol compatibility separate from MCP protocol and future engine API compatibility.
 
 ## Restoration and migration limits
 
@@ -102,7 +102,7 @@ These are supported design outcomes to prove, not currently available restoratio
 | Later complete matching archive | May establish original coverage through owner recovery against retained independent proof references. A current incomplete-store digest alone cannot. |
 | Device migration or copied files | Device-only key/anchor do not migrate. New-device files are insufficient; retire the old signing instance and use a separately designed recovery/transfer procedure. If the old instance may still sign, autonomous same-seed migration is unsupported. |
 
-The local lock excludes writers of one local store only. No cross-device clone fence, whole-device/Keychain rollback detector, administrator-resistant clock or protection from another seed holder is claimed. No portable encrypted seed-export format is selected. The proposed funds-discovery profile is BIP39 with an empty passphrase and BCH BIP44 account zero on an explicit network; bounded receive/change discovery and retained issuance evidence still require engine integration and qualification. Seed backup and operational-journal backup serve different purposes.
+The local lock excludes writers of one local store only. No cross-device clone fence, whole-device/Keychain rollback detector, administrator-resistant clock or protection from another seed holder is claimed. No portable encrypted seed-export format is selected. The proposed funds-discovery profile is BIP39 with an empty passphrase and BCH BIP44 account zero on an explicit network; bounded receive/change source integration and retained issuance are implemented with synthetic qualification; live provider/distribution proof remains required. Seed backup and operational-journal backup serve different purposes.
 
 ## Proof matrix and release gate
 
@@ -114,9 +114,9 @@ The local lock excludes writers of one local store only. No cross-device clone f
 | Continuity and recovery | Injected complete-state, staging, promotion and recovery-latch failures | Actual Keychain/database crash and ambiguous-write durability; restart recovery | Supported backup, update and migration behavior with retained liabilities. |
 | Single local writer | Competing development-probe processes | Installed helper contention and lifecycle | Launch/update/removal ownership with the same store identity. |
 | Wallet-closed unattended operation | Design only | Logged-in/awake, locked-screen, UI-closed, sleep/wake and logout behavior | Registration approval, installation, update and removal. |
-| Wallet/MCP functionality | Not implemented in this foundation | Real engine, owner client and MCP interoperability | End-to-end supported release acceptance. |
+| Wallet/MCP functionality | Internal BCH/SQLite engine with injected boundaries; shipping entries unavailable | Real owner client, installed engine and MCP interoperability | End-to-end supported release acceptance. |
 
-Current evidence is source and synthetic only. The matrix's signed-runtime and distribution columns remain pending; a package build or synthetic role cannot satisfy them. Apple documentation supplies prerequisites, not proof of their composition. Distribution qualification requires suitable Developer Program provisioning and remains pending. Do not weaken entitlements, use ad-hoc identity as equivalent proof, switch Keychain backends or add a transport fallback to bypass that gate. This foundation is not ready for funding or production autonomy.
+Current evidence is source and synthetic only. The matrix's signed-runtime and distribution columns remain pending; a package build or synthetic role cannot satisfy them. Apple documentation supplies prerequisites, not proof of their composition. Distribution qualification requires suitable Developer Program provisioning and remains pending. Do not weaken entitlements, use ad-hoc identity as equivalent proof, switch Keychain backends or add a transport fallback to bypass that gate. The product is not ready for funding or production autonomy.
 
 ## Apple reference basis
 

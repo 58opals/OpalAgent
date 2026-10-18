@@ -26,11 +26,11 @@ let package = Package(
         .target(name: "AgentServiceCore", dependencies: ["AgentValues", "AgentNativeIPC", "CSQLite", .product(name: "OpalBaseCore", package: "OpalBase")]),
         .executableTarget(name: "AgentService", dependencies: ["AgentValues", "AgentServiceCore"]),
         .executableTarget(name: "AgentBridge", dependencies: ["AgentMCP", "AgentClient"]),
-        .executableTarget(name: "AgentProtocolFixture", dependencies: ["AgentMCP", "AgentClient", "AgentValues", "AgentServiceCore", .product(name: "OpalBaseCore", package: "OpalBase"), .product(name: "MCP", package: "swift-sdk")]),
+        .executableTarget(name: "AgentProtocolFixture", dependencies: ["AgentNativeIPC", "AgentMCP", "AgentClient", "AgentValues", "AgentServiceCore", .product(name: "OpalBaseCore", package: "OpalBase"), .product(name: "MCP", package: "swift-sdk")]),
         .executableTarget(name: "StoreLockProbe", dependencies: ["AgentServiceCore"]),
         .testTarget(name: "AgentMCPTests", dependencies: ["AgentMCP", "AgentClient", "AgentValues", .product(name: "MCP", package: "swift-sdk"), .product(name: "Logging", package: "swift-log")]),
         .testTarget(name: "AgentNativeIPCTests", dependencies: ["AgentNativeIPC", "AgentClient", "AgentValues"]),
-        .testTarget(name: "AgentProtocolIntegrationTests", dependencies: ["AgentProtocolFixture", "AgentMCP", "AgentClient", "AgentValues", "AgentServiceCore", .product(name: "OpalBaseCore", package: "OpalBase"), .product(name: "MCP", package: "swift-sdk")]),
+        .testTarget(name: "AgentProtocolIntegrationTests", dependencies: ["AgentNativeIPC", "AgentProtocolFixture", "AgentMCP", "AgentClient", "AgentValues", "AgentServiceCore", .product(name: "OpalBaseCore", package: "OpalBase"), .product(name: "MCP", package: "swift-sdk")]),
         .testTarget(name: "AgentClientTests", dependencies: ["AgentClient", "AgentValues"]),
         .testTarget(name: "AgentServiceCoreTests", dependencies: ["AgentServiceCore", "AgentClient", "AgentNativeIPC", "AgentValues", "CSQLite", .product(name: "OpalBaseCore", package: "OpalBase")])
     ],

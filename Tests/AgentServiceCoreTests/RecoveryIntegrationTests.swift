@@ -1,4 +1,6 @@
+import AgentValues
 import CSQLite
+import Darwin
 import CryptoKit
 import Foundation
 import Testing
@@ -401,4 +403,182 @@ private struct RecoveryReceiveBoundary: AccountChainBoundary {
     func receivingAddress(at index: UInt32, accountID: String, network: String) async throws -> String {
         "synthetic-address-\(index)"
     }
+}
+
+// These three real process deaths complement, rather than replace, the thirteen
+// deterministic recovery read/write failure prefixes above.
+@Suite(.serialized)
+private struct RecoveryProcessTests {
+    @Test(arguments: RecoveryChildPrefix.allCases)
+    func recoveryChildDeathKeepsStableLatchAndRestrictedAuthority(prefix: RecoveryChildPrefix) async throws {
+        let original = try recoveryState()
+        var target = original
+        target.commitID = "interrupted-receive-target"
+        target.allocations[0].issuedIndices.append(2)
+        target.allocations[0].issuedHighWater = 2
+        let receive = ReceiveRequest(accountID: "account", network: "mainnet", requestKey: String(repeating: "d", count: 32))
+        let allocation = ReceiveAllocation(operationID: "published-receive", accountID: "account", network: "mainnet",
+            index: 2, address: "disposable-receive-two")
+        target.requests.append(RequestRecord(id: allocation.operationID, principalID: "integration",
+            method: "create_receive_request", key: receive.requestKey, binding: try paymentEncoding(receive),
+            disposition: .closed, result: try paymentEncoding(allocation), consumedAttemptID: nil,
+            tombstone: false, originGrantID: "grant"))
+        let anchor = ContinuityAnchor(committed: try original.reference(), pending: PendingState(
+            parent: try original.reference(), target: try target.reference(), classification: "receive.allocate"))
+        let fixture = try RecoveryFixture(state: target, anchor: anchor)
+        defer { fixture.remove() }
+        let databasePath = fixture.path
+        let anchorPath = fixture.anchor.path.path
+        let phasePath = fixture.folder.appendingPathComponent("child-phase.json").path
+        let reopenedPath = fixture.folder.appendingPathComponent("reopened-owner.json").path
+        await #expect(processExitsWith: .signal(SIGKILL)) {
+            [databasePath = databasePath as String, anchorPath = anchorPath as String,
+             phasePath = phasePath as String, prefix] in
+            let effects = RecoveryStorageEffects()
+            let childAnchor = RecoveryChildAnchor(path: anchorPath, killAt: prefix, phasePath: phasePath, effects: effects)
+            let journal = try SQLiteJournal(path: databasePath) { point in
+                if prefix == .restrictedSQLCommitted, point == .afterCommit {
+                    let value = try childAnchor.read()
+                    guard value?.pending?.classification == "ownerRecovery",
+                          value?.pending?.target.generation == 2 else { throw ContinuityError.invalidState }
+                    try childAnchor.terminate(at: prefix, anchor: value)
+                }
+            }
+            let continuity = ContinuityCoordinator(database: journal, anchor: childAnchor)
+            let (service, connection) = recoveryStorageOwner(continuity: continuity, effects: effects)
+            _ = try await service.send(OwnerControlRequest(call: .recoverJournal(.init(wallet: nil, source: nil))),
+                connection: connection)
+            throw ContinuityError.invalidState // The selected prefix must kill, never return.
+        }
+        let phase = try JSONDecoder().decode(RecoveryChildReceipt.self, from: Data(contentsOf: URL(fileURLWithPath: phasePath)))
+        #expect(phase.prefix == prefix.rawValue && phase.pid != getpid() && phase.generation == 2)
+        #expect(phase.effectCounts == RecoveryStorageEffects.Counts())
+        let durableAnchor = try #require(try fixture.anchor.actual())
+        #expect(durableAnchor.recovery?.id == phase.recoveryID && durableAnchor.recovery?.targetGeneration == 2)
+        let beforeResume = try #require(try SQLiteJournal(path: databasePath).read())
+        if prefix == .latchDurable {
+            #expect(beforeResume.authorization.generation == 1 && beforeResume.mode == .enabled)
+        } else {
+            #expect(beforeResume.authorization.generation == 2 && beforeResume.mode == .restricted)
+            #expect(beforeResume.authorization.grants.allSatisfy(\.revoked) && beforeResume.approvals.allSatisfy { !$0.active })
+        }
+        // An enabled physical row behind a durable latch is never a client-ready state.
+        let blocked = ContinuityCoordinator(database: try SQLiteJournal(path: databasePath), anchor: fixture.anchor)
+        #expect(blocked.status() == .quarantined)
+        #expect(throws: ContinuityError.recoveryRequired) { try blocked.startup() }
+
+        // A separate successful child performs the real owner recovery endpoint. It
+        // does not authenticate an integration, reopen a signer or force enablement.
+        await #expect(processExitsWith: .success) {
+            [databasePath = databasePath as String, anchorPath = anchorPath as String,
+             reopenedPath = reopenedPath as String, prefix] in
+            let journal = try SQLiteJournal(path: databasePath)
+            let anchor = RecoveryChildAnchor(path: anchorPath)
+            let continuity = ContinuityCoordinator(database: journal, anchor: anchor)
+            try #require(continuity.status() == .quarantined)
+            let effects = RecoveryStorageEffects()
+            let (service, connection) = recoveryStorageOwner(continuity: continuity, effects: effects)
+            let response = try await service.send(OwnerControlRequest(call: .recoverJournal(.init(wallet: nil, source: nil))),
+                connection: connection)
+            guard case .recoverJournal(let status) = response.result else { throw ContinuityError.invalidState }
+            try #require(status.availability == .restricted && status.walletGeneration == 2)
+            let state = try continuity.inspect { $0 }
+            let clean = try #require(try anchor.read())
+            let reference = try state.reference()
+            try #require(clean.recovery == nil && clean.pending == nil && clean.committed == reference)
+            try #require(state.mode == .restricted && state.history == .complete)
+            try #require(state.authorization.grants.allSatisfy(\.revoked) && state.approvals.allSatisfy { !$0.active })
+            try #require(effects.counts == RecoveryStorageEffects.Counts())
+            let receipt = RecoveryChildReceipt(prefix: prefix.rawValue, pid: getpid(),
+                recoveryID: state.commitID, generation: state.authorization.generation, effectCounts: effects.counts)
+            try writeRecoveryChildReceipt(receipt, path: reopenedPath)
+        }
+        let reopened = try JSONDecoder().decode(RecoveryChildReceipt.self, from: Data(contentsOf: URL(fileURLWithPath: reopenedPath)))
+        #expect(reopened.pid != getpid() && reopened.pid != phase.pid)
+        #expect(reopened.recoveryID == phase.recoveryID && reopened.generation == 2)
+        #expect(reopened.effectCounts == RecoveryStorageEffects.Counts())
+        let final = try #require(try SQLiteJournal(path: databasePath).read())
+        let liabilityUnchanged = final.payments.first { $0.id == "possible" } == target.payments.first { $0.id == "possible" }
+        let gatesUnchanged = final.gates == target.gates
+        let allocationsUnchanged = final.allocations == target.allocations
+        #expect(liabilityUnchanged && gatesUnchanged && allocationsUnchanged)
+        #expect(final.requests.count == target.requests.count && final.payments.count == target.payments.count)
+        for prior in target.requests {
+            let retained = try #require(final.requests.first { $0.id == prior.id })
+            let identityAndResultUnchanged = retained.key == prior.key && retained.binding == prior.binding &&
+                retained.result == prior.result && retained.tombstone == prior.tombstone &&
+                retained.consumedAttemptID == prior.consumedAttemptID
+            #expect(identityAndResultUnchanged)
+            #expect(retained.disposition == (prior.disposition == .unsubmitted ? .invalidated : prior.disposition))
+        }
+        for prior in target.payments {
+            let retained = try #require(final.payments.first { $0.id == prior.id })
+            let bytesAndAdmissionsUnchanged = retained.canonicalBytes == prior.canonicalBytes &&
+                retained.transactionDigest == prior.transactionDigest && retained.attempts == prior.attempts &&
+                retained.ordinaryAdmissions == prior.ordinaryAdmissions
+            #expect(bytesAndAdmissionsUnchanged)
+        }
+        #expect(final.mode == .restricted && final.authorization.generation == 2 && final.history == .complete)
+        #expect(final.authorization.grants.allSatisfy(\.revoked) && final.approvals.allSatisfy { !$0.active })
+        #expect(final.requests.first { $0.id == "unsubmitted-request" }?.disposition == .invalidated)
+        #expect(try fixture.anchor.actual()?.committed == final.reference())
+        let retainedHighWater = try #require(final.allocations.first?.issuedHighWater)
+        try writeRecoveryStorageReceipt(name: "c1-" + prefix.rawValue, contents: [
+            "scenario": "C1", "prefix": prefix.rawValue, "parentPID": getpid(),
+            "killedChildPID": phase.pid, "recoveryChildPID": reopened.pid,
+            "frameworkExitChecksReturned": true, "expectedFirstSignal": SIGKILL,
+            "expectedSecondExit": 0, "latchID": phase.recoveryID,
+            "recoveredCommitID": final.commitID, "generation": final.authorization.generation,
+            "mode": final.mode.rawValue, "history": final.history.rawValue,
+            "liabilityUnchanged": liabilityUnchanged, "gatesUnchanged": gatesUnchanged,
+            "allocationsUnchanged": allocationsUnchanged,
+            "issuedHighWater": retainedHighWater,
+            "firstEffectCounts": try recoveryStorageCountMetadata(phase.effectCounts),
+            "recoveryEffectCounts": try recoveryStorageCountMetadata(reopened.effectCounts)
+        ])
+    }
+}
+
+private enum RecoveryChildPrefix: String, CaseIterable, Codable, Sendable {
+    case latchDurable, restrictedSQLCommitted, restrictedPromoted
+}
+private struct RecoveryChildReceipt: Codable {
+    let prefix: String
+    let pid: Int32
+    let recoveryID: String
+    let generation: UInt64
+    var effectCounts: RecoveryStorageEffects.Counts? = nil
+}
+private final class RecoveryChildAnchor: ContinuityAnchorStore, @unchecked Sendable {
+    let path: String
+    private let killAt: RecoveryChildPrefix?
+    private let phasePath: String?
+    private let effects: RecoveryStorageEffects?
+    init(path: String, killAt: RecoveryChildPrefix? = nil, phasePath: String? = nil, effects: RecoveryStorageEffects? = nil) {
+        self.path = path; self.killAt = killAt; self.phasePath = phasePath; self.effects = effects
+    }
+    func read() throws -> ContinuityAnchor? {
+        try JSONDecoder().decode(ContinuityAnchor.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
+    }
+    func write(_ value: ContinuityAnchor) throws {
+        let url = URL(fileURLWithPath: path)
+        try JSONEncoder().encode(value).write(to: url, options: .atomic)
+        let file = try FileHandle(forWritingTo: url); defer { try? file.close() }; try file.synchronize()
+        if killAt == .latchDurable, value.recovery != nil,
+           value.pending?.classification == "receive.allocate" { try terminate(at: .latchDurable, anchor: value) }
+        if killAt == .restrictedPromoted, value.recovery != nil, value.pending == nil,
+           value.committed?.generation == 2 { try terminate(at: .restrictedPromoted, anchor: value) }
+    }
+    func terminate(at prefix: RecoveryChildPrefix, anchor: ContinuityAnchor?) throws -> Never {
+        guard let phasePath, let latch = anchor?.recovery else { throw ContinuityError.invalidState }
+        try writeRecoveryChildReceipt(.init(prefix: prefix.rawValue, pid: getpid(),
+            recoveryID: latch.id, generation: latch.targetGeneration, effectCounts: effects?.counts), path: phasePath)
+        precondition(kill(getpid(), SIGKILL) == 0)
+        while true { _ = Darwin.pause() }
+    }
+}
+private func writeRecoveryChildReceipt(_ value: RecoveryChildReceipt, path: String) throws {
+    let url = URL(fileURLWithPath: path)
+    try JSONEncoder().encode(value).write(to: url, options: .atomic)
+    let file = try FileHandle(forWritingTo: url); defer { try? file.close() }; try file.synchronize()
 }

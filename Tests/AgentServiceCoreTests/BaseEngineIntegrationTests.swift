@@ -238,6 +238,112 @@ private func bchComposedFixture(funded: Bool = true) async throws -> BCHComposed
 }
 
 @Suite(.serialized) struct BaseEngineIntegrationTests {
+    @Test func publishedReceiveSurvivesCancelAndReopenWhileSpentHistoryStillAdvancesFrontier() async throws {
+        var fixture: BCHComposedFixture? = try await bchComposedFixture(funded: false)
+        let directory = try #require(fixture).directory
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let custody = try #require(fixture).custody
+        let vault = try #require(fixture).vault
+        let chain = try #require(fixture).chain
+        let clock = try #require(fixture).clock
+        let policy = try #require(fixture).policy
+        let anchor = try #require(fixture).anchor
+        let peer = try #require(fixture).peer
+        let published: ReceiveAllocation
+        var pendingAllocationCount = -1
+        let request = ReceiveRequest(accountID: custody.accountID, network: custody.network,
+            requestKey: String(repeating: "b", count: 32))
+        do {
+            let initial = try #require(fixture)
+            let held = AllocationLifecycleBoundary(adapter: initial.adapter)
+            let receiver = try initial.store.receiveEngine(boundary: held, clock: clock)
+            let cancelledRequest = ReceiveRequest(accountID: custody.accountID, network: custody.network,
+                requestKey: String(repeating: "c", count: 32))
+            let pending = Task { try await receiver.create(cancelledRequest, session: initial.session,
+                connectionID: "connection", peer: peer) }
+            do {
+                try await held.waitUntilEntered()
+                let snapshot = try await receiver.lookup(request: .init(accountID: custody.accountID, network: custody.network,
+                    requestKey: cancelledRequest.requestKey), effect: .receive, session: initial.session,
+                    connectionID: "connection", peer: peer)
+                let cancelled = try await receiver.cancel(id: snapshot.operationID, accountID: custody.accountID,
+                    network: custody.network, session: initial.session, connectionID: "connection", peer: peer)
+                #expect(cancelled.state == .closed && cancelled.closeReason == .cancelled && cancelled.allocation == nil)
+                await held.release()
+                // Compatibility create awaits the actual retained worker, including its late completion.
+                await #expect(throws: PaymentFailure.invalidTransition) { try await pending.value }
+                let pendingAddressCalls = await held.addressCalls
+                pendingAllocationCount = try initial.state().allocations.count
+                #expect(pendingAllocationCount == 0 && pendingAddressCalls == 0)
+            } catch {
+                pending.cancel()
+                await held.release()
+                _ = await pending.result
+                throw error
+            }
+            published = try await receiver.create(request, session: initial.session, connectionID: "connection", peer: peer)
+            #expect(published.index == 0)
+            let beforeCancel = try initial.state().reference()
+            await #expect(throws: PaymentFailure.invalidTransition) {
+                try await receiver.cancel(id: published.operationID, accountID: custody.accountID, network: custody.network,
+                    session: initial.session, connectionID: "connection", peer: peer)
+            }
+            #expect(try initial.state().reference() == beforeCancel)
+            let beforeReplay = await held.counts()
+            #expect(try await receiver.create(request, session: initial.session, connectionID: "connection", peer: peer) == published)
+            #expect(await held.counts() == beforeReplay)
+            #expect(try initial.state().allocations.first?.issuedIndices == [0])
+            #expect(try initial.state().allocations.first?.issuedHighWater == 0)
+        }
+        try await #require(fixture).engine.cancelLocalTransport()
+        fixture = nil // All initial receive workers were joined before dropping the actual writer lease.
+        let store = try DurableWalletStore(directory: directory, anchor: anchor, policy: policy)
+        let account = try await BaseSeedAccountProvider().restoreSigningAccount(custody: custody, vault: vault)
+        let adapter = try await BaseBCHAdapter(account: account, custody: custody, vault: vault, continuity: store.continuity,
+            chain: chain.operations(), clock: clock, context: { chain.context() })
+        let session = try store.integrationAuthority().authenticate(connectionID: "reopened-allocation", peer: peer,
+            credential: Data(repeating: 0x36, count: 32), now: clock.read().wall)
+        let receiver = try store.receiveEngine(boundary: adapter, clock: clock)
+        #expect(try await receiver.create(request, session: session, connectionID: "reopened-allocation", peer: peer) == published)
+        let next = try await receiver.create(.init(accountID: custody.accountID, network: custody.network,
+            requestKey: String(repeating: "d", count: 32)), session: session, connectionID: "reopened-allocation", peer: peer)
+        #expect(next.index == 1 && next.address != published.address)
+        #expect(try store.continuity.inspect { $0.allocations.first?.issuedIndices } == [0, 1])
+        #expect(try store.continuity.inspect { $0.allocations.first?.issuedHighWater } == 1)
+        let deposit = try integrationFunding(address: OpalBase.Address(published.address), byte: 0xE1)
+        try chain.publish(deposit, height: 2)
+        let external = try OpalBase.Address("bitcoincash:qpm2qsznhks23z7629mms6s4cwef74vcwvy22gdx6a")
+        let spent = try OpalBase.Transaction(version: 2, inputs: [.init(
+            previousTransactionHash: .init(naturalOrder: BCHPublicChain.hash(deposit)),
+            previousTransactionOutputIndex: 0, unlockingScript: Data([0x51]))],
+            outputs: [.init(value: 49_000, address: external)], lockTime: 0).encode()
+        try chain.publish(spent, height: 3)
+        chain.setView("published-address-spent")
+        let publicAccount = try await BaseSeedAccountProvider().restorePublicAccount(custody: custody)
+        let recovered = try await ordinaryBCHRecovery(publicAccount, chain: chain)
+        let frontier = try await publicAccount.refreshConfirmedAddressFrontier(network: .mainnet, using: chain.operations())
+        #expect(recovered.balance.uint64 == 0 && recovered.history.count == 2)
+        #expect(frontier.receivingHighestIndex == 0 && frontier.changeHighestIndex == -1)
+        let unspent = try await chain.operations().addressReader.fetchUnspentOutputs(for: published.address, tokenFilter: .include)
+        let spentHistory = try await chain.operations().addressReader.fetchHistory(for: published.address, includeUnconfirmed: false)
+        #expect(unspent.isEmpty && spentHistory.count == 2)
+        #expect(chain.sentBytes.isEmpty)
+        let retainedHighWater = try #require(store.continuity.inspect { $0.allocations.first?.issuedHighWater })
+        #expect(retainedHighWater == 1)
+        let finalReplay = try await receiver.create(request, session: session, connectionID: "reopened-allocation", peer: peer)
+        #expect(finalReplay == published)
+        try writeRecoveryStorageReceipt(name: "c3-allocation", contents: [
+            "scenario": "C3", "pendingAllocationCount": pendingAllocationCount,
+            "publishedIndex": published.index, "nextIndex": next.index,
+            "retainedHighWater": retainedHighWater,
+            "receivingConfirmedFrontier": frontier.receivingHighestIndex,
+            "balanceSatoshis": recovered.balance.uint64, "historyCount": recovered.history.count,
+            "unspentCount": unspent.count, "relayCount": chain.sentBytes.count,
+            "sameKeyAllocationRetained": finalReplay == published
+        ])
+    }
+
+
     @Test func actualBaseEmptyTwentyThenConfirmedNineteenRecoversThroughThirtyNine() async throws {
         let f = try await bchComposedFixture(funded: false); defer { try? FileManager.default.removeItem(at: f.directory) }
         let receiver = try f.store.receiveEngine(boundary: f.adapter, clock: f.clock)
@@ -661,4 +767,37 @@ private func issueBCHFixtureReceives(_ fixture: BCHComposedFixture) async throws
         addresses.append(allocation.address)
     }
     return addresses
+}
+
+/// Holds one refresh before delegating to the actual Base adapter; no snapshot,
+/// address or allocation outcome is supplied by this synchronization helper.
+private actor AllocationLifecycleBoundary: AccountChainBoundary {
+    let adapter: BaseBCHAdapter
+    private var entered = false
+    private var opened = false
+    private var waiter: CheckedContinuation<Void, Never>?
+    private var refreshCalls = 0
+    private(set) var addressCalls = 0
+    init(adapter: BaseBCHAdapter) { self.adapter = adapter }
+    func refresh(accountID: String, network: String) async throws -> AccountSyncRecord {
+        refreshCalls += 1
+        if !opened {
+            entered = true
+            await withCheckedContinuation { waiter = $0 }
+        }
+        return try await adapter.refresh(accountID: accountID, network: network)
+    }
+    func receivingAddress(at index: UInt32, accountID: String, network: String) async throws -> String {
+        addressCalls += 1
+        return try await adapter.receivingAddress(at: index, accountID: accountID, network: network)
+    }
+    func release() { opened = true; let saved = waiter; waiter = nil; saved?.resume() }
+    func waitUntilEntered() async throws {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !entered {
+            guard ContinuousClock.now < deadline else { throw PaymentFailure.invalidTransition }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+    }
+    func counts() -> [Int] { [refreshCalls, addressCalls] }
 }

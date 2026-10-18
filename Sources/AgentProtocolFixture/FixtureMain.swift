@@ -6,7 +6,14 @@ import AgentMCP
 @main enum AgentProtocolFixture {
     static func main() async {
         do {
-            let options = try parse(Array(CommandLine.arguments.dropFirst()))
+            let arguments = Array(CommandLine.arguments.dropFirst())
+            if arguments.count == 2, arguments[0] == "--test-control-fd", let fd = Int32(arguments[1]), fd == 3 {
+                let socket = try FixtureControlSocket(descriptor: fd)
+                let session = try await FixtureProcessSession.make(socket: socket)
+                try await session.run()
+                return
+            }
+            let options = try parse(arguments)
             let runtime = try await FixtureRuntime.make(directory: options.directory, scenario: options.scenario,
                 tracePath: options.trace)
             let server = MCPToolServer(client: runtime.client)

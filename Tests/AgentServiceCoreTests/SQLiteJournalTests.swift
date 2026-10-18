@@ -1,3 +1,4 @@
+import AgentValues
 import CSQLite
 import Darwin
 import Foundation
@@ -270,4 +271,116 @@ private func scalar(_ database: OpaquePointer, _ sql: String) throws -> Int64 {
     defer { sqlite3_finalize(statement) }
     guard sqlite3_step(statement) == SQLITE_ROW else { throw SQLiteJournalError.corruptState }
     return sqlite3_column_int64(statement, 0)
+}
+
+private enum IncompatibleStorageVariant: String, CaseIterable, Sendable {
+    case futureSQLVersion, wrongApplicationID, futureCanonicalFormat, futureAnchorFormat
+}
+
+@Test(arguments: IncompatibleStorageVariant.allCases)
+private func incompatibleOwnedStorageIsRejectedWithoutChangingBytesOrStartingEffects(variant: IncompatibleStorageVariant) async throws {
+    let fixture = try SQLiteFixture()
+    defer { fixture.remove() }
+    var original = sqliteState()
+    original.authorization.network = "mainnet"
+    for index in original.payments.indices { original.payments[index].network = "mainnet" }
+    do { try SQLiteJournal(path: fixture.database).write(original) }
+    let anchor = try SQLiteTestAnchor(path: fixture.anchor, initial: .init(committed: original.reference()))
+    switch variant {
+    case .futureSQLVersion:
+        try withSQL(fixture.database) { try execute($0, "PRAGMA user_version = 999") }
+    case .wrongApplicationID:
+        try withSQL(fixture.database) { try execute($0, "PRAGMA application_id = 123456") }
+    case .futureCanonicalFormat:
+        try withSQL(fixture.database) { database in
+            let bytes: Data
+            do {
+                var statement: OpaquePointer?
+                guard sqlite3_prepare_v2(database, "SELECT payload FROM root", -1, &statement, nil) == SQLITE_OK,
+                      let statement else { throw SQLiteJournalError.corruptState }
+                defer { sqlite3_finalize(statement) }
+                guard sqlite3_step(statement) == SQLITE_ROW, let pointer = sqlite3_column_blob(statement, 0) else {
+                    throw SQLiteJournalError.corruptState
+                }
+                bytes = Data(bytes: pointer, count: Int(sqlite3_column_bytes(statement, 0)))
+            }
+            var root = try #require(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
+            root["formatVersion"] = 99
+            let payload = try JSONSerialization.data(withJSONObject: root, options: [.sortedKeys])
+            var update: OpaquePointer?
+            guard sqlite3_prepare_v2(database, "UPDATE root SET payload = ?", -1, &update, nil) == SQLITE_OK,
+                  let update else { throw SQLiteJournalError.corruptState }
+            defer { sqlite3_finalize(update) }
+            let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+            let bound = payload.withUnsafeBytes { sqlite3_bind_blob(update, 1, $0.baseAddress, Int32($0.count), transient) }
+            guard bound == SQLITE_OK, sqlite3_step(update) == SQLITE_DONE, sqlite3_changes(database) == 1 else {
+                throw SQLiteJournalError.corruptState
+            }
+        }
+    case .futureAnchorFormat:
+        var value = try #require(try anchor.read()); value.formatVersion = 99; try anchor.write(value)
+    }
+    let before = try incompatibleStorageFiles(fixture.directory)
+    switch variant {
+    case .futureSQLVersion, .wrongApplicationID:
+        #expect(throws: SQLiteJournalError.incompatibleSchema) { try SQLiteJournal(path: fixture.database) }
+    case .futureCanonicalFormat:
+        let reader = try SQLiteJournal(path: fixture.database)
+        #expect(throws: ContinuityError.incompatibleSchema) { try reader.read() }
+    case .futureAnchorFormat:
+        let reader = ContinuityCoordinator(database: try SQLiteJournal(path: fixture.database), anchor: anchor)
+        #expect(throws: ContinuityError.incompatibleSchema) { try reader.startup() }
+    }
+    let effects = RecoveryStorageEffects()
+    let database = IncompatibleStorageDatabase(path: fixture.database, effects: effects)
+    let readOnlyAnchor = IncompatibleStorageAnchor(base: anchor, effects: effects)
+    let continuity = ContinuityCoordinator(database: database, anchor: readOnlyAnchor)
+    #expect(continuity.status() == (variant == .futureAnchorFormat ? .incompatibleSchema : .quarantined))
+    #expect(throws: (any Error).self) { try continuity.startup() }
+    let (owner, context) = recoveryStorageOwner(continuity: continuity, effects: effects)
+    if variant == .futureAnchorFormat {
+        let response = try await owner.send(OwnerControlRequest(call: .status), connection: context)
+        guard case .status(let status) = response.result else { throw ContinuityError.invalidState }
+        // The earlier incompatible-schema observation latched quarantine; readable recovery metadata remains.
+        #expect(status.availability == .recoveryRequired)
+    } else {
+        await #expect(throws: ServiceProblem(.recoveryRequired)) {
+            try await owner.send(OwnerControlRequest(call: .status), connection: context)
+        }
+    }
+    #expect(effects.counts == RecoveryStorageEffects.Counts())
+    let after = try incompatibleStorageFiles(fixture.directory)
+    let allBytesAndSidecarsUnchanged = before == after
+    #expect(allBytesAndSidecarsUnchanged)
+    #expect(Set(before.keys) == ["store.sqlite", "independent-anchor.json"])
+    try writeRecoveryStorageReceipt(name: "c2-" + variant.rawValue, contents: [
+        "scenario": "C2", "variant": variant.rawValue, "parentPID": getpid(),
+        "filesBefore": before.keys.sorted(), "filesAfter": after.keys.sorted(),
+        "allBytesAndSidecarsUnchanged": allBytesAndSidecarsUnchanged,
+        "effectCounts": try recoveryStorageCountMetadata(effects.counts),
+        "existingHotJournalOrWALExercised": false
+    ])
+}
+
+/// Lazy opening lets the real coordinator/owner metadata path encounter unknown SQL
+/// identity before there is any initialized writer. No recovery/reset is attempted.
+private final class IncompatibleStorageDatabase: ContinuityDatabase, @unchecked Sendable {
+    let path: String
+    let effects: RecoveryStorageEffects
+    init(path: String, effects: RecoveryStorageEffects) { self.path = path; self.effects = effects }
+    func read() throws -> CanonicalState? { try SQLiteJournal(path: path).read() }
+    func write(_ state: CanonicalState) throws { try effects.rejectWrite() }
+}
+private final class IncompatibleStorageAnchor: ContinuityAnchorStore, @unchecked Sendable {
+    let base: SQLiteTestAnchor
+    let effects: RecoveryStorageEffects
+    init(base: SQLiteTestAnchor, effects: RecoveryStorageEffects) { self.base = base; self.effects = effects }
+    func read() throws -> ContinuityAnchor? { try base.read() }
+    func write(_ anchor: ContinuityAnchor) throws { try effects.rejectWrite() }
+}
+private func incompatibleStorageFiles(_ directory: URL) throws -> [String: Data] {
+    let names = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+    return try Dictionary(uniqueKeysWithValues: names.map { name in
+        (name, try Data(contentsOf: directory.appendingPathComponent(name)))
+    })
 }

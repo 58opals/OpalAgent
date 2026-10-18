@@ -32,6 +32,8 @@ swift build --scratch-path "<external-directory>"
 swift test --no-parallel --scratch-path "<external-directory>"
 ```
 
+Process tests discover the exact `AgentProtocolFixture` executable beside the loaded package test bundle. An optional explicit executable binding requires both `OPAL_AGENT_PROTOCOL_FIXTURE_EXECUTABLE` and its matching `OPAL_AGENT_PROTOCOL_FIXTURE_SHA256`; partial or mismatching bindings fail before launch. No fixture environment configuration is required for the command above. Normal fixture construction remains fresh-only; process tests resume only their own capability-bound disposable namespace.
+
 Deterministic tests use disposable synthetic keys/data, actual SQLite and injected chain/relay/anchor boundaries. They include process termination around SQL commits, concurrency, restart, stale evidence and recovery. Real Base integration exercises derivation, transaction construction and public reservation/submission APIs. These checks do not qualify a live Keychain anchor, real XPC signatures, an installed helper, remote chain completeness or installed-service interoperability. The protocol fixture supports the documented November actual-SDK-client and limited June actual-host synthetic wire acceptance. Both exercise all twelve tools; the host scenario also checks receive replay, retained-key recovery and one uncertain synthetic submission with its liability held.
 
 ## Product boundaries

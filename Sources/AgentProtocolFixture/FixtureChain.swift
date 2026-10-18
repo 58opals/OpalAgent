@@ -1,5 +1,6 @@
 #if DEBUG
 import CryptoKit
+import Darwin
 import Foundation
 import OpalBaseCore
 @testable import AgentServiceCore
@@ -8,6 +9,7 @@ import OpalBaseCore
 final class FixtureClock: PaymentClock, @unchecked Sendable {
     private let lock = NSLock()
     private var value = PaymentClockReading(wall: 1_000, monotonic: 100)
+    init(wall: Int64 = 1_000) { value.wall = wall }
     func read() -> PaymentClockReading { lock.withLock { value } }
     func advance(_ seconds: UInt64) { lock.withLock { value.wall += Int64(seconds); value.monotonic += seconds } }
 }
@@ -22,7 +24,14 @@ final class FixtureAnchor: ContinuityAnchorStore, @unchecked Sendable {
         }
     }
     func write(_ value: ContinuityAnchor) throws {
-        try lock.withLock { try JSONEncoder().encode(value).write(to: path, options: .atomic) }
+        try lock.withLock {
+            let temporary = path.deletingLastPathComponent().appendingPathComponent(".anchor-" + UUID().uuidString)
+            try FixtureProcessOwnership.writeNew(JSONEncoder().encode(value), to: temporary)
+            guard Darwin.rename(temporary.path, path.path) == 0 else {
+                try? FileManager.default.removeItem(at: temporary)
+                throw FixtureFailure.fixtureUnavailable
+            }
+        }
     }
 }
 final class FixtureKeys: @unchecked Sendable {
@@ -64,11 +73,13 @@ final class FixturePublicChain: @unchecked Sendable {
     private var view = "view-A"
     private var fresh = true
     private var accepted = false
+    private var relayObserver: (@Sendable (Data) throws -> Void)?
     let relayLatch = FixtureRelayLatch()
     private let clock: FixtureClock
     init(clock: FixtureClock) { self.clock = clock }
     var sentBytes: [Data] { lock.withLock { sent } }
     var counts: (queries: Int, relays: Int) { lock.withLock { (queryCount, sent.count) } }
+    func onRelay(_ observer: @escaping @Sendable (Data) throws -> Void) { lock.withLock { relayObserver = observer } }
     private func query() { lock.withLock { queryCount += 1 } }
     func setAccepted(_ value: Bool) { lock.withLock { accepted = value } }
     func setFresh(_ value: Bool) { lock.withLock { fresh = value } }
@@ -138,6 +149,7 @@ final class FixturePublicChain: @unchecked Sendable {
         let client = OpalBase.Network.TransactionClient(broadcastTransaction: { raw in
             let bytes = try Self.data(raw)
             self.lock.withLock { self.sent.append(bytes) }
+            try self.lock.withLock { self.relayObserver }?(bytes)
             try await self.relayLatch.wait()
             if self.lock.withLock({ self.accepted }) { return Self.hex(Data(Self.hash(bytes).reversed())) }
             throw CancellationError() // Request ownership happened; the remote result is unknown.

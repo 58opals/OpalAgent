@@ -8,10 +8,13 @@ import Foundation
 public struct NativeClientFactory: Sendable {
     private let deployment: (any NativeDeploymentProvider)?
     public init(deployment: (any NativeDeploymentProvider)? = nil) { self.deployment = deployment }
-    public func integrationTransport(credential: Data) throws -> NativeIntegrationTransport {
+    public func integrationTransport(credential: Data, peerProfile: IntegrationPeerProfile = .mcp) throws -> NativeIntegrationTransport {
         guard let deployment, credential.count == 32 else { throw ClientFailure.unavailable }
         try deployment.requireQualifiedPrerequisites()
-        return NativeIntegrationTransport(deployment: deployment, policy: try deployment.deployment(), credential: credential)
+        let policy = try deployment.deployment()
+        guard peerProfile != .appleAutomation || policy.appleIntegrationMachService != nil else { throw ClientFailure.unavailable }
+        return NativeIntegrationTransport(deployment: deployment, policy: policy, credential: credential,
+            channel: peerProfile == .mcp ? .integration : .appleAutomation)
     }
     public func ownerTransport(consent: any NativeWalletConsentProvider) throws -> NativeOwnerTransport {
         guard let deployment else { throw ClientFailure.unavailable }
@@ -23,8 +26,15 @@ public struct NativeClientFactory: Sendable {
 public struct NativeIntegrationTransport: CapabilityTransport, CustomReflectable {
     public var customMirror: Mirror { Mirror(self, children: ["transport": "<native integration transport>"]) }
     private let channel: NativeClientChannel
-    fileprivate init(deployment: any NativeDeploymentProvider, policy: NativeDeploymentPolicy, credential: Data) {
-        channel = NativeClientChannel(deployment: deployment, policy: policy, channel: .integration, credential: credential, consent: nil)
+    fileprivate init(deployment: any NativeDeploymentProvider, policy: NativeDeploymentPolicy, credential: Data, channel: NativeChannel) {
+        self.channel = NativeClientChannel(deployment: deployment, policy: policy, channel: channel, credential: credential, consent: nil)
+    }
+    /// Completes the peer and credential handshake without invoking a capability.
+    /// An active authenticated connection may be reused. This is not a fresh revocation
+    /// check on a reused transport. Construct a new transport for an independent check;
+    /// authority can still change afterward and the service rechecks every capability.
+    public func authenticate() async throws {
+        _ = try await channel.ready()
     }
     public func send(_ request: CapabilityRequest) async throws -> CapabilityResponse {
         let id = UUID(), link = try await channel.ready()
@@ -86,7 +96,7 @@ private actor NativeClientChannel {
                 guard greeting.channel == channel, UUID(uuidString: greeting.connectionID) != nil,
                       link.sameUserPeer else { throw NativeIPCFailure.untrustedPeer }
                 link.consentReceiver?.bind(connectionID: greeting.connectionID)
-                if channel == .integration {
+                if channel != .owner {
                     guard let credential, credential.count == 32 else { throw NativeIPCFailure.unavailable }
                     let authID = UUID()
                     let auth = try NativeWire.frame(greeting, kind: .authenticate, requestID: authID)
@@ -121,7 +131,7 @@ private final class NativeClientLink: @unchecked Sendable {
         self.channel = channel
         connection = NSXPCConnection(machServiceName: policy.machService(for: channel), options: [])
         connection.setCodeSigningRequirement(policy.service.requirement)
-        connection.remoteObjectInterface = NSXPCInterface(with: channel == .integration ? NativeIntegrationXPC.self : NativeOwnerXPC.self)
+        connection.remoteObjectInterface = NSXPCInterface(with: channel == .owner ? NativeOwnerXPC.self : NativeIntegrationXPC.self)
         if let consent, channel == .owner {
             consentReceiver = NativeConsentReceiver(connection: connection, provider: consent)
             connection.exportedInterface = NSXPCInterface(with: NativeWalletConsentXPC.self)
@@ -170,8 +180,8 @@ private final class NativeClientLink: @unchecked Sendable {
                 }
                 switch mode {
                 case .hello:
-                    if channel == .integration, let remote = proxy as? any NativeIntegrationXPC { remote.hello(packet.frame as NSData) { reply($0, nil) } }
-                    else if let remote = proxy as? any NativeOwnerXPC { remote.hello(packet.frame as NSData) { reply($0, nil) } }
+                    if channel != .owner, let remote = proxy as? any NativeIntegrationXPC { remote.hello(packet.frame as NSData) { reply($0, nil) } }
+                    else if channel == .owner, let remote = proxy as? any NativeOwnerXPC { remote.hello(packet.frame as NSData) { reply($0, nil) } }
                     else { invalidate() }
                 case .authenticate:
                     guard let remote = proxy as? any NativeIntegrationXPC, let credential, credential.count == 32 else { invalidate(); return }

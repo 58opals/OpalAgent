@@ -12,12 +12,13 @@ Requires macOS 27.0, Xcode 27 and Swift 6.4. The products are:
 | --- | --- |
 | `AgentValues` | Public transport values with no engine, storage or protocol dependency. |
 | `AgentClient` | Public injected clients and unavailable-by-default native transport construction; no engine/storage dependency. |
+| `AgentAppIntents` | Mac-only Apple action/entity/query adapters over the public client and values; host dependencies must be explicitly registered. |
 | `AgentService` | Intended shipping service entry; linked to the internal core, currently unavailable. |
 | `AgentBridge` | Shipping stdio adapter; discovery works, wallet calls require a qualified authenticated service channel. |
 | `StoreLockProbe` | Development-only competing-process lock probe; excluded from distribution. |
 | `AgentProtocolFixture` | Debug-only disposable engine/MCP composition; excluded from distribution and unavailable in Release. |
 
-`AgentServiceCore` is an internal target with no library product. It uses the public `OpalBaseCore` ordinary-BCH product and system SQLite through `CSQLite`. Client and bridge cannot import the engine through a public product. `AgentMCP` owns the official MCP SDK dependency; the public values/client and native wire targets have no SDK, Base or SQLite dependency. The bridge does not link the engine or privacy integrations.
+`AgentServiceCore` is an internal target with no library product. It uses the public `OpalBaseCore` ordinary-BCH product and system SQLite through `CSQLite`. Client and bridge cannot import the engine through a public product. `AgentAppIntents` imports only the public client/values and Apple frameworks, with no engine, Base, SQLite or MCP SDK dependency. `AgentMCP` owns the official MCP SDK dependency; the public values/client and native wire targets have no SDK, Base or SQLite dependency. The bridge does not link the engine or privacy integrations.
 
 The package pins public OpalBase revision `f1ec2dc05ce778eb2d29230b0fd9ba5fc1c02597`, which provides `OpalBaseCore`. The official Swift MCP SDK is pinned to exact version `0.12.1` (revision `a0ae212ebf6eab5f754c3129608bc5557637e605`). The root `Package.resolved` records the canonical public dependency graph.
 

@@ -47,11 +47,13 @@ public struct EnrollmentRequest: Sendable, Equatable {
     public let accountIDs: [String]
     public let scopes: [IntegrationScope]
     public let expiresAt: Int64?
-    public init(wallet: WalletScope, integrationID: String, accountIDs: [String], scopes: [IntegrationScope], expiresAt: Int64? = nil) throws {
+    public let peerProfile: IntegrationPeerProfile
+    public init(wallet: WalletScope, integrationID: String, accountIDs: [String], scopes: [IntegrationScope], expiresAt: Int64? = nil,
+                peerProfile: IntegrationPeerProfile = .mcp) throws {
         guard ownerIdentifier(integrationID), !accountIDs.isEmpty, accountIDs.allSatisfy(ownerIdentifier),
               Set(accountIDs).count == accountIDs.count, !scopes.isEmpty, Set(scopes).count == scopes.count,
               expiresAt.map({ $0 > 0 }) ?? true else { throw CapabilityFailure.invalidRequest }
-        self.wallet = wallet; self.integrationID = integrationID; self.accountIDs = accountIDs; self.scopes = scopes; self.expiresAt = expiresAt
+        self.wallet = wallet; self.integrationID = integrationID; self.accountIDs = accountIDs; self.scopes = scopes; self.expiresAt = expiresAt; self.peerProfile = peerProfile
     }
 }
 public struct ApprovalPolicyRequest: Sendable, Equatable {
@@ -167,10 +169,33 @@ public struct GrantProjection: Codable, Sendable, Equatable {
     public let expiresAt: Int64?
     public let credentialGeneration: UInt64
     public let state: GrantState
+    public let peerProfile: IntegrationPeerProfile
     public init(selector: GrantSelector, integrationID: String, accountIDs: [String], scopes: [IntegrationScope],
-                expiresAt: Int64?, credentialGeneration: UInt64, state: GrantState) {
+                expiresAt: Int64?, credentialGeneration: UInt64, state: GrantState, peerProfile: IntegrationPeerProfile = .mcp) {
         self.selector = selector; self.integrationID = integrationID; self.accountIDs = accountIDs; self.scopes = scopes
-        self.expiresAt = expiresAt; self.credentialGeneration = credentialGeneration; self.state = state
+        self.expiresAt = expiresAt; self.credentialGeneration = credentialGeneration; self.state = state; self.peerProfile = peerProfile
+    }
+    private enum CodingKeys: String, CodingKey {
+        case selector, integrationID, accountIDs, scopes, expiresAt, credentialGeneration, state, peerProfile
+    }
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        selector = try container.decode(GrantSelector.self, forKey: .selector)
+        integrationID = try container.decode(String.self, forKey: .integrationID)
+        accountIDs = try container.decode([String].self, forKey: .accountIDs)
+        scopes = try container.decode([IntegrationScope].self, forKey: .scopes)
+        expiresAt = try container.decodeIfPresent(Int64.self, forKey: .expiresAt)
+        credentialGeneration = try container.decode(UInt64.self, forKey: .credentialGeneration)
+        state = try container.decode(GrantState.self, forKey: .state)
+        peerProfile = container.contains(.peerProfile) ? try container.decode(IntegrationPeerProfile.self, forKey: .peerProfile) : .mcp
+    }
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(selector, forKey: .selector); try container.encode(integrationID, forKey: .integrationID)
+        try container.encode(accountIDs, forKey: .accountIDs); try container.encode(scopes, forKey: .scopes)
+        try container.encodeIfPresent(expiresAt, forKey: .expiresAt)
+        try container.encode(credentialGeneration, forKey: .credentialGeneration); try container.encode(state, forKey: .state)
+        if peerProfile != .mcp { try container.encode(peerProfile, forKey: .peerProfile) }
     }
 }
 public struct OwnerIssuedCredential: Sendable {

@@ -4,7 +4,31 @@ import Foundation
 private struct OwnerBody: Codable { let method: String; let payload: Data }
 private struct EmptyBody: Codable {}
 private struct RecoveryInput: Codable { let wallet: WalletScope?; let source: RecoverySourceHandle? }
-private struct EnrollmentInput: Codable { let wallet: WalletScope; let integrationID: String; let accountIDs: [String]; let scopes: [IntegrationScope]; let expiresAt: Int64? }
+private struct EnrollmentInput: Codable {
+    let wallet: WalletScope; let integrationID: String; let accountIDs: [String]; let scopes: [IntegrationScope]; let expiresAt: Int64?
+    let peerProfile: IntegrationPeerProfile
+    init(wallet: WalletScope, integrationID: String, accountIDs: [String], scopes: [IntegrationScope], expiresAt: Int64?, peerProfile: IntegrationPeerProfile) {
+        self.wallet = wallet; self.integrationID = integrationID; self.accountIDs = accountIDs; self.scopes = scopes
+        self.expiresAt = expiresAt; self.peerProfile = peerProfile
+    }
+    private enum CodingKeys: String, CodingKey { case wallet, integrationID, accountIDs, scopes, expiresAt, peerProfile }
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        wallet = try container.decode(WalletScope.self, forKey: .wallet)
+        integrationID = try container.decode(String.self, forKey: .integrationID)
+        accountIDs = try container.decode([String].self, forKey: .accountIDs)
+        scopes = try container.decode([IntegrationScope].self, forKey: .scopes)
+        expiresAt = try container.decodeIfPresent(Int64.self, forKey: .expiresAt)
+        peerProfile = container.contains(.peerProfile) ? try container.decode(IntegrationPeerProfile.self, forKey: .peerProfile) : .mcp
+    }
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(wallet, forKey: .wallet); try container.encode(integrationID, forKey: .integrationID)
+        try container.encode(accountIDs, forKey: .accountIDs); try container.encode(scopes, forKey: .scopes)
+        try container.encodeIfPresent(expiresAt, forKey: .expiresAt)
+        if peerProfile != .mcp { try container.encode(peerProfile, forKey: .peerProfile) }
+    }
+}
 private struct PolicyInput: Codable { let wallet: WalletScope; let expectedRevision: UInt64; let approvalRequired: Bool }
 private struct RelayInput: Codable { let requestKey: RequestKey; let context: ExactRelayReviewContext }
 private struct ReceiptInput: Codable { let wallet: WalletScope; let requestKey: RequestKey }
@@ -29,7 +53,7 @@ public extension NativeWire {
         case .exportRecoveryMaterial(let wallet), .enableWallet(let wallet): payload = try encode(wallet)
         case .recoverJournal(let input): payload = try encode(RecoveryInput(wallet: input.wallet, source: input.source))
         case .discoverPublicAccount(let account): payload = try encode(account)
-        case .enrollIntegration(let input): payload = try encode(EnrollmentInput(wallet: input.wallet, integrationID: input.integrationID, accountIDs: input.accountIDs, scopes: input.scopes, expiresAt: input.expiresAt))
+        case .enrollIntegration(let input): payload = try encode(EnrollmentInput(wallet: input.wallet, integrationID: input.integrationID, accountIDs: input.accountIDs, scopes: input.scopes, expiresAt: input.expiresAt, peerProfile: input.peerProfile))
         case .rotateGrant(let selector), .revokeGrant(let selector): payload = try encode(selector)
         case .setApprovalPolicy(let input): payload = try encode(PolicyInput(wallet: input.wallet, expectedRevision: input.expectedRevision, approvalRequired: input.approvalRequired))
         case .paymentStatus(let selector), .reviewPreview(let selector), .reviewRelay(let selector): payload = try encode(selector)
@@ -62,7 +86,7 @@ public extension NativeWire {
         case .discoverPublicAccount: call = .discoverPublicAccount(try decode(AccountScope.self, from: body.payload))
         case .enrollIntegration:
             let input = try decode(EnrollmentInput.self, from: body.payload)
-            call = .enrollIntegration(try EnrollmentRequest(wallet: input.wallet, integrationID: input.integrationID, accountIDs: input.accountIDs, scopes: input.scopes, expiresAt: input.expiresAt))
+            call = .enrollIntegration(try EnrollmentRequest(wallet: input.wallet, integrationID: input.integrationID, accountIDs: input.accountIDs, scopes: input.scopes, expiresAt: input.expiresAt, peerProfile: input.peerProfile))
         case .rotateGrant: call = .rotateGrant(try decode(GrantSelector.self, from: body.payload))
         case .revokeGrant: call = .revokeGrant(try decode(GrantSelector.self, from: body.payload))
         case .setApprovalPolicy:

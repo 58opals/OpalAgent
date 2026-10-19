@@ -1,4 +1,5 @@
 import AgentClient
+import AgentAppIntents
 import AgentValues
 import CryptoKit
 import Foundation
@@ -115,7 +116,8 @@ private struct CapabilityFixture {
     let clock: CapabilityClock
     let account: AccountScope
     static func make(scopes: [IntegrationScope] = IntegrationScope.allCases, snapshot: Bool = false,
-                     approvalRequired: Bool = true, integrationID: String = "integration-distinct") throws -> Self {
+                     approvalRequired: Bool = true, integrationID: String = "integration-distinct",
+                     peerProfile: IntegrationPeerProfile = .mcp) throws -> Self {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("capability-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let journal = try SQLiteJournal(path: directory.appendingPathComponent("state.sqlite").path)
@@ -124,11 +126,12 @@ private struct CapabilityFixture {
         let bridge = SignedPeerIdentity(teamIdentifier: "synthetic-team", signingIdentifier: "bridge")
         let ownerIdentity = SignedPeerIdentity(teamIdentifier: "synthetic-team", signingIdentifier: "owner")
         let policy = AuthorityPolicy(bridge: bridge, owner: ownerIdentity, accountIDs: ["account"],
-            capabilities: Set(IntegrationScope.allCases.map(\.rawValue)), ownerAuthenticationAge: 100)
+            capabilities: Set(IntegrationScope.allCases.map(\.rawValue)), ownerAuthenticationAge: 100,
+            appleIntegration: peerProfile == .appleAutomation ? ownerIdentity : nil)
         let ledger = AuthorizationLedger(walletID: "wallet", network: "mainnet", generation: 1,
             grants: [GrantRecord(id: "grant-distinct", integrationID: integrationID, accountIDs: ["account"],
                 capabilities: scopes.map(\.rawValue), credentialDigest: paymentDigest(credential), credentialGeneration: 1,
-                expiresAt: nil, revoked: false)])
+                expiresAt: nil, revoked: false, peerProfile: peerProfile)])
         var state = CanonicalState(installationID: "installation", authorization: ledger, mode: .enabled, history: .complete)
         let protected = try PayloadProtector(profile: .encrypted, walletID: "wallet",
             wrappingKey: .available(SymmetricKey(data: Data(repeating: 0x45, count: 32)))).protect(Data("disposable synthetic seed payload".utf8))
@@ -139,7 +142,7 @@ private struct CapabilityFixture {
         try journal.write(state); try anchor.write(.init(committed: state.reference()))
         let continuity = ContinuityCoordinator(database: journal, anchor: anchor)
         let authority = try ServiceAuthority(continuity: continuity, policy: policy)
-        let peer = PeerEvidence(identity: bridge, signatureValidated: true)
+        let peer = PeerEvidence(identity: peerProfile == .mcp ? bridge : ownerIdentity, signatureValidated: true)
         let owner = OwnerAuthenticationEvidence(peer: .init(identity: ownerIdentity, signatureValidated: true),
             authenticationSucceeded: true, authenticatedAt: 1_000)
         let session = try authority.authenticate(connectionID: "connection", peer: peer, credential: credential, now: 1_000)
@@ -465,4 +468,138 @@ func capabilityAuthorityChangesDuringAwaitPreventDisclosure(_ change: String) as
     await #expect(throws: ServiceProblem(.recoveryRequired)) { try await f.call(.getSyncStatus(f.account)) }
     #expect(try f.continuity.inspect { try $0.reference() } == before)
     #expect(f.effects.counts == [0, 0, 0, 0, 0, 0])
+}
+
+// Host authentication below invokes the actual authority for every open/validation. Only the
+// known-unlocked observation and local request persistence are synthetic host collaborators.
+private struct AppleCapabilityHost: AgentAutomationAccess {
+    let fixture: CapabilityFixture
+    let credential: Data
+    let binding: AgentAutomationBinding
+    init(_ fixture: CapabilityFixture, credential: Data? = nil, grantID: String = "grant-distinct") throws {
+        self.fixture = fixture; self.credential = credential ?? fixture.credential
+        let state = try fixture.continuity.inspect { $0 }
+        guard let grant = state.authorization.grants.first(where: { $0.id == grantID }) else { throw AgentAutomationFailure.unavailable }
+        // Enrollment facts captured by the test host, never inferred from an entity selector.
+        binding = try AgentAutomationBinding(wallet: fixture.account.wallet, integrationID: grant.integrationID,
+            grantID: grant.id, walletGeneration: state.authorization.generation, credentialGeneration: grant.credentialGeneration,
+            accountIDs: grant.accountIDs, scopes: grant.capabilities.compactMap(IntegrationScope.init(rawValue:)))
+    }
+    func isKnownUnlocked() async -> Bool { true }
+    func openSession() async throws -> AgentAutomationSession {
+        let context = try currentContext()
+        return AgentAutomationSession(binding: binding,
+            client: CapabilityClient(transport: CapabilityEndpointTransport(service: fixture.service, context: context)))
+    }
+    func validate(binding: AgentAutomationBinding) async throws {
+        _ = try currentContext()
+        guard binding == self.binding else { throw AgentAutomationFailure.staleContext }
+    }
+    private func currentContext() throws -> CapabilityConnectionContext {
+        let connectionID = UUID().uuidString
+        let session = try fixture.authority.authenticate(connectionID: connectionID, peer: fixture.context.peer,
+            credential: credential, now: fixture.clock.read().wall)
+        guard session.peerProfile == .appleAutomation,
+              session.principal.grantID == binding.grantID, session.principal.integrationID == binding.integrationID,
+              session.walletGeneration == binding.walletGeneration, session.credentialGeneration == binding.credentialGeneration else {
+            throw AgentAutomationFailure.staleContext
+        }
+        return CapabilityConnectionContext(session: session, connectionID: connectionID, peer: fixture.context.peer)
+    }
+}
+private actor AppleCapabilityRequests: AgentAutomationRequestStore {
+    private var rows: [String: RetainedAgentAutomationRequest] = [:]
+    var count: Int { rows.count }
+    func create(binding: AgentAutomationBinding, payload: AgentAutomationRequestPayload) async throws -> RetainedAgentAutomationRequest {
+        let handle = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+        let key = try RequestKey(UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased())
+        let value = try RetainedAgentAutomationRequest(handleID: handle, owner: .init(binding: binding), payload: payload, requestKey: key)
+        rows[handle] = value; return value
+    }
+    func load(handleID: String, binding: AgentAutomationBinding) async throws -> RetainedAgentAutomationRequest {
+        try checked(handleID, binding: binding)
+    }
+    func recordOperation(handleID: String, binding: AgentAutomationBinding, identity: OperationIdentity) async throws -> RetainedAgentAutomationRequest {
+        let value = try checked(handleID, binding: binding)
+        guard value.operation == nil || value.operation == identity else { throw AgentAutomationFailure.invalidResponse }
+        let enriched = try RetainedAgentAutomationRequest(handleID: value.handleID, owner: value.owner, payload: value.payload,
+            requestKey: value.requestKey, operation: identity)
+        rows[handleID] = enriched; return enriched
+    }
+    func recent(binding: AgentAutomationBinding, limit: Int) async throws -> [RetainedAgentAutomationRequest] {
+        guard (1...40).contains(limit) else { throw AgentAutomationFailure.invalidReference }
+        return rows.values.filter { $0.owner == AgentAutomationRequestOwner(binding: binding) && binding.accountIDs.contains($0.payload.account.accountID) }
+            .sorted { $0.handleID < $1.handleID }.prefix(limit).map { $0 }
+    }
+    private func checked(_ handleID: String, binding: AgentAutomationBinding) throws -> RetainedAgentAutomationRequest {
+        guard let value = rows[handleID], value.owner == AgentAutomationRequestOwner(binding: binding),
+              binding.accountIDs.contains(value.payload.account.accountID) else { throw AgentAutomationFailure.requestUnavailable }
+        return value
+    }
+}
+
+@Test func appleAdapterCommandOnlyReceiveReplaysWithoutReadScope() async throws {
+    let f = try CapabilityFixture.make(scopes: [.receive], peerProfile: .appleAutomation); defer { f.close() }
+    let store = AppleCapabilityRequests(), host = try AppleCapabilityHost(f)
+    let adapter = AgentAutomationAdapter(access: host, requests: store)
+    let retained = try await adapter.newRequest(.createReceiveRequest(f.account))
+    guard case .receive(let initial) = try await adapter.execute(handleID: retained.handleID, effect: .createReceiveRequest) else {
+        throw CapabilityFailure.invalidResponse
+    }
+    try await f.waitAccount(initial.identity.selector.operationID, .allocated)
+    let beforeReplay = f.effects.counts
+    guard case .receive(let replay) = try await adapter.execute(handleID: retained.handleID, effect: .createReceiveRequest) else {
+        throw CapabilityFailure.invalidResponse
+    }
+    #expect(replay.identity == initial.identity && replay.identity.requestKey == retained.requestKey)
+    #expect(replay.state == .allocated && replay.allocation?.index == 0)
+    #expect(f.effects.counts == beforeReplay && beforeReplay[4] == 1 && beforeReplay[5] == 1)
+    await #expect(throws: AgentAutomationFailure.scopeDenied) { try await adapter.resume(handleID: retained.handleID) }
+    await #expect(throws: AgentAutomationFailure.scopeDenied) { try await adapter.retainedRequests() }
+    let count = await store.count
+    let state = try f.continuity.inspect { $0 }
+    #expect(count == 1 && state.requests.count == 1)
+    #expect(state.allocations.first?.issuedIndices == [0] && state.allocations.first?.issuedHighWater == 0)
+    #expect(f.effects.counts == beforeReplay)
+}
+
+@Test func appleAdapterCurrentAuthenticationTracksRotationRevocationAndOrigin() async throws {
+    let f = try CapabilityFixture.make(scopes: [.read, .receive], peerProfile: .appleAutomation); defer { f.close() }
+    let store = AppleCapabilityRequests(), initialHost = try AppleCapabilityHost(f)
+    let adapter = AgentAutomationAdapter(access: initialHost, requests: store)
+    let retained = try await adapter.newRequest(.createReceiveRequest(f.account))
+    guard case .receive(let initial) = try await adapter.execute(handleID: retained.handleID, effect: .createReceiveRequest) else {
+        throw CapabilityFailure.invalidResponse
+    }
+    try await f.waitAccount(initial.identity.selector.operationID, .allocated)
+    let beforeRotation = f.effects.counts
+    let rotated = try f.authority.rotate(id: initialHost.binding.grantID, owner: f.owner, now: 1_000)
+    await #expect(throws: AuthorizationFailure.invalidCredential) { try await adapter.retainedRequests() }
+    await #expect(throws: AuthorizationFailure.invalidCredential) { try await adapter.execute(handleID: retained.handleID, effect: .createReceiveRequest) }
+    let currentHost = try AppleCapabilityHost(f, credential: rotated.rawValue)
+    let current = AgentAutomationAdapter(access: currentHost, requests: store)
+    let references = try await current.retainedRequests()
+    #expect(references.count == 1 && references[0].requestKey == retained.requestKey)
+    guard case .receive(let observed) = try await current.resume(handleID: retained.handleID) else { throw CapabilityFailure.invalidResponse }
+    #expect(observed.identity == initial.identity && observed.allocation?.index == 0)
+    #expect(currentHost.binding.credentialGeneration == 2 && currentHost.binding.grantID == initialHost.binding.grantID)
+    #expect(f.effects.counts == beforeRotation)
+    try f.authority.revoke(id: currentHost.binding.grantID, owner: f.owner, now: 1_000)
+    await #expect(throws: AuthorizationFailure.revoked) { try await current.retainedRequests() }
+    await #expect(throws: AuthorizationFailure.revoked) { try await current.execute(handleID: retained.handleID, effect: .createReceiveRequest) }
+    let replacement = try f.authority.enroll(id: "replacement-apple-grant", integrationID: "replacement-apple-integration", accounts: ["account"],
+        capabilities: ["read", "receive"], expiry: nil, owner: f.owner, now: 1_000, peerProfile: .appleAutomation)
+    let replacementHost = try AppleCapabilityHost(f, credential: replacement.rawValue, grantID: replacement.principal.grantID)
+    let replacementSession = try await replacementHost.openSession()
+    await #expect(throws: ServiceProblem(.unavailable)) {
+        try await replacementSession.client.call(.getOperation(.operation(initial.identity.selector)))
+    }
+    let replacementAdapter = AgentAutomationAdapter(access: replacementHost, requests: store)
+    let foreignReferences = try await replacementAdapter.retainedRequests()
+    #expect(foreignReferences.isEmpty)
+    await #expect(throws: AgentAutomationFailure.requestUnavailable) { try await replacementAdapter.execute(handleID: retained.handleID, effect: .createReceiveRequest) }
+    let count = await store.count
+    let state = try f.continuity.inspect { $0 }
+    #expect(count == 1 && state.requests.count == 1 && state.allocations.first?.issuedIndices == [0])
+    #expect(f.effects.counts == beforeRotation)
 }

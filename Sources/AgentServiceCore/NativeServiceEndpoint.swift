@@ -3,7 +3,7 @@ import AgentValues
 import Darwin
 import Foundation
 
-/// The host must retain both separately configured endpoints. This source does not install or launch a service.
+/// The host must retain each separately configured endpoint. This source does not install or launch a service.
 /// Authority facts are produced only after Foundation delivers a message on an exact signed, same-user peer connection.
 final class NativeServiceEndpoint: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
     private let deployment: any NativeDeploymentProvider
@@ -27,6 +27,11 @@ final class NativeServiceEndpoint: NSObject, NSXPCListenerDelegate, @unchecked S
               authorityPolicy.owner == SignedPeerIdentity(teamIdentifier: configured.wallet.teamIdentifier, signingIdentifier: configured.wallet.signingIdentifier) else {
             throw NativeIPCFailure.untrustedPeer
         }
+        if channel == .appleAutomation {
+            guard configured.appleIntegrationMachService != nil,
+                  authorityPolicy.appleIntegration == SignedPeerIdentity(teamIdentifier: configured.wallet.teamIdentifier,
+                      signingIdentifier: configured.wallet.signingIdentifier) else { throw NativeIPCFailure.untrustedPeer }
+        }
         self.deployment = deployment; self.configured = configured; self.channel = channel
         self.authority = authority; self.capabilities = capabilities; self.owner = owner; self.clock = clock
         listener = NSXPCListener(machServiceName: configured.machService(for: channel))
@@ -49,7 +54,7 @@ final class NativeServiceEndpoint: NSObject, NSXPCListenerDelegate, @unchecked S
               (try? deployment.requireQualifiedPrerequisites()) != nil else { return false }
         let state = NativeServiceConnection(connection: connection, channel: channel, identity: configured.peer(for: channel))
         connection.setCodeSigningRequirement(configured.peer(for: channel).requirement)
-        if channel == .integration {
+        if channel != .owner {
             connection.exportedInterface = NSXPCInterface(with: NativeIntegrationXPC.self)
             connection.exportedObject = NativeIntegrationEndpoint(state: state, authority: authority, service: capabilities, clock: clock)
         } else {
@@ -98,19 +103,20 @@ private final class NativeServiceConnection: @unchecked Sendable {
     }
     func bind(_ session: AuthorizationSession) throws {
         try lock.withLock {
-            guard active, self.session == nil, session.connectionID == id else { throw NativeIPCFailure.unavailable }
+            guard active, channel != .owner, self.session == nil, session.connectionID == id,
+                  session.peerProfile == (channel == .integration ? .mcp : .appleAutomation) else { throw NativeIPCFailure.unavailable }
             self.session = session
         }
     }
     func integrationContext(peer: PeerEvidence) throws -> CapabilityConnectionContext {
         try lock.withLock {
-            guard active, let session else { throw NativeIPCFailure.unavailable }
+            guard active, channel != .owner, let session else { throw NativeIPCFailure.unavailable }
             return CapabilityConnectionContext(session: session, connectionID: id, peer: peer)
         }
     }
     func ownerConnection(peer: PeerEvidence) throws -> OwnerConnectionContext {
         try lock.withLock {
-            guard active else { throw NativeIPCFailure.unavailable }
+            guard active, channel == .owner else { throw NativeIPCFailure.unavailable }
             if let ownerContext { return ownerContext }
             let context = OwnerConnectionContext(connectionID: id, peer: peer); ownerContext = context; return context
         }
@@ -169,7 +175,7 @@ private final class NativeIntegrationEndpoint: NSObject, NativeIntegrationXPC, @
             guard frame.length > 0, frame.length <= NativeWire.maximumFrameBytes, credential.length == 32 else { throw NativeIPCFailure.malformedFrame }
             let envelope = try NativeWire.unpack(frame as Data, kind: .authenticate); id = envelope.requestID
             let binding = try NativeWire.decode(NativeHello.self, from: envelope.payload)
-            guard binding == NativeHello(channel: .integration, connectionID: state.id) else { throw NativeIPCFailure.untrustedPeer }
+            guard state.channel != .owner, binding == NativeHello(channel: state.channel, connectionID: state.id) else { throw NativeIPCFailure.untrustedPeer }
             let session = try authority().authenticate(connectionID: state.id, peer: peer, credential: credential as Data, now: clock.read().wall)
             try state.bind(session)
             reply(try NativeWire.frame(binding, kind: .authenticated, requestID: id) as NSData)

@@ -27,7 +27,7 @@ This is an inventory proposal, not a generated or installed bundle. Final signat
 
 | Artifact | Proposed identity and responsibility |
 | --- | --- |
-| Wallet app | Existing Wallet application identity; trusted owner-control deputy and registration owner. |
+| Wallet app | Existing application identity; trusted owner-control deputy, separate Apple integration host and registration owner. |
 | `OpalAgentService.app` / `AgentService` | Bundle/signing identifier `com.58opals.OpalAgent.Service`; app-like, profile-bearing per-user service helper. |
 | `AgentBridge` | Signing identifier `com.58opals.OpalAgent.MCP`; signed stdio executable with no service Keychain entitlement. |
 | LaunchAgent property list | Name and proposed label `com.58opals.OpalAgent.Service`; resolves the embedded service executable relative to Wallet's bundle. |
@@ -57,6 +57,8 @@ Explicitly select [`kSecUseDataProtectionKeychain = true`](https://developer.app
 
 The service alone opens its dedicated application storage. Supported database/journal backups exclude the independent anchor and wrapping key. The seed payload uses standard AES-GCM authenticated encryption; both save and restore validate encrypted protection metadata and bound identity/format context. Reject plaintext and downgrade paths. Missing key with existing ciphertext requires recovery; temporary inaccessibility must not be treated as missing or trigger regeneration. Successful decryption does not establish continuity.
 
+The proposed Apple integration credential is a separate device-local item owned by the Wallet host, with exact storage identity and access still requiring signed qualification. It is not the service wrapping key or continuity anchor and grants no membership in their access group. No live Apple credential provider or weaker storage fallback is delivered here.
+
 Owner controls and bridge have no direct database/key access and no storage fallback when the service is unavailable. Signing authority lives in the service; an application payment-approval policy does not isolate secrets from a compromised service.
 
 ## Reciprocal peer verification
@@ -69,12 +71,14 @@ Every production native connection must set the expected peer requirement before
 | --- | --- |
 | Wallet owner client | Exact approved service designated code requirement and compatible protocol. |
 | Stdio bridge client | Exact approved service designated code requirement and compatible protocol. |
+| Wallet Apple integration client | Exact approved service designated code requirement and compatible protocol; fixed enrolled Apple credential binding. |
 | Service owner interface | Exact approved Wallet designated code requirement, correct user context and required trusted owner-authentication flow. |
-| Service integration interface | Exact approved bridge designated code requirement, then service verification of its supplied integration credential. |
+| Service MCP integration interface | Exact approved bridge designated code requirement, then service verification of its supplied MCP-profile credential. |
+| Service Apple integration interface | Exact approved Wallet designated code requirement, then its separate Apple-profile credential; integration selectors only. |
 
 Record and evaluate the exact requirements of the final signed executables, including the approved signing identifier and Team/certificate provenance. Do not substitute a Team-only expression, executable path, label, same-user process or launcher metadata. Apple's [code requirement language](https://developer.apple.com/library/archive/documentation/Security/Conceptual/CodeSigningGuide/RequirementLang/RequirementLang.html) distinguishes identifier and certificate constraints; the proposed allowlist is a product requirement, not a current signed artifact.
 
-Owner and integration interfaces remain separate. Wallet performs required fresh human authentication as the trusted owner deputy; its signature alone supplies no consent. A signed bridge still needs a current credential and scope, and a stolen credential used through an allowed bridge remains a same-user threat. No host-process attestation is claimed.
+Owner, MCP integration and Apple integration interfaces remain separate. The optional Apple Mach service must differ from both existing services and shares their single authority/writer; absence leaves it unavailable. The source allowlist and profile checks supply no actual signed-endpoint qualification. Wallet performs required fresh human authentication as the trusted owner deputy; its signature alone supplies no consent. A signed bridge still needs a current credential and scope, and a stolen credential used through an allowed bridge remains a same-user threat. No host-process attestation is claimed.
 
 ## Installation, update and removal duties
 
@@ -114,6 +118,7 @@ The local lock excludes writers of one local store only. No cross-device clone f
 | Continuity and recovery | Injected complete-state, staging, promotion and recovery-latch failures | Actual Keychain/database crash and ambiguous-write durability; restart recovery | Supported backup, update and migration behavior with retained liabilities. |
 | Single local writer | Competing development-probe processes | Installed helper contention and lifecycle | Launch/update/removal ownership with the same store identity. |
 | Wallet-closed unattended operation | Design only | Logged-in/awake, locked-screen, UI-closed, sleep/wake and logout behavior | Registration approval, installation, update and removal. |
+| Mac Apple automation | Package compilation and actual extracted intent/entity/query metadata; synthetic adapter guards and actual-service scoped replay/authentication. Wallet owns its host, local request storage and owner routes. | Actual signed main-app integration, independent query privacy, revocation/reconnect and owner-review handoff; App Intents system invocation separately. | Qualified host credential storage, package discovery, supported Shortcuts/Spotlight/Siri behavior and matching release artifacts. |
 | Wallet/MCP functionality | Actual BCH/SQLite fixture, strict MCP adapter and SDK-client wire scenarios; ordinary wallet channel unavailable | Real signed owner/service clients, installed engine and host interoperability through qualified native IPC | End-to-end supported release acceptance. |
 
 Current evidence is source and synthetic only. The matrix's signed-runtime and distribution columns remain pending; a package build or synthetic role cannot satisfy them. Apple documentation supplies prerequisites, not proof of their composition. Distribution qualification requires suitable Developer Program provisioning and remains pending. Do not weaken entitlements, use ad-hoc identity as equivalent proof, switch Keychain backends or add a transport fallback to bypass that gate. The product is not ready for funding or production autonomy.

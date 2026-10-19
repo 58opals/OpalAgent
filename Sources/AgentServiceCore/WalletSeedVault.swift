@@ -185,7 +185,7 @@ struct OwnerWalletControl: Sendable {
         // Expected identity and authentication age come from trusted composition, never restored rows.
         let authority = AuthorizationAuthority(ledger: AuthorizationLedger(walletID: "owner-control", network: "owner-control", generation: 0, grants: []),
             expectedBridgeIdentity: policy.bridge, trustedOwnerIdentity: policy.owner,
-            maximumOwnerAuthenticationAge: policy.ownerAuthenticationAge)
+            maximumOwnerAuthenticationAge: policy.ownerAuthenticationAge, expectedAppleIntegrationIdentity: policy.appleIntegration)
         try authority.requireOwner(owner: owner, now: now)
     }
 }

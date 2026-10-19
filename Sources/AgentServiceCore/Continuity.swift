@@ -827,6 +827,9 @@ private func validateRetention(from old: CanonicalState, to new: CanonicalState,
     guard old.custody == nil || new.custody == old.custody else { throw ContinuityError.invalidState }
     guard new.hasCompleteGateCoverage(),
           Set(old.authorization.grants.map(\.id)).isSubset(of: Set(new.authorization.grants.map(\.id))),
+          old.authorization.grants.allSatisfy({ grant in
+              new.authorization.grants.contains { $0.id == grant.id && $0.peerProfile == grant.peerProfile }
+          }),
           old.authorization.grants.filter(\.expiredObserved).allSatisfy({ grant in
               new.authorization.grants.contains { $0.id == grant.id && $0.expiredObserved }
           }),

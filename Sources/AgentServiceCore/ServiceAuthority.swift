@@ -1,3 +1,4 @@
+import AgentValues
 import Foundation
 
 /// Source-only service boundary. Peer evidence and inventories must come from trusted adapters.
@@ -7,6 +8,12 @@ struct AuthorityPolicy: Sendable {
     let accountIDs: Set<String>
     let capabilities: Set<String>
     let ownerAuthenticationAge: Int64
+    let appleIntegration: SignedPeerIdentity?
+    init(bridge: SignedPeerIdentity, owner: SignedPeerIdentity, accountIDs: Set<String>, capabilities: Set<String>,
+         ownerAuthenticationAge: Int64, appleIntegration: SignedPeerIdentity? = nil) {
+        self.bridge = bridge; self.owner = owner; self.accountIDs = accountIDs; self.capabilities = capabilities
+        self.ownerAuthenticationAge = ownerAuthenticationAge; self.appleIntegration = appleIntegration
+    }
 }
 
 final class ServiceAuthority: Sendable {
@@ -20,7 +27,7 @@ final class ServiceAuthority: Sendable {
     }
 
     func enroll(id: String, integrationID: String, accounts: [String], capabilities: [String],
-                expiry: Int64?, owner: OwnerAuthenticationEvidence, now: Int64) throws -> IssuedCredential {
+                expiry: Int64?, owner: OwnerAuthenticationEvidence, now: Int64, peerProfile: IntegrationPeerProfile = .mcp) throws -> IssuedCredential {
         try withObservedExpirations(classification: "enrollment", now: now) { state, authority in
             let inventory = state.custody.map { Set([$0.accountID]) } ?? policy.accountIDs
             guard Set(accounts).isSubset(of: inventory),
@@ -28,7 +35,7 @@ final class ServiceAuthority: Sendable {
                 throw AuthorizationFailure.scopeDenied
             }
             return try authority.issueGrant(id: id, integrationID: integrationID,
-                accountIDs: accounts, capabilities: capabilities, expiresAt: expiry, owner: owner, now: now)
+                accountIDs: accounts, capabilities: capabilities, expiresAt: expiry, owner: owner, now: now, peerProfile: peerProfile)
         }
     }
 
@@ -103,7 +110,7 @@ final class ServiceAuthority: Sendable {
 
     private func authority(for state: CanonicalState) -> AuthorizationAuthority {
         AuthorizationAuthority(ledger: state.authorization, expectedBridgeIdentity: policy.bridge,
-            trustedOwnerIdentity: policy.owner, maximumOwnerAuthenticationAge: policy.ownerAuthenticationAge)
+            trustedOwnerIdentity: policy.owner, maximumOwnerAuthenticationAge: policy.ownerAuthenticationAge, expectedAppleIntegrationIdentity: policy.appleIntegration)
     }
 
     private func requireEnabled(_ state: CanonicalState) throws {

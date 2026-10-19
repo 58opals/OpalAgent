@@ -704,7 +704,7 @@ actor PaymentEngine {
 
     private static func authority(_ state: CanonicalState, policy: AuthorityPolicy) -> AuthorizationAuthority {
         AuthorizationAuthority(ledger: state.authorization, expectedBridgeIdentity: policy.bridge,
-            trustedOwnerIdentity: policy.owner, maximumOwnerAuthenticationAge: policy.ownerAuthenticationAge)
+            trustedOwnerIdentity: policy.owner, maximumOwnerAuthenticationAge: policy.ownerAuthenticationAge, expectedAppleIntegrationIdentity: policy.appleIntegration)
     }
     private static func requireEnabled(_ state: CanonicalState) throws {
         guard state.mode == .enabled, state.history == .complete, state.custody != nil,

@@ -347,7 +347,7 @@ actor ReceiveEngine {
         return try continuity.transaction(classification: name, mutation: { state -> Result<T, any Error> in
             guard state.mode == .enabled, state.history == .complete else { throw PaymentFailure.recoveryRequired }
             var authority = AuthorizationAuthority(ledger: state.authorization, expectedBridgeIdentity: policy.bridge,
-                trustedOwnerIdentity: policy.owner, maximumOwnerAuthenticationAge: policy.ownerAuthenticationAge)
+                trustedOwnerIdentity: policy.owner, maximumOwnerAuthenticationAge: policy.ownerAuthenticationAge, expectedAppleIntegrationIdentity: policy.appleIntegration)
             for id in authority.observeExpirations(now: now) { state.invalidateUnsubmitted(grantID: id) }
             state.authorization = authority.ledger
             return Result {

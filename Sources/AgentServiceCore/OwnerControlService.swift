@@ -173,7 +173,7 @@ struct OwnerControlService: Sendable {
             try continuity.inspect { try requireWallet(request.wallet, state: $0) }
             let issued = try authority().enroll(id: UUID().uuidString, integrationID: request.integrationID,
                 accounts: request.accountIDs, capabilities: request.scopes.map(\.rawValue), expiry: request.expiresAt,
-                owner: owner, now: clock.read().wall)
+                owner: owner, now: clock.read().wall, peerProfile: request.peerProfile)
             return .enrollIntegration(try issuedProjection(issued, wallet: request.wallet))
         case .rotateGrant(let selector):
             try continuity.inspect { try requireWallet(selector.wallet, state: $0) }
@@ -318,7 +318,7 @@ struct OwnerControlService: Sendable {
         GrantProjection(selector: try GrantSelector(wallet: scope, grantID: grant.id), integrationID: grant.integrationID,
             accountIDs: grant.accountIDs, scopes: grant.capabilities.compactMap(IntegrationScope.init(rawValue:)),
             expiresAt: grant.expiresAt, credentialGeneration: grant.credentialGeneration,
-            state: grant.revoked ? .revoked : (grant.expiredObserved || grant.expiresAt.map { clock.read().wall >= $0 } == true ? .expired : .active))
+            state: grant.revoked ? .revoked : (grant.expiredObserved || grant.expiresAt.map { clock.read().wall >= $0 } == true ? .expired : .active), peerProfile: grant.peerProfile)
     }
     private func paymentProjection(_ selector: OperationSelector, owner: OwnerAuthenticationEvidence?) async throws -> PaymentOperation {
         try requireSelector(selector)
@@ -413,7 +413,7 @@ struct OwnerControlService: Sendable {
         try requirePeer(connection)
         guard proof.challenge.connectionID == connection.connectionID else { throw ServiceProblem(.unavailable) }
         let authority = AuthorizationAuthority(ledger: AuthorizationLedger(walletID: "owner", network: "owner", generation: 0, grants: []),
-            expectedBridgeIdentity: policy.bridge, trustedOwnerIdentity: policy.owner, maximumOwnerAuthenticationAge: policy.ownerAuthenticationAge)
+            expectedBridgeIdentity: policy.bridge, trustedOwnerIdentity: policy.owner, maximumOwnerAuthenticationAge: policy.ownerAuthenticationAge, expectedAppleIntegrationIdentity: policy.appleIntegration)
         try authority.requireOwner(owner: OwnerAuthenticationEvidence(peer: connection.peer, authenticationSucceeded: true,
             authenticatedAt: proof.authenticatedAt), now: clock.read().wall)
     }

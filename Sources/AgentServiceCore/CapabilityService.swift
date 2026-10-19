@@ -250,7 +250,7 @@ final class CapabilityService: Sendable {
         return try continuity.transaction(classification: "capability.disclosure", mutation: { state -> Result<T, any Error> in
             if state.mode == .enabled {
                 var authority = AuthorizationAuthority(ledger: state.authorization, expectedBridgeIdentity: policy.bridge,
-                    trustedOwnerIdentity: policy.owner, maximumOwnerAuthenticationAge: policy.ownerAuthenticationAge)
+                    trustedOwnerIdentity: policy.owner, maximumOwnerAuthenticationAge: policy.ownerAuthenticationAge, expectedAppleIntegrationIdentity: policy.appleIntegration)
                 for grant in authority.observeExpirations(now: now) {
                     state.invalidateUnsubmitted(grantID: grant)
                     let payments = Set(state.payments.filter { $0.originGrantID == grant }.map(\.id))
@@ -282,7 +282,7 @@ final class CapabilityService: Sendable {
               state.custody?.accountID == account.accountID else { throw ServiceProblem(.unavailable) }
         try requireAccountCustody(state, accountID: account.accountID, network: account.wallet.network.rawValue)
         let authority = AuthorizationAuthority(ledger: state.authorization, expectedBridgeIdentity: policy.bridge,
-            trustedOwnerIdentity: policy.owner, maximumOwnerAuthenticationAge: policy.ownerAuthenticationAge)
+            trustedOwnerIdentity: policy.owner, maximumOwnerAuthenticationAge: policy.ownerAuthenticationAge, expectedAppleIntegrationIdentity: policy.appleIntegration)
         _ = try authority.authorize(session: context.session, connectionID: context.connectionID, peer: context.peer,
             operation: .init(walletID: account.wallet.walletID, network: account.wallet.network.rawValue,
                 accountID: account.accountID, capability: scope.rawValue), now: clock.read().wall)

@@ -7,6 +7,7 @@ let package = Package(
     products: [
         .library(name: "AgentValues", targets: ["AgentValues"]),
         .library(name: "AgentClient", targets: ["AgentClient"]),
+        .library(name: "AgentAppIntents", targets: ["AgentAppIntents"]),
         .executable(name: "AgentService", targets: ["AgentService"]),
         .executable(name: "AgentBridge", targets: ["AgentBridge"]),
         .executable(name: "StoreLockProbe", targets: ["StoreLockProbe"]),
@@ -21,6 +22,7 @@ let package = Package(
         .target(name: "AgentValues"),
         .target(name: "AgentNativeIPC", dependencies: ["AgentValues"]),
         .target(name: "AgentClient", dependencies: ["AgentValues", "AgentNativeIPC"]),
+        .target(name: "AgentAppIntents", dependencies: ["AgentClient", "AgentValues"]),
         .target(name: "AgentMCP", dependencies: ["AgentClient", "AgentValues", .product(name: "MCP", package: "swift-sdk"), .product(name: "Logging", package: "swift-log")]),
         .systemLibrary(name: "CSQLite"),
         .target(name: "AgentServiceCore", dependencies: ["AgentValues", "AgentNativeIPC", "CSQLite", .product(name: "OpalBaseCore", package: "OpalBase")]),
@@ -32,7 +34,8 @@ let package = Package(
         .testTarget(name: "AgentNativeIPCTests", dependencies: ["AgentNativeIPC", "AgentClient", "AgentValues"]),
         .testTarget(name: "AgentProtocolIntegrationTests", dependencies: ["AgentNativeIPC", "AgentProtocolFixture", "AgentMCP", "AgentClient", "AgentValues", "AgentServiceCore", .product(name: "OpalBaseCore", package: "OpalBase"), .product(name: "MCP", package: "swift-sdk")]),
         .testTarget(name: "AgentClientTests", dependencies: ["AgentClient", "AgentValues"]),
-        .testTarget(name: "AgentServiceCoreTests", dependencies: ["AgentServiceCore", "AgentClient", "AgentNativeIPC", "AgentValues", "CSQLite", .product(name: "OpalBaseCore", package: "OpalBase")])
+        .testTarget(name: "AgentAppIntentsTests", dependencies: ["AgentAppIntents", "AgentClient", "AgentValues"]),
+        .testTarget(name: "AgentServiceCoreTests", dependencies: ["AgentServiceCore", "AgentClient", "AgentAppIntents", "AgentNativeIPC", "AgentValues", "CSQLite", .product(name: "OpalBaseCore", package: "OpalBase")], resources: [.copy("Fixtures/LegacyGrantV2")])
     ],
     swiftLanguageModes: [.v6]
 )

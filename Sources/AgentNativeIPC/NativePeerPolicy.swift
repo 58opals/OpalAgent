@@ -3,7 +3,7 @@ import Foundation
 import Security
 
 public enum NativeIPCFailure: Error, Sendable, Equatable { case unavailable, malformedFrame, incompatibleProtocol, untrustedPeer }
-public enum NativeChannel: String, Codable, Sendable { case integration, owner }
+public enum NativeChannel: String, Codable, Sendable { case integration, owner, appleAutomation }
 
 /// Values come from the accepted signed-artifact policy, never a message or an inferred developer identity.
 public struct NativeSignedIdentity: Sendable, Equatable {
@@ -31,18 +31,29 @@ public struct NativeDeploymentPolicy: Sendable, Equatable {
     public let wallet: NativeSignedIdentity
     public let integrationMachService: String
     public let ownerMachService: String
+    public let appleIntegrationMachService: String?
     public init(service: NativeSignedIdentity, bridge: NativeSignedIdentity, wallet: NativeSignedIdentity,
-                integrationMachService: String, ownerMachService: String) throws {
+                integrationMachService: String, ownerMachService: String, appleIntegrationMachService: String? = nil) throws {
         guard service.teamIdentifier == bridge.teamIdentifier, service.teamIdentifier == wallet.teamIdentifier,
               Set([service.signingIdentifier, bridge.signingIdentifier, wallet.signingIdentifier]).count == 3,
-              Self.validName(integrationMachService), Self.validName(ownerMachService), integrationMachService != ownerMachService else {
+              Self.validName(integrationMachService), Self.validName(ownerMachService), integrationMachService != ownerMachService,
+              appleIntegrationMachService.map({ Self.validName($0) && $0 != integrationMachService && $0 != ownerMachService }) ?? true else {
             throw NativeIPCFailure.untrustedPeer
         }
         self.service = service; self.bridge = bridge; self.wallet = wallet
         self.integrationMachService = integrationMachService; self.ownerMachService = ownerMachService
+        self.appleIntegrationMachService = appleIntegrationMachService
     }
-    public func peer(for channel: NativeChannel) -> NativeSignedIdentity { channel == .integration ? bridge : wallet }
-    public func machService(for channel: NativeChannel) -> String { channel == .integration ? integrationMachService : ownerMachService }
+    public func peer(for channel: NativeChannel) -> NativeSignedIdentity {
+        switch channel { case .integration: bridge; case .owner, .appleAutomation: wallet }
+    }
+    public func machService(for channel: NativeChannel) -> String {
+        switch channel {
+        case .integration: integrationMachService
+        case .owner: ownerMachService
+        case .appleAutomation: appleIntegrationMachService ?? ""
+        }
+    }
     private static func validName(_ value: String) -> Bool {
         !value.isEmpty && value.utf8.count <= 255 && value.utf8.allSatisfy {
             (65...90).contains($0) || (97...122).contains($0) || (48...57).contains($0) || [45,46].contains($0)

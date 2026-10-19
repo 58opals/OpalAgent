@@ -1,3 +1,4 @@
+import AgentValues
 import CryptoKit
 import Foundation
 import Security
@@ -12,6 +13,57 @@ struct GrantRecord: Codable, Equatable, Sendable {
     var expiresAt: Int64?
     var revoked: Bool
     var expiredObserved: Bool = false
+    var peerProfile: IntegrationPeerProfile = .mcp
+
+    init(id: String, integrationID: String, accountIDs: [String], capabilities: [String], credentialDigest: Data,
+         credentialGeneration: UInt64, expiresAt: Int64?, revoked: Bool, expiredObserved: Bool = false,
+         peerProfile: IntegrationPeerProfile = .mcp) {
+        self.id = id; self.integrationID = integrationID; self.accountIDs = accountIDs; self.capabilities = capabilities
+        self.credentialDigest = credentialDigest; self.credentialGeneration = credentialGeneration
+        self.expiresAt = expiresAt; self.revoked = revoked; self.expiredObserved = expiredObserved; self.peerProfile = peerProfile
+    }
+    private enum CodingKeys: String, CodingKey {
+        case id, integrationID, accountIDs, capabilities, credentialDigest, credentialGeneration, expiresAt, revoked, expiredObserved
+        case peerProfile, profileCredentialDigest
+    }
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        // Absence alone denotes the legacy bridge profile. Explicit null or unknown values are invalid.
+        peerProfile = container.contains(.peerProfile) ? try container.decode(IntegrationPeerProfile.self, forKey: .peerProfile) : .mcp
+        let digestKey: CodingKeys = peerProfile == .mcp ? .credentialDigest : .profileCredentialDigest
+        let forbiddenKey: CodingKeys = peerProfile == .mcp ? .profileCredentialDigest : .credentialDigest
+        guard !container.contains(forbiddenKey) else {
+            throw DecodingError.dataCorruptedError(forKey: forbiddenKey, in: container, debugDescription: "Conflicting credential verifier")
+        }
+        credentialDigest = try container.decode(Data.self, forKey: digestKey)
+        if peerProfile == .appleAutomation, credentialDigest.count != 32 {
+            throw DecodingError.dataCorruptedError(forKey: digestKey, in: container, debugDescription: "Invalid credential verifier")
+        }
+        id = try container.decode(String.self, forKey: .id)
+        integrationID = try container.decode(String.self, forKey: .integrationID)
+        accountIDs = try container.decode([String].self, forKey: .accountIDs)
+        capabilities = try container.decode([String].self, forKey: .capabilities)
+        credentialGeneration = try container.decode(UInt64.self, forKey: .credentialGeneration)
+        expiresAt = try container.decodeIfPresent(Int64.self, forKey: .expiresAt)
+        revoked = try container.decode(Bool.self, forKey: .revoked)
+        expiredObserved = try container.decode(Bool.self, forKey: .expiredObserved)
+    }
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id); try container.encode(integrationID, forKey: .integrationID)
+        try container.encode(accountIDs, forKey: .accountIDs); try container.encode(capabilities, forKey: .capabilities)
+        try container.encode(credentialGeneration, forKey: .credentialGeneration)
+        try container.encodeIfPresent(expiresAt, forKey: .expiresAt)
+        try container.encode(revoked, forKey: .revoked); try container.encode(expiredObserved, forKey: .expiredObserved)
+        if peerProfile == .mcp {
+            // Preserve the exact legacy canonical representation, including the omitted profile.
+            try container.encode(credentialDigest, forKey: .credentialDigest)
+        } else {
+            try container.encode(peerProfile, forKey: .peerProfile)
+            // Same SHA-256 verifier; the distinct required field makes unsupported readers refuse this row.
+            try container.encode(credentialDigest, forKey: .profileCredentialDigest)
+        }
+    }
 
     func canonicalized() -> Self {
         var result = self
@@ -80,6 +132,7 @@ struct AuthorizationSession: Sendable {
     let connectionID: String
     let credentialGeneration: UInt64
     let walletGeneration: UInt64
+    let peerProfile: IntegrationPeerProfile
     fileprivate let credentialDigest: Data
 }
 
@@ -106,6 +159,7 @@ enum AuthorizationFailure: Error, Equatable {
 struct AuthorizationAuthority: Sendable {
     private(set) var ledger: AuthorizationLedger
     let expectedBridgeIdentity: SignedPeerIdentity
+    let expectedAppleIntegrationIdentity: SignedPeerIdentity?
     let trustedOwnerIdentity: SignedPeerIdentity
     let maximumOwnerAuthenticationAge: Int64
 
@@ -113,10 +167,12 @@ struct AuthorizationAuthority: Sendable {
         ledger: AuthorizationLedger,
         expectedBridgeIdentity: SignedPeerIdentity,
         trustedOwnerIdentity: SignedPeerIdentity,
-        maximumOwnerAuthenticationAge: Int64
+        maximumOwnerAuthenticationAge: Int64,
+        expectedAppleIntegrationIdentity: SignedPeerIdentity? = nil
     ) {
         self.ledger = ledger.canonicalized()
         self.expectedBridgeIdentity = expectedBridgeIdentity
+        self.expectedAppleIntegrationIdentity = expectedAppleIntegrationIdentity
         self.trustedOwnerIdentity = trustedOwnerIdentity
         self.maximumOwnerAuthenticationAge = maximumOwnerAuthenticationAge
     }
@@ -141,9 +197,11 @@ struct AuthorizationAuthority: Sendable {
         capabilities: [String],
         expiresAt: Int64?,
         owner: OwnerAuthenticationEvidence,
-        now: Int64
+        now: Int64,
+        peerProfile: IntegrationPeerProfile = .mcp
     ) throws -> IssuedCredential {
         try requireOwner(owner: owner, now: now)
+        _ = try integrationIdentity(for: peerProfile)
         guard !id.isEmpty, !integrationID.isEmpty,
               !accountIDs.isEmpty, accountIDs.allSatisfy({ !$0.isEmpty }),
               !capabilities.isEmpty, capabilities.allSatisfy({ !$0.isEmpty }),
@@ -160,7 +218,7 @@ struct AuthorizationAuthority: Sendable {
         let grant = GrantRecord(
             id: id, integrationID: integrationID, accountIDs: accountIDs,
             capabilities: capabilities, credentialDigest: Self.digest(credential),
-            credentialGeneration: 1, expiresAt: expiresAt, revoked: false
+            credentialGeneration: 1, expiresAt: expiresAt, revoked: false, peerProfile: peerProfile
         ).canonicalized()
         ledger.grants.append(grant)
         ledger = ledger.canonicalized()
@@ -207,7 +265,6 @@ struct AuthorizationAuthority: Sendable {
         credential: Data,
         now: Int64
     ) throws -> AuthorizationSession {
-        try requirePeer(peer, identity: expectedBridgeIdentity)
         guard !connectionID.isEmpty else { throw AuthorizationFailure.invalidRequest }
         guard credential.count == 32 else { throw AuthorizationFailure.invalidCredential }
         let credentialDigest = Self.digest(credential)
@@ -215,11 +272,12 @@ struct AuthorizationAuthority: Sendable {
         guard matches.count == 1, let grant = matches.first else {
             throw AuthorizationFailure.invalidCredential
         }
+        try requirePeer(peer, identity: integrationIdentity(for: grant.peerProfile))
         try validateGrant(grant, now: now)
         return AuthorizationSession(
             principal: grant.principal, connectionID: connectionID,
             credentialGeneration: grant.credentialGeneration,
-            walletGeneration: ledger.generation, credentialDigest: credentialDigest
+            walletGeneration: ledger.generation, peerProfile: grant.peerProfile, credentialDigest: credentialDigest
         )
     }
 
@@ -231,14 +289,14 @@ struct AuthorizationAuthority: Sendable {
         operation: AuthorizationOperation,
         now: Int64
     ) throws -> IntegrationPrincipal {
-        try requirePeer(peer, identity: expectedBridgeIdentity)
+        try requirePeer(peer, identity: integrationIdentity(for: session.peerProfile))
         guard session.connectionID == connectionID,
               session.walletGeneration == ledger.generation else {
             throw AuthorizationFailure.staleSession
         }
         let index = try grantIndex(id: session.principal.grantID)
         let grant = ledger.grants[index]
-        guard grant.principal == session.principal,
+        guard grant.principal == session.principal, grant.peerProfile == session.peerProfile,
               grant.credentialGeneration == session.credentialGeneration,
               Self.equalDigest(grant.credentialDigest, session.credentialDigest) else {
             throw AuthorizationFailure.staleSession
@@ -267,6 +325,15 @@ struct AuthorizationAuthority: Sendable {
             session: session, connectionID: connectionID, peer: peer,
             operation: operation, now: now
         )
+    }
+
+    private func integrationIdentity(for profile: IntegrationPeerProfile) throws -> SignedPeerIdentity {
+        switch profile {
+        case .mcp: return expectedBridgeIdentity
+        case .appleAutomation:
+            guard let expectedAppleIntegrationIdentity else { throw AuthorizationFailure.untrustedPeer }
+            return expectedAppleIntegrationIdentity
+        }
     }
 
     private func requirePeer(_ peer: PeerEvidence, identity: SignedPeerIdentity) throws {

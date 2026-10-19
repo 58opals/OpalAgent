@@ -125,7 +125,7 @@ private func validateOwnerResult(_ result: OwnerControlResult, for call: OwnerCo
         try validateGrant(issued.grant)
         try requireCapabilityResponse(issued.grant.selector.wallet == request.wallet && issued.grant.integrationID == request.integrationID &&
             Set(issued.grant.accountIDs) == Set(request.accountIDs) && Set(issued.grant.scopes) == Set(request.scopes) &&
-            issued.grant.expiresAt == request.expiresAt && issued.grant.state == .active && issued.credential.withBytes { $0.count == 32 })
+            issued.grant.expiresAt == request.expiresAt && issued.grant.peerProfile == request.peerProfile && issued.grant.state == .active && issued.credential.withBytes { $0.count == 32 })
     case (.rotateGrant(let selector), .rotateGrant(let issued)):
         try validateGrant(issued.grant)
         try requireCapabilityResponse(issued.grant.selector == selector && issued.grant.state == .active && issued.credential.withBytes { $0.count == 32 })

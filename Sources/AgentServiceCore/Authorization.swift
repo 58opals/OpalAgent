@@ -186,7 +186,7 @@ struct AuthorizationAuthority: Sendable {
               !age.overflow,
               age.partialValue >= 0,
               age.partialValue <= maximumOwnerAuthenticationAge else {
-            throw AuthorizationFailure.ownerAuthenticationRequired
+            ServiceDiagnostics.authorizationDenied(.ownerAuthenticationRequired); throw AuthorizationFailure.ownerAuthenticationRequired
         }
     }
 
@@ -212,7 +212,7 @@ struct AuthorizationAuthority: Sendable {
                       ($0.expiresAt.map { now < $0 } ?? true)
               }),
               expiresAt.map({ $0 > now }) ?? true else {
-            throw AuthorizationFailure.invalidRequest
+            ServiceDiagnostics.authorizationDenied(.invalidRequest); throw AuthorizationFailure.invalidRequest
         }
         let credential = try Self.makeCredential()
         let grant = GrantRecord(
@@ -245,7 +245,7 @@ struct AuthorizationAuthority: Sendable {
         let index = try grantIndex(id: id)
         try validateGrant(ledger.grants[index], now: now)
         guard ledger.grants[index].credentialGeneration < UInt64.max else {
-            throw AuthorizationFailure.invalidRequest
+            ServiceDiagnostics.authorizationDenied(.invalidRequest); throw AuthorizationFailure.invalidRequest
         }
         let credential = try Self.makeCredential()
         ledger.grants[index].credentialDigest = Self.digest(credential)
@@ -265,12 +265,12 @@ struct AuthorizationAuthority: Sendable {
         credential: Data,
         now: Int64
     ) throws -> AuthorizationSession {
-        guard !connectionID.isEmpty else { throw AuthorizationFailure.invalidRequest }
-        guard credential.count == 32 else { throw AuthorizationFailure.invalidCredential }
+        guard !connectionID.isEmpty else { ServiceDiagnostics.authorizationDenied(.invalidRequest); throw AuthorizationFailure.invalidRequest }
+        guard credential.count == 32 else { ServiceDiagnostics.authorizationDenied(.invalidCredential); throw AuthorizationFailure.invalidCredential }
         let credentialDigest = Self.digest(credential)
         let matches = ledger.grants.filter { Self.equalDigest($0.credentialDigest, credentialDigest) }
         guard matches.count == 1, let grant = matches.first else {
-            throw AuthorizationFailure.invalidCredential
+            ServiceDiagnostics.authorizationDenied(.invalidCredential); throw AuthorizationFailure.invalidCredential
         }
         try requirePeer(peer, identity: integrationIdentity(for: grant.peerProfile))
         try validateGrant(grant, now: now)
@@ -292,21 +292,21 @@ struct AuthorizationAuthority: Sendable {
         try requirePeer(peer, identity: integrationIdentity(for: session.peerProfile))
         guard session.connectionID == connectionID,
               session.walletGeneration == ledger.generation else {
-            throw AuthorizationFailure.staleSession
+            ServiceDiagnostics.authorizationDenied(.staleSession); throw AuthorizationFailure.staleSession
         }
         let index = try grantIndex(id: session.principal.grantID)
         let grant = ledger.grants[index]
         guard grant.principal == session.principal, grant.peerProfile == session.peerProfile,
               grant.credentialGeneration == session.credentialGeneration,
               Self.equalDigest(grant.credentialDigest, session.credentialDigest) else {
-            throw AuthorizationFailure.staleSession
+            ServiceDiagnostics.authorizationDenied(.staleSession); throw AuthorizationFailure.staleSession
         }
         try validateGrant(grant, now: now)
         guard operation.walletID == ledger.walletID,
               operation.network == ledger.network,
               grant.accountIDs.contains(operation.accountID),
               grant.capabilities.contains(operation.capability) else {
-            throw AuthorizationFailure.scopeDenied
+            ServiceDiagnostics.authorizationDenied(.scopeDenied); throw AuthorizationFailure.scopeDenied
         }
         return grant.principal
     }
@@ -320,7 +320,7 @@ struct AuthorizationAuthority: Sendable {
         operation: AuthorizationOperation,
         now: Int64
     ) throws -> IntegrationPrincipal {
-        guard resultOwner == session.principal else { throw AuthorizationFailure.unavailable }
+        guard resultOwner == session.principal else { ServiceDiagnostics.authorizationDenied(.unavailable); throw AuthorizationFailure.unavailable }
         return try authorize(
             session: session, connectionID: connectionID, peer: peer,
             operation: operation, now: now
@@ -331,21 +331,21 @@ struct AuthorizationAuthority: Sendable {
         switch profile {
         case .mcp: return expectedBridgeIdentity
         case .appleAutomation:
-            guard let expectedAppleIntegrationIdentity else { throw AuthorizationFailure.untrustedPeer }
+            guard let expectedAppleIntegrationIdentity else { ServiceDiagnostics.authorizationDenied(.untrustedPeer); throw AuthorizationFailure.untrustedPeer }
             return expectedAppleIntegrationIdentity
         }
     }
 
     private func requirePeer(_ peer: PeerEvidence, identity: SignedPeerIdentity) throws {
         guard peer.signatureValidated, peer.identity == identity else {
-            throw AuthorizationFailure.untrustedPeer
+            ServiceDiagnostics.authorizationDenied(.untrustedPeer); throw AuthorizationFailure.untrustedPeer
         }
     }
 
     private func grantIndex(id: String) throws -> Int {
         let indices = ledger.grants.indices.filter { ledger.grants[$0].id == id }
         guard indices.count == 1, let index = indices.first else {
-            throw AuthorizationFailure.unavailable
+            ServiceDiagnostics.authorizationDenied(.unavailable); throw AuthorizationFailure.unavailable
         }
         return index
     }
@@ -355,11 +355,11 @@ struct AuthorizationAuthority: Sendable {
               grant.credentialDigest.count == 32, grant.credentialGeneration > 0,
               !grant.accountIDs.isEmpty, grant.accountIDs.allSatisfy({ !$0.isEmpty }),
               !grant.capabilities.isEmpty, grant.capabilities.allSatisfy({ !$0.isEmpty }) else {
-            throw AuthorizationFailure.unavailable
+            ServiceDiagnostics.authorizationDenied(.unavailable); throw AuthorizationFailure.unavailable
         }
-        guard !grant.revoked else { throw AuthorizationFailure.revoked }
+        guard !grant.revoked else { ServiceDiagnostics.authorizationDenied(.revoked); throw AuthorizationFailure.revoked }
         if grant.expiredObserved || grant.expiresAt.map({ now >= $0 }) == true {
-            throw AuthorizationFailure.expired
+            ServiceDiagnostics.authorizationDenied(.expired); throw AuthorizationFailure.expired
         }
     }
 
@@ -368,7 +368,7 @@ struct AuthorizationAuthority: Sendable {
         let status = bytes.withUnsafeMutableBytes {
             SecRandomCopyBytes(kSecRandomDefault, $0.count, $0.baseAddress!)
         }
-        guard status == errSecSuccess else { throw AuthorizationFailure.randomnessUnavailable }
+        guard status == errSecSuccess else { ServiceDiagnostics.authorizationDenied(.randomnessUnavailable); throw AuthorizationFailure.randomnessUnavailable }
         return Data(bytes)
     }
 

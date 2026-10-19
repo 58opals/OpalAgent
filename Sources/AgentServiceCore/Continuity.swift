@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import OpalDiagnostics
 
 // Authoritative service rows. External engine and persistence adapters own their effects.
 enum WalletMode: String, Codable, Sendable { case restricted, enabled }
@@ -471,7 +472,9 @@ final class ContinuityCoordinator: @unchecked Sendable {
         guard proposed.invalidateAllUnsubmitted() else { return original.state }
         proposed.commitID = UUID().uuidString
         try validateRetention(from: original.state, to: proposed)
-        try handshake(proposed, from: original.anchor, classification: "startupInvalidation")
+        let trace = ServiceDiagnostics.attemptTrace()
+        try handshake(proposed, from: original.anchor, classification: "startupInvalidation", diagnosticTrace: trace)
+        recordPaymentTransitions(from: original.state, to: proposed, trace: trace)
         return proposed.canonicalized()
     }
 
@@ -548,7 +551,10 @@ final class ContinuityCoordinator: @unchecked Sendable {
             return try projection(original.state.canonicalized(), intermediate)
         }
         proposed.commitID = UUID().uuidString
-        try handshake(proposed, from: original.anchor, classification: classification)
+        let trace = ServiceDiagnostics.attemptTrace()
+        try handshake(proposed, from: original.anchor, classification: classification, diagnosticTrace: trace)
+        recordPaymentTransitions(from: original.state, to: proposed, trace: trace)
+        // Projection may throw after the verified state changed; observations do not imply rollback.
         return try projection(proposed.canonicalized(), intermediate)
     }
 
@@ -698,6 +704,7 @@ final class ContinuityCoordinator: @unchecked Sendable {
             finished.recovery = nil
             try writeAnchorAndVerify(finished)
             quarantine = false
+            ServiceDiagnostics.recoveryCompleted(history: candidate.history, path: .resumed)
             return candidate
         }
         let qualified = proofs.first { $0.reference == candidateReference }
@@ -724,11 +731,15 @@ final class ContinuityCoordinator: @unchecked Sendable {
         finished.recovery = nil
         try writeAnchorAndVerify(finished)
         quarantine = false
+        ServiceDiagnostics.recoveryCompleted(history: reset.history, path: .reset)
         return reset
     }
 
     private func trusted() throws -> (state: CanonicalState, anchor: ContinuityAnchor) {
-        guard !quarantine else { throw ContinuityError.recoveryRequired }
+        guard !quarantine else {
+            ServiceDiagnostics.trustUnavailable(.recoveryRequired)
+            throw ContinuityError.recoveryRequired
+        }
         do {
             let currentAnchor = try readAnchorRequired()
             try currentAnchor.validate()
@@ -741,17 +752,20 @@ final class ContinuityCoordinator: @unchecked Sendable {
             }
             return (state, currentAnchor)
         } catch ContinuityError.keyUnavailable {
+            ServiceDiagnostics.trustUnavailable(.keyUnavailable)
             throw ContinuityError.keyUnavailable
         } catch ContinuityError.storageUnavailable {
+            ServiceDiagnostics.trustUnavailable(.storageUnavailable)
             throw ContinuityError.storageUnavailable
         } catch {
             quarantine = true
+            ServiceDiagnostics.trustUnavailable(.recoveryRequired)
             throw error
         }
     }
 
     private func handshake(_ state: CanonicalState, from original: ContinuityAnchor,
-                           classification: String) throws {
+                           classification: String, diagnosticTrace: OpalDiagnostics.TraceID? = nil) throws {
         try state.validate()
         guard original.pending == nil, !classification.isEmpty else {
             quarantine = true
@@ -770,6 +784,26 @@ final class ContinuityCoordinator: @unchecked Sendable {
         promoted.committed = target
         promoted.pending = nil
         try writeAnchorAndVerify(promoted)
+        // Read-back, including ambiguous writes, owns this fact; it is not command success.
+        ServiceDiagnostics.barrierVerified(trace: diagnosticTrace)
+    }
+
+    private func recordPaymentTransitions(from original: CanonicalState, to proposed: CanonicalState,
+                                          trace: OpalDiagnostics.TraceID?) {
+        guard ServiceDiagnostics.payment.isEnabled(level: .notice) else { return }
+        var previous: [String: PaymentDisposition] = [:]
+        for row in original.payments { previous[row.id] = row.disposition }
+        var groups: [String: (from: PaymentDisposition?, to: PaymentDisposition)] = [:]
+        for row in proposed.payments where previous[row.id] != row.disposition {
+            let from = previous[row.id]
+            let key = (from?.rawValue ?? "new") + "." + row.disposition.rawValue
+            groups[key] = (from, row.disposition)
+        }
+        for key in groups.keys.sorted() {
+            if let group = groups[key] {
+                ServiceDiagnostics.paymentTransition(from: group.from, to: group.to, trace: trace)
+            }
+        }
     }
 
     private func writeAnchorAndVerify(_ expected: ContinuityAnchor) throws {

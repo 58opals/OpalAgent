@@ -20,7 +20,7 @@ Requires macOS 27.0, Xcode 27 and Swift 6.4. The products are:
 
 `AgentServiceCore` is an internal target with no library product. It uses the public `OpalBaseCore` ordinary-BCH product and system SQLite through `CSQLite`. Client and bridge cannot import the engine through a public product. `AgentAppIntents` imports only the public client/values and Apple frameworks, with no engine, Base, SQLite or MCP SDK dependency. `AgentMCP` owns the official MCP SDK dependency; the public values/client and native wire targets have no SDK, Base or SQLite dependency. The bridge does not link the engine or privacy integrations.
 
-The package pins public OpalBase revision `f1ec2dc05ce778eb2d29230b0fd9ba5fc1c02597`, which provides `OpalBaseCore`. The official Swift MCP SDK is pinned to exact version `0.12.1` (revision `a0ae212ebf6eab5f754c3129608bc5557637e605`). The root `Package.resolved` records the canonical public dependency graph.
+The package pins public OpalBase revision `f1ec2dc05ce778eb2d29230b0fd9ba5fc1c02597`, which provides `OpalBaseCore`. The official Swift MCP SDK is pinned to exact version `0.12.1` (revision `a0ae212ebf6eab5f754c3129608bc5557637e605`). Agent-owned observations use public OpalDiagnostics revision `97dfa7674ea3a25147a025b9c66fd65bff74fb0e`, already shared by the foundation packages. The direct `develop` requirement matches their compatible requirement; the root `Package.resolved` retains the exact canonical public dependency graph.
 
 ## Build and test
 
@@ -36,6 +36,10 @@ swift test --no-parallel --scratch-path "<external-directory>"
 Process tests discover the exact `AgentProtocolFixture` executable beside the loaded package test bundle. An optional explicit executable binding requires both `OPAL_AGENT_PROTOCOL_FIXTURE_EXECUTABLE` and its matching `OPAL_AGENT_PROTOCOL_FIXTURE_SHA256`; partial or mismatching bindings fail before launch. No fixture environment configuration is required for the command above. Normal fixture construction remains fresh-only; process tests resume only their own capability-bound disposable namespace.
 
 Deterministic tests use disposable synthetic keys/data, actual SQLite and injected chain/relay/anchor boundaries. They include process termination around SQL commits, concurrency, restart, stale evidence and recovery. Real Base integration exercises derivation, transaction construction and public reservation/submission APIs. These checks do not qualify a live Keychain anchor, real XPC signatures, an installed helper, remote chain completeness or installed-service interoperability. The protocol fixture supports the documented November actual-SDK-client and limited June actual-host synthetic wire acceptance. Both exercise all twelve tools; the host scenario also checks receive replay, retained-key recovery and one uncertain synthetic submission with its liability held.
+
+## Diagnostics
+
+Diagnostics are silent by default. The service and bridge entries explicitly select their exact Agent categories while leaving buffering and routing disabled. Embedders own any capture configuration; libraries do not configure or clear it. Agent events contain only closed public classifications and fresh local random trace tokens. They never accept wallet/request identifiers, amounts, credentials, payloads, endpoints or arbitrary error text, including private fields. SDK loggers remain no-op and stdout remains protocol-only. See the [observation contract](Documentation/Architecture.md#diagnostic-observations) for capture scope and evidence limits.
 
 ## Product boundaries
 

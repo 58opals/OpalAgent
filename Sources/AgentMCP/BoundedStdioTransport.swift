@@ -33,16 +33,17 @@ public actor BoundedStdioTransport: Transport {
     }
 
     public func connect() throws {
-        guard !used else { throw MCPError.connectionClosed }
+        guard !used else { MCPDiagnostics.transportFailed(.connection); throw MCPError.connectionClosed }
         used = true
         for descriptor in [input, output] {
             let flags = fcntl(descriptor, F_GETFL)
             guard flags >= 0, fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0 else {
+                MCPDiagnostics.transportFailed(.connection)
                 throw MCPError.connectionClosed
             }
         }
         // Broken stdout must fail a write rather than terminate a process with SIGPIPE.
-        guard fcntl(output, F_SETNOSIGPIPE, 1) == 0 else { throw MCPError.connectionClosed }
+        guard fcntl(output, F_SETNOSIGPIPE, 1) == 0 else { MCPDiagnostics.transportFailed(.connection); throw MCPError.connectionClosed }
         connected = true
         reader = Task { await readFrames() }
     }
@@ -51,7 +52,7 @@ public actor BoundedStdioTransport: Transport {
 
     public func send(_ data: Data) async throws {
         guard connected, data.count <= MCPBounds.outputBytes, !data.contains(10),
-              writes.count < MCPBounds.concurrentRequests else { throw MCPError.connectionClosed }
+              writes.count < MCPBounds.concurrentRequests else { MCPDiagnostics.transportFailed(.send); throw MCPError.connectionClosed }
         var framed = data
         framed.append(10)
         try await withCheckedThrowingContinuation { completion in
@@ -84,7 +85,7 @@ public actor BoundedStdioTransport: Transport {
             if count == 0 {
                 // A non-newline-terminated final fragment is not a complete stdio message.
                 if pending.isEmpty { continuation.finish() }
-                else { continuation.finish(throwing: MCPError.invalidRequest("Incomplete frame")) }
+                else { MCPDiagnostics.transportFailed(.incompleteFrame); continuation.finish(throwing: MCPError.invalidRequest("Incomplete frame")) }
                 return
             }
             if count < 0 {
@@ -92,6 +93,7 @@ public actor BoundedStdioTransport: Transport {
                     do { try await Task.sleep(for: .milliseconds(5)) } catch { break }
                     continue
                 }
+                MCPDiagnostics.transportFailed(.read)
                 continuation.finish(throwing: MCPError.connectionClosed)
                 return
             }
@@ -99,17 +101,20 @@ public actor BoundedStdioTransport: Transport {
             for index in 0..<count where buffer[index] == 10 {
                 let segment = buffer[start..<index]
                 guard pending.count <= MCPBounds.inputBytes - segment.count else {
+                    MCPDiagnostics.transportFailed(.frameSize)
                     continuation.finish(throwing: MCPError.invalidRequest("Frame too large"))
                     return
                 }
                 pending.append(contentsOf: segment)
                 guard !pending.isEmpty else {
+                    MCPDiagnostics.transportFailed(.emptyFrame)
                     continuation.finish(throwing: MCPError.invalidRequest("Empty frame"))
                     return
                 }
                 switch continuation.yield(pending) {
                 case .enqueued: break
                 case .dropped, .terminated:
+                    MCPDiagnostics.transportFailed(.capacity)
                     continuation.finish(throwing: MCPError.invalidRequest("Input capacity exceeded"))
                     return
                 @unknown default: return
@@ -119,6 +124,7 @@ public actor BoundedStdioTransport: Transport {
             }
             let remaining = buffer[start..<count]
             guard pending.count <= MCPBounds.inputBytes - remaining.count else {
+                MCPDiagnostics.transportFailed(.frameSize)
                 continuation.finish(throwing: MCPError.invalidRequest("Frame too large"))
                 return
             }
@@ -146,6 +152,7 @@ public actor BoundedStdioTransport: Transport {
                 }
                 item.completion.resume()
             } catch {
+                MCPDiagnostics.transportFailed(.write)
                 item.completion.resume(throwing: MCPError.connectionClosed)
                 connected = false
                 continuation.finish(throwing: MCPError.connectionClosed)

@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import OpalDiagnostics
 import Testing
 @testable import AgentServiceCore
 
@@ -359,6 +360,34 @@ private enum InvalidOwnerAuthentication: CaseIterable, Sendable {
         switch self {
         case .wrongPeer, .unsigned: .untrustedPeer
         case .failed, .stale, .future, .overflow: .ownerAuthenticationRequired
+        }
+    }
+}
+
+
+extension AuthorizationTests {
+    @Test(arguments: [false, true])
+    func diagnosticsObserveDenialsWithoutChangingAuthorizationOrHostConfiguration(enabled: Bool) throws {
+        let configuration = enabled ? OpalDiagnostics.Configuration(
+            subsystem: "com.58opals.agent.tests", categoryFilter: .enabled(["agent.authorization"]),
+            bufferPolicy: .enabled(capacity: 4), routingPolicy: .disabled) : .init()
+        try OpalDiagnostics.withConfiguration(configuration) {
+            let fixture = try authorizationFixture()
+            let ledger = fixture.authority.ledger
+            #expect(throws: AuthorizationFailure.invalidCredential) {
+                try fixture.authority.authenticate(connectionID: "connection-b", peer: bridgePeer,
+                    credential: Data("private-credential-canary".utf8), now: 100)
+            }
+            #expect(fixture.authority.ledger == ledger)
+            #expect(OpalDiagnostics.configuration == configuration)
+            let records = OpalDiagnostics.recentRecords
+            #expect(records.count == (enabled ? 1 : 0))
+            if enabled {
+                let record = try #require(records.first)
+                #expect(record.category.rawValue == "agent.authorization" && record.event.rawValue == "authorization_denied")
+                #expect(record.fields == [.publicField("reason", value: "invalid_credential")])
+                #expect(UUID(uuidString: record.traceID?.rawValue ?? "") != nil)
+            }
         }
     }
 }

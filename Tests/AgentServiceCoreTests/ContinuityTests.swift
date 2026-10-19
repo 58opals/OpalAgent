@@ -1,4 +1,5 @@
 import Foundation
+import OpalDiagnostics
 import Testing
 @testable import AgentServiceCore
 
@@ -184,12 +185,17 @@ private func ordinaryFailuresNeverAcknowledgeAndRestartOnlyTrustsCleanExactState
     let (database, anchor, coordinator) = try stores()
     anchor.writeFailures = [1: .after, 2: .after]
     database.writeFailures = [1: .after]
-    let result = try coordinator.transaction(mutation: { $0.allocations[0].issuedHighWater = 2 }, projection: { state, _ in
+    let result = try OpalDiagnostics.withConfiguration(continuityCapture) {
+        let result = try coordinator.transaction(mutation: { $0.allocations[0].issuedHighWater = 2 }, projection: { state, _ in
         #expect(anchor.value?.pending == nil)
         let reference = try state.reference()
         #expect(anchor.value?.committed == reference)
         return "acknowledged"
-    })
+        })
+        #expect(OpalDiagnostics.recentRecords.map(\.event.rawValue) == ["barrier_verified"])
+        #expect(OpalDiagnostics.configuration == continuityCapture)
+        return result
+    }
     #expect(result == "acknowledged")
     #expect(anchor.value?.committed == (try database.value?.reference()))
     #expect(anchor.trace.events == ["anchor.read", "database.read", "anchor.write", "anchor.read", "database.write", "database.read", "anchor.write", "anchor.read"])
@@ -255,7 +261,10 @@ private func recoveryFailurePrefixesRetainStableLatchAndNeverReviveCopiedAuthori
     case .clearBefore: anchor.writeFailures[5] = .before
     case .clearReadback: anchor.readFailures[7] = .unavailable
     }
-    #expect(throws: (any Error).self) { try coordinator.recover(ownerAuthorized: true, recoveryID: "stable") }
+    OpalDiagnostics.withConfiguration(continuityCapture) {
+        #expect(throws: (any Error).self) { try coordinator.recover(ownerAuthorized: true, recoveryID: "stable") }
+        #expect(!OpalDiagnostics.recentRecords.contains { $0.event.rawValue == "recovery_completed" })
+    }
     let latchWasWritten = !anchor.history.isEmpty
     let oldLatch = anchor.history.first?.recovery
     if latchWasWritten {
@@ -276,7 +285,14 @@ private func recoveryFailurePrefixesRetainStableLatchAndNeverReviveCopiedAuthori
     // Clear faults; resuming a durable latch ignores a caller-supplied new recovery ID.
     anchor.readFailures = [:]; anchor.writeFailures = [:]
     database.readFailures = [:]; database.writeFailures = [:]
-    let reset = try restarted.recover(ownerAuthorized: true, recoveryID: "different")
+    let reset = try OpalDiagnostics.withConfiguration(continuityCapture) {
+        let reset = try restarted.recover(ownerAuthorized: true, recoveryID: "different")
+        let completed = OpalDiagnostics.recentRecords.filter { $0.event.rawValue == "recovery_completed" }
+        #expect(completed.count == 1)
+        #expect(completed.first?.fields.first { $0.name == "history" }?.value == "complete")
+        #expect(anchor.value?.recovery == nil && anchor.value?.pending == nil)
+        return reset
+    }
     #expect(reset.mode == .restricted && reset.authorization.grants.allSatisfy { $0.revoked })
     #expect(reset.payments.first { $0.id == "possible" } == original.payments[0])
     #expect(reset.gates == original.gates)
@@ -493,4 +509,44 @@ private enum ProjectionFailure: Error { case failed }
         try coordinator.transaction { $0.authorization.grants[0].expiredObserved = false }
     }
     #expect(anchor.writes == 0)
+}
+
+
+private let continuityCapture = OpalDiagnostics.Configuration(
+    subsystem: "com.58opals.agent.tests", categoryFilter: .enabled(["agent.journal", "agent.payment", "agent.recovery"]),
+    bufferPolicy: .enabled(capacity: 40), routingPolicy: .disabled)
+
+@Test(arguments: [false, true])
+func diagnosticsReportVerifiedPaymentChangesEvenWhenProjectionThrows(enabled: Bool) throws {
+    let configuration = enabled ? continuityCapture : OpalDiagnostics.Configuration()
+    let (database, anchor, coordinator) = try stores()
+    anchor.writeFailures = [1: .after, 2: .after]
+    database.writeFailures = [1: .after]
+    try OpalDiagnostics.withConfiguration(configuration) {
+        #expect(throws: ProjectionFailure.failed) {
+            try coordinator.transaction(mutation: { $0.invalidateUnsubmitted(grantID: "grant") }, projection: { _, _ in
+                if enabled {
+                    #expect(OpalDiagnostics.recentRecords.map(\.event.rawValue) == ["barrier_verified", "payment_transition"])
+                }
+                throw ProjectionFailure.failed
+            })
+        }
+        #expect(database.value?.payments.first { $0.id == "unsubmitted" }?.disposition == .invalidated)
+        #expect(database.value?.payments.first { $0.id == "possible" }?.liabilityUnresolved == true)
+        let committed = try database.value?.reference()
+        #expect(anchor.value?.pending == nil && anchor.value?.committed == committed)
+        let records = OpalDiagnostics.recentRecords
+        if enabled {
+            let transition = try #require(records.last)
+            #expect(transition.category.rawValue == "agent.payment")
+            #expect(transition.fields == [.publicField("from_state", value: "unsubmitted"), .publicField("to_state", value: "invalidated")])
+            #expect(transition.traceID == records.first?.traceID)
+            #expect(UUID(uuidString: transition.traceID?.rawValue ?? "") != nil)
+        } else { #expect(records.isEmpty) }
+        // Retrying an unchanged mutation is not a new durable transition.
+        try coordinator.transaction { $0.invalidateUnsubmitted(grantID: "grant") }
+        #expect(OpalDiagnostics.recentRecords == records)
+        #expect(OpalDiagnostics.configuration == configuration)
+    }
+    #expect(database.writes == 1 && anchor.writes == 2)
 }

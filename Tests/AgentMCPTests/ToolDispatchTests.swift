@@ -2,6 +2,7 @@ import AgentClient
 import AgentValues
 import Foundation
 import MCP
+import OpalDiagnostics
 import Testing
 @testable import AgentMCP
 
@@ -265,4 +266,85 @@ private enum ToolPrivateFailure: Error, CustomStringConvertible {
     #expect(try JSONEncoder().encode(result).count < 1_024)
     let (normal, _) = fixture.dispatch()
     #expect(await normal.call(name: "prepare_payment", arguments: fixture.arguments(.preparePayment)).isError == false)
+}
+
+
+private let toolCapture = OpalDiagnostics.Configuration(
+    subsystem: "com.58opals.agent.tests", categoryFilter: .enabled(["agent.mcp"]),
+    bufferPolicy: .enabled(capacity: 3), routingPolicy: .disabled)
+
+private final class DiagnosticDescriptionProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    func describe() -> String { lock.lock(); defer { lock.unlock() }; count += 1; return "private-error-canary" }
+    var evaluations: Int { lock.lock(); defer { lock.unlock() }; return count }
+}
+private struct DiagnosticPrivateError: Error, CustomStringConvertible {
+    let probe: DiagnosticDescriptionProbe
+    var description: String { probe.describe() }
+}
+
+@Test func diagnosticsKeepActualToolFailuresSilentByDefaultAndNeverDescribeErrors() async throws {
+    let probe = DiagnosticDescriptionProbe()
+    let fixture = try ToolFixture()
+    for enabled in [false, true] {
+        let configuration = enabled ? toolCapture : OpalDiagnostics.Configuration()
+        try await OpalDiagnostics.withConfiguration(configuration) {
+            let (dispatch, calls) = fixture.dispatch { _ in throw DiagnosticPrivateError(probe: probe) }
+            let code = try toolCode(await dispatch.call(name: "get_balance", arguments: fixture.arguments(.getBalance)))
+            #expect(code == "unavailable")
+            #expect(await calls.values.count == 1)
+            #expect(OpalDiagnostics.configuration == configuration)
+            let records = OpalDiagnostics.recentRecords
+            #expect(records.count == (enabled ? 1 : 0))
+            if enabled {
+                #expect(records.first?.fields == [.publicField("stage", value: "result"), .publicField("reason", value: "unavailable")])
+            }
+        }
+    }
+    #expect(probe.evaluations == 0)
+}
+
+@Test func diagnosticsBoundMalformedToolInputToTheClosedPublicSchema() async throws {
+    let fixture = try ToolFixture(); let (dispatch, calls) = fixture.dispatch()
+    let canary = "private-seed-credential-account-request-key-amount-endpoint-canary"
+    try await OpalDiagnostics.withConfiguration(toolCapture) {
+        try await OpalDiagnostics.withTraceID(.init(publicValue: canary)) {
+            for _ in 0..<20 {
+                let code = try toolCode(await dispatch.call(name: canary, arguments: [canary: .string(canary)]))
+                #expect(code == "invalidRequest")
+            }
+            let records = OpalDiagnostics.recentRecords
+            #expect(records.count == 3)
+            #expect(await calls.values.isEmpty)
+            for record in records {
+                #expect(record.category.rawValue == "agent.mcp" && record.event.rawValue == "tool_failed")
+                #expect(record.fields == [.publicField("stage", value: "method"), .publicField("reason", value: "invalidRequest")])
+                #expect(record.fields.allSatisfy { $0.privacy == .public && $0.value != "<redacted>" })
+                #expect(UUID(uuidString: record.traceID?.rawValue ?? "") != nil)
+                #expect(record.traceID?.rawValue != canary)
+            }
+            #expect(Set(records.compactMap(\.traceID)).count == 3)
+            #expect(OpalDiagnostics.configuration == toolCapture)
+        }
+    }
+}
+
+@Test func diagnosticsParallelToolAttemptsKeepTheirScopedCapturesSeparate() async throws {
+    let fixture = try ToolFixture()
+    @Sendable func capture(method: String, stage: String) async throws -> OpalDiagnostics.TraceID {
+        try await OpalDiagnostics.withConfiguration(toolCapture) {
+            let (dispatch, calls) = fixture.dispatch()
+            #expect(try toolCode(await dispatch.call(name: method, arguments: ["private-field-canary": .string("private-value-canary")])) == "invalidRequest")
+            #expect(await calls.values.isEmpty)
+            let records = OpalDiagnostics.recentRecords
+            #expect(records.count == 1)
+            let record = try #require(records.first)
+            #expect(record.fields == [.publicField("stage", value: stage), .publicField("reason", value: "invalidRequest")])
+            return try #require(record.traceID)
+        }
+    }
+    async let method = capture(method: "private-method-canary", stage: "method")
+    async let input = capture(method: "get_balance", stage: "input")
+    #expect(try await method != input)
 }

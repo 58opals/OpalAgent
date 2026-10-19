@@ -238,3 +238,41 @@ Financial outputs conform to [`TransientAppEntity`](https://developer.apple.com/
 This adapter supplies no `IndexedEntity`, proactive financial donation or Mac preconfigured-shortcut provider. Main-app package discovery and neutral queries are separate from proactive indexing. Omitting app-initiated donation does not prove that the system or downstream shortcuts retain no prior execution/result data, and revocation cannot retract those copies. Actual extracted metadata must independently confirm all declared intents, parameters, main-app queries and transient result types; compilation alone cannot prove system discovery or privacy behavior.
 
 Open Wallet Review validates the current Apple integration's retained payment selector and returns only a matching route acknowledgment. The acknowledgment means navigation was accepted, not that review, authentication, approval or submission occurred. Wallet independently resolves owner context at its foreground destination, including separately supplied MCP-origin selectors through its owner router. No owner preview, receipt, reusable consent proof or cross-grant result returns to the invoking automation. Existing autonomous spending and optional exact-payment approval remain service policy.
+
+
+## Diagnostic observations
+
+`AgentServiceCore` and `AgentMCP` use OpalDiagnostics through internal closed vocabularies. Their callers supply only finite classifications and fresh local attempt tokens, never arbitrary strings, errors or diagnostic field arrays. Every Agent field is public-safe before it enters Diagnostics; private-field redaction is not an input-sanitization substitute. Seeds, keys, credentials, principals, wallet/account/grant/operation/request/transaction identifiers, amounts, addresses, scripts, payloads, digests, paths, endpoints and arbitrary error descriptions are excluded. Internal payment row IDs are used only to compare retained states locally and never passed to Diagnostics. Observation does not add a journal schema, durable audit trail, authorization fact or recovery proof.
+
+| Category | Event | Public fields and meaning |
+| --- | --- | --- |
+| `agent.authorization` | `authorization_denied` | `reason`: closed mapping of the actual authorization guard refusal. It does not assert that a surrounding command made no durable change. |
+| `agent.journal` | `barrier_verified` | No fields. The complete database/anchor handshake passed actual read-back, including any ambiguous thrown writes. It does not mean that later projection or acknowledgment succeeded. |
+| `agent.journal` | `trust_unavailable` | `reason`: `recoveryRequired`, `keyUnavailable` or `storageUnavailable` at the existing trust check. No arbitrary storage error is inspected. |
+| `agent.recovery` | `recovery_completed` | `history`: `complete` or `incomplete`; `path`: `reset` or `resumed`. The final recovery-latch clearing has passed verification; complete history still has its existing evidence meaning. |
+| `agent.payment` | `payment_transition` | `from_state`: a `PaymentDisposition` case or `new`; `to_state`: a `PaymentDisposition` case. One observation per distinct changed state pair in a verified ordinary transaction/startup batch, without row identity, count or within-batch causal ordering. |
+| `agent.mcp` | `tool_failed` | `stage`: `method`, `input` or `result`; `reason`: a finite `ServiceProblemCode` case. Output-budget and unknown failures map to `unavailable`, without claiming the service itself failed. |
+| `agent.mcp` | `transport_failed` | `reason`: `connection`, `incompleteFrame`, `read`, `frameSize`, `emptyFrame`, `capacity`, `send` or `write`, at an existing bounded transport refusal/termination. |
+| `agent.mcp` | `protocol_rejected` | `reason`: `parse_error`, `invalid_request`, `method_not_found`, `invalid_parameters` or `request_failed`. Recorded after the rejection's existing output handoff succeeds; peer receipt is not established. |
+| `agent.service` / `agent.mcp` | `assembly_unavailable` / `bridge_stopped` | No fields. The executable reached its existing fixed-error path. |
+
+The continuity owner emits verified payment observations under the same serialization boundary after the handshake and before projection, which may still throw. Commands that leave payment dispositions unchanged, including unchanged replays, emit no new transition. An attempted write that throws is ambiguous until existing read-back proves its result; there is no diagnostic “commit failed” inference. Recovery-reset invalidations use `recovery_completed`, not exhaustive per-payment transition events. Process loss, disabled capture, filtering and bounded eviction can omit observations; missing events cannot prove that a write, relay or payment did not occur. The authoritative journal and existing reconciliation/recovery procedures retain their roles.
+
+Every emitted Agent observation explicitly selects a fresh random local `TraceID`; verified journal/payment observations within one transaction share a fresh attempt token. Tokens are not derived from retained identities and do not inherit a caller-supplied task trace. They have no authority and are not persisted in Agent’s authoritative journal or transmitted in its wire contracts; retained diagnostic records include them. They do not propagate across XPC or stdio. No end-to-end lower-library correlation is promised.
+
+Only executable composition or an embedding host may configure Diagnostics. `AgentService` selects exactly `agent.service`, `agent.authorization`, `agent.journal`, `agent.recovery` and `agent.payment`; `AgentBridge` selects exactly `agent.mcp`. Both leave buffering and routing disabled. Libraries never configure/reset the runtime or clear a host capture. Synthetic qualification can use an isolated task-local scope, copy the retained records inside that scope, and leave routing disabled:
+
+```swift
+let capture = OpalDiagnostics.Configuration(
+    subsystem: "com.58opals.agent.tests",
+    categoryFilter: .enabled(["agent.authorization", "agent.journal", "agent.recovery", "agent.payment", "agent.mcp"]),
+    bufferPolicy: .enabled(capacity: 40),
+    routingPolicy: .disabled)
+try await OpalDiagnostics.withConfiguration(capture) {
+    try await exerciseSyntheticOperation()
+    let records = OpalDiagnostics.recentRecords
+    // Inspect/copy records here, after owned asynchronous work has completed.
+}
+```
+
+`exerciseSyntheticOperation()` denotes the host's fixture operation and completion seam. Child tasks share the scope; independent captures require separate scopes. The record buffer bounds count, not bytes; Agent's finite metadata bounds individual field growth. Keep exact Agent categories enabled rather than `.all` or category-prefix selection. Existing lower libraries have independent schemas, including private error descriptions or endpoint fields: a filter prevents retention/routing but cannot prevent their eager field construction. Enabling lower-library categories requires a separate synthetic-only review and is outside this Agent never-pass contract. SDK `Logging.Logger` requirements remain satisfied by `SwiftLogNoOpLogHandler`, independently of Agent observations. Fixed executable stderr and JSON-RPC-only stdout are preserved.

@@ -32,7 +32,7 @@ final class ServiceAuthority: Sendable {
             let inventory = state.custody.map { Set([$0.accountID]) } ?? policy.accountIDs
             guard Set(accounts).isSubset(of: inventory),
                   Set(capabilities).isSubset(of: policy.capabilities) else {
-                throw AuthorizationFailure.scopeDenied
+                ServiceDiagnostics.authorizationDenied(.scopeDenied); throw AuthorizationFailure.scopeDenied
             }
             return try authority.issueGrant(id: id, integrationID: integrationID,
                 accountIDs: accounts, capabilities: capabilities, expiresAt: expiry, owner: owner, now: now, peerProfile: peerProfile)

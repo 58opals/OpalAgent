@@ -188,9 +188,11 @@ actor ProfileTransport: Transport {
         // A recognized id-less notification never receives a response, including on error.
         guard let id else { return }
         try await base.send(Self.error(id: id, code: code, supportedVersions: supportedVersions))
+        MCPDiagnostics.protocolRejected(code: code)
     }
     private func rejectEnvelope(code: Int) async throws {
         try await base.send(Self.error(id: nil, code: code))
+        MCPDiagnostics.protocolRejected(code: code)
     }
     private static func error(id: Any?, code: Int, supportedVersions: Bool = false) throws -> Data {
         let message: String

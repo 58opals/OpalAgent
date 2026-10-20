@@ -14,7 +14,7 @@ let package = Package(
         .executable(name: "AgentProtocolFixture", targets: ["AgentProtocolFixture"])
     ],
     dependencies: [
-        .package(url: "https://github.com/58opals/OpalBase.git", revision: "f1ec2dc05ce778eb2d29230b0fd9ba5fc1c02597"),
+        .package(url: "https://github.com/58opals/OpalBase.git", revision: "efcb644de6dc2f0cbcca6c805367dfadb42d251e"),
         .package(url: "https://github.com/58opals/OpalDiagnostics.git", branch: "develop"),
         .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", exact: "0.12.1"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.5.0")

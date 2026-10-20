@@ -4,6 +4,8 @@ OpalAgent is a dedicated Bitcoin Cash wallet service and local MCP bridge for ma
 
 The internal durable BCH engine includes encrypted fixed-profile seed recovery, an actual SQLite journal, scoped authorization, bounded receive allocation, synchronization, exact-payment approval, immutable transaction submission and restricted recovery. External keys, continuity anchors, peer authentication, chain views and transport are injected. `AgentBridge` serves the twelve strict MCP tool shapes through the official Swift SDK; ordinary construction returns unavailable for wallet operations because no qualified native deployment/custody provider exists. `AgentService` still reports unavailable. Neither entry installs a service, opens live Keychain items or starts a live wallet runtime. A separate Debug-only development fixture composes the actual engine with disposable injected boundaries for protocol qualification.
 
+Internal service Keychain adapter source reads an already provisioned 256-bit wrapping key and reads/writes complete continuity anchors through injectable Security operations. Shipping startup does not construct these adapters. Wrapping-key provisioning, generation, rotation and deletion are not implemented.
+
 ## Package
 
 Requires macOS 27.0, Xcode 27 and Swift 6.4. The products are:
@@ -36,6 +38,8 @@ swift test --no-parallel --scratch-path "<external-directory>"
 Process tests discover the exact `AgentProtocolFixture` executable beside the loaded package test bundle. An optional explicit executable binding requires both `OPAL_AGENT_PROTOCOL_FIXTURE_EXECUTABLE` and its matching `OPAL_AGENT_PROTOCOL_FIXTURE_SHA256`; partial or mismatching bindings fail before launch. No fixture environment configuration is required for the command above. Normal fixture construction remains fresh-only; process tests resume only their own capability-bound disposable namespace.
 
 Deterministic tests use disposable synthetic keys/data, actual SQLite and injected chain/relay/anchor boundaries. They include process termination around SQL commits, concurrency, restart, stale evidence and recovery. Real Base integration exercises derivation, transaction construction and public reservation/submission APIs. These checks do not qualify a live Keychain anchor, real XPC signatures, an installed helper, remote chain completeness or installed-service interoperability. The protocol fixture supports the documented November actual-SDK-client and limited June actual-host synthetic wire acceptance. Both exercise all twelve tools; the host scenario also checks receive replay, retained-key recovery and one uncertain synthetic submission with its liability held.
+
+Keychain adapter tests must inject Security operations rather than access live items. Request construction, result/error handling and anchor encoding checks can establish source behavior; they cannot establish entitlement eligibility, actual storage atomicity or crash durability.
 
 ## Diagnostics
 

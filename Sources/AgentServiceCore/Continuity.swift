@@ -366,7 +366,7 @@ struct ContinuityAnchor: Codable, Equatable, Sendable {
     var recovery: RecoveryLatch? = nil
     var originalProofs: [RetainedProof] = []
 
-    fileprivate func validate() throws {
+    func validate() throws {
         guard formatVersion == 1 else { throw ContinuityError.incompatibleSchema }
         let references = [committed, pending?.target, pending?.parent].compactMap { $0 }
             + originalProofs.flatMap { [$0.reference, $0.parent].compactMap { $0 } }

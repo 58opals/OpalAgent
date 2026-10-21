@@ -42,11 +42,13 @@ struct OwnerControlService: Sendable {
     let wallet: OwnerWalletControl
     let vault: WalletSeedVault
     let accounts: any AccountChainBoundary
-    let payments: PaymentEngine?
+    private let paymentProvider: @Sendable () -> PaymentEngine?
+    var payments: PaymentEngine? { paymentProvider() }
     let consent: any OwnerConsentProvider
     let archives: (any OwnerRecoveryArchiveProvider)?
     let clock: any PaymentClock
-    private let newWalletCreation: KeychainNewWalletCreation?
+    private enum CreationMode: Sendable { case preprovisioned, boundNew, unavailable }
+    private let creationMode: CreationMode
 
     init(continuity: ContinuityCoordinator, policy: AuthorityPolicy,
          authority: @escaping @Sendable () throws -> ServiceAuthority, vault: WalletSeedVault,
@@ -55,9 +57,9 @@ struct OwnerControlService: Sendable {
          clock: any PaymentClock = SystemPaymentClock()) {
         self.continuity = continuity; self.policy = policy; self.authority = authority
         self.wallet = OwnerWalletControl(continuity: continuity, policy: policy)
-        self.vault = vault; self.accounts = accounts; self.payments = payments
+        self.vault = vault; self.accounts = accounts; self.paymentProvider = { payments }
         self.consent = consent; self.archives = archives; self.clock = clock
-        self.newWalletCreation = nil
+        self.creationMode = .preprovisioned
     }
 
     /// Explicit source composition only; shipping startup never selects live custody.
@@ -68,8 +70,20 @@ struct OwnerControlService: Sendable {
          clock: any PaymentClock = SystemPaymentClock()) {
         self.continuity = creation.continuity; self.policy = policy; self.authority = authority
         self.wallet = creation.ownerControl(policy: policy); self.vault = creation.vault
-        self.accounts = accounts; self.payments = payments; self.consent = consent
-        self.archives = archives; self.clock = clock; self.newWalletCreation = creation
+        self.accounts = accounts; self.paymentProvider = { payments }; self.consent = consent
+        self.archives = archives; self.clock = clock; self.creationMode = .boundNew
+    }
+
+    /// Binds owner commands, custody, authority and effects to the same durable writer/lease.
+    init(store: DurableWalletStore, accounts: any AccountChainBoundary,
+         consent: any OwnerConsentProvider, archives: (any OwnerRecoveryArchiveProvider)? = nil,
+         clock: any PaymentClock = SystemPaymentClock()) throws {
+        guard let vault = store.vault else { throw DurableWalletStoreError.custodyNotConfigured }
+        self.continuity = store.continuity; self.policy = store.authorityPolicy
+        self.authority = { try store.integrationAuthority() }; self.wallet = store.ownerControl
+        self.vault = vault; self.accounts = accounts; self.paymentProvider = { store.configuredPaymentEngine }
+        self.consent = consent; self.archives = archives; self.clock = clock
+        self.creationMode = store.permitsNewWallet ? .boundNew : .unavailable
     }
 
     func send(_ request: OwnerControlRequest, connection: OwnerConnectionContext) async throws -> OwnerControlResponse {
@@ -129,12 +143,15 @@ struct OwnerControlService: Sendable {
             return .inspectRecovery(OwnerRecoveryStatus(status: try status(owner),
                 availableSources: try archives?.availableSources() ?? []))
         case .createWallet(let network):
-            if newWalletCreation != nil {
+            switch creationMode {
+            case .boundNew:
                 _ = try await wallet.createNew(network: network.rawValue, owner: owner,
                     now: clock.read().wall, authorizationCheck: check)
-            } else {
+            case .preprovisioned:
                 _ = try await wallet.createNew(vault: vault, network: network.rawValue, owner: owner,
                     now: clock.read().wall, authorizationCheck: check)
+            case .unavailable:
+                throw ServiceProblem(.unavailable)
             }
             return .createWallet(try status(owner))
         case .restoreSeed(let request):
@@ -422,7 +439,7 @@ struct OwnerControlService: Sendable {
         try OperationSelector(account: AccountScope(wallet: walletScope(state), accountID: payment.accountID), operationID: payment.id)
     }
     private func paymentEngine() throws -> PaymentEngine {
-        guard let payments else { throw ServiceProblem(.unavailable) }; return payments
+        guard let value = payments else { throw ServiceProblem(.unavailable) }; return value
     }
     private func requirePeer(_ connection: OwnerConnectionContext) throws {
         guard connection.isActive, !connection.connectionID.isEmpty,

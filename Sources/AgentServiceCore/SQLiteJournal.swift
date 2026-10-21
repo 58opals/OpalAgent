@@ -22,7 +22,8 @@ final class SQLiteJournal: ContinuityDatabase, @unchecked Sendable {
     private let fault: (@Sendable (SQLiteJournalFaultPoint) throws -> Void)?
     private var poisoned = false
 
-    init(path: String, fault: (@Sendable (SQLiteJournalFaultPoint) throws -> Void)? = nil) throws {
+    init(path: String, createIfMissing: Bool = true,
+         fault: (@Sendable (SQLiteJournalFaultPoint) throws -> Void)? = nil) throws {
         guard path.hasPrefix("/"), !path.utf8.contains(0) else { throw SQLiteJournalError.invalidPath }
         let url = URL(fileURLWithPath: path)
         // macOS temporary roots include /var -> /private/var. Resolve parents, never the store itself.
@@ -33,12 +34,14 @@ final class SQLiteJournal: ContinuityDatabase, @unchecked Sendable {
         free(parent)
         self.path = path
         self.fault = fault
-        connection = try Self.open(path: path, flags: SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)
+        connection = try Self.open(path: path,
+            flags: SQLITE_OPEN_READWRITE | (createIfMissing ? SQLITE_OPEN_CREATE : 0))
         do {
             let version = try Self.integerScalar(connection, "PRAGMA user_version")
             let identity = try Self.integerScalar(connection, "PRAGMA application_id")
             let isNew = version == 0 && identity == 0
             if isNew {
+                guard createIfMissing else { throw SQLiteJournalError.incompatibleSchema }
                 guard try Self.integerScalar(connection,
                     "SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'") == 0 else {
                     throw SQLiteJournalError.incompatibleSchema

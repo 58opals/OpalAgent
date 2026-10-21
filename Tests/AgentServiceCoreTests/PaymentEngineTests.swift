@@ -799,6 +799,11 @@ enum PaymentCrashPrefix: String, Codable, Sendable, CaseIterable {
     let id = try await f.prepare()
     _ = try await f.engine.submit(operationID: id, session: f.session, connectionID: "connection", peer: f.peer)
     try await f.wait(id, disposition: .uncertain)
+    // SQL phase visibility can precede anchor promotion. Join the original writer
+    // through its verified read before assembling a separate restarted coordinator.
+    let settled = try await f.engine.get(operationID: id, session: f.session,
+        connectionID: "connection", peer: f.peer)
+    #expect(settled.payment.disposition == .uncertain && settled.payment.ordinaryAdmissions == 1)
     f.clock.advance(1_000)
     let restarted = try reopenPaymentFixture(databasePath: f.databasePath, anchorPath: f.anchor.path, clock: f.clock)
     await restarted.engine.continuePending()

@@ -59,6 +59,48 @@ struct KeychainWrappingKeySource: WrappingKeySource {
     }
 }
 
+/// Add-only capability selected exclusively by the explicit owner new-wallet flow.
+struct KeychainWrappingKeyProvisioner: Sendable {
+    private let item: KeychainCustodyItem
+    private let reader: KeychainWrappingKeySource
+    private let operations: any KeychainItemOperations
+    private let generateKey: @Sendable () throws -> SymmetricKey
+
+    init(accessGroup: String, walletID: String, operations: any KeychainItemOperations,
+         generateKey: @escaping @Sendable () throws -> SymmetricKey = { SymmetricKey(size: .bits256) }) throws {
+        item = try KeychainCustodyItem(service: "com.58opals.OpalAgent.wrapkey",
+            accessGroup: accessGroup, components: [walletID])
+        reader = try KeychainWrappingKeySource(accessGroup: accessGroup, walletID: walletID, operations: operations)
+        self.operations = operations
+        self.generateKey = generateKey
+    }
+
+    func requireAbsent() throws {
+        switch try reader.wrappingKey() {
+        case .missing: return
+        case .inaccessible: throw ContinuityError.keyUnavailable
+        case .available: throw ContinuityError.invalidState
+        }
+    }
+
+    func provision() throws -> SymmetricKey {
+        try requireAbsent()
+        let candidate = try generateKey()
+        guard candidate.bitCount == 256 else { throw KeychainCustodyError.invalidResult }
+        var attributes = item.query()
+        attributes[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        attributes[kSecValueData as String] = candidate.withUnsafeBytes { Data($0) }
+        // Even an error after persistence is unacknowledged. Never adopt a duplicate,
+        // update, delete, retry, or infer rollback from an unsuccessful add.
+        let status = operations.add(attributes as CFDictionary)
+        guard status == errSecSuccess else { throw KeychainCustodyError.operationFailed(status) }
+        guard case .available(let stored) = try reader.wrappingKey(), stored == candidate else {
+            throw KeychainCustodyError.invalidResult
+        }
+        return stored
+    }
+}
+
 /// Persists one complete independent anchor. The coordinator owns all write read-back.
 final class KeychainContinuityAnchorStore: ContinuityAnchorStore {
     private let item: KeychainCustodyItem

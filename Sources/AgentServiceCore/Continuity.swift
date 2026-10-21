@@ -572,12 +572,39 @@ final class ContinuityCoordinator: @unchecked Sendable {
         return value?.committed ?? value?.pending?.target ?? value?.originalProofs.first?.reference
     }
 
-    // Called only after the owner creation flow generated a new seed; restoration uses recover.
-    func initializeFreshWallet(_ state: CanonicalState) throws {
+    // Observation before asynchronous seed preparation; the locked initializer rechecks it.
+    func requireFreshWallet() throws {
         lock.lock()
         defer { lock.unlock() }
-        guard try readDatabase() == nil, try readAnchor() == nil,
-              state.mode == .restricted, state.history == .complete,
+        try requireFreshWalletLocked()
+    }
+
+    private func requireFreshWalletLocked() throws {
+        guard try readDatabase() == nil, try readAnchor() == nil else {
+            throw ContinuityError.invalidState
+        }
+    }
+
+    // The effect closure is synchronous and runs only after verified independent intent.
+    // Any interrupted prefix retains its latch; creation never resumes or clears it.
+    @discardableResult
+    func initializeFreshWallet(commitID: String,
+                               preflight: () throws -> Void = {},
+                               makeState: () throws -> CanonicalState) throws -> CanonicalState {
+        lock.lock()
+        defer { lock.unlock() }
+        try requireFreshWalletLocked()
+        try preflight()
+        guard !commitID.isEmpty else { throw ContinuityError.invalidState }
+        let initial = ContinuityAnchor(committed: nil,
+            recovery: RecoveryLatch(id: commitID, targetGeneration: 1))
+        // New key effects require an acknowledged intent write as well as exact read-back.
+        // A failed initial write retains any marker but never starts provisioning.
+        do { try anchor.write(initial) }
+        catch { quarantine = true; throw error }
+        try verifyAnchor(initial)
+        let state = try makeState()
+        guard state.commitID == commitID, state.mode == .restricted, state.history == .complete,
               state.authorization.generation == 1, state.authorization.grants.isEmpty,
               state.requests.isEmpty, state.payments.isEmpty, state.approvals.isEmpty,
               state.gates.isEmpty, state.allocations.isEmpty, let custody = state.custody else {
@@ -585,14 +612,18 @@ final class ContinuityCoordinator: @unchecked Sendable {
         }
         try custody.validate()
         try state.validate()
-        let latch = RecoveryLatch(id: state.commitID, targetGeneration: 1)
-        let initial = ContinuityAnchor(committed: nil, recovery: latch)
-        try writeAnchorAndVerify(initial)
         try handshake(state, from: initial, classification: "newWallet")
         var finished = try readAnchorRequired()
+        guard finished.pending == nil, finished.recovery == initial.recovery,
+              finished.committed == (try state.reference()),
+              (try readDatabase()?.reference()) == (try state.reference()) else {
+            quarantine = true
+            throw ContinuityError.recoveryRequired
+        }
         finished.recovery = nil
         try writeAnchorAndVerify(finished)
         quarantine = false
+        return state.canonicalized()
     }
 
     func enable(ownerAuthorized: Bool, custodyCheck: (CanonicalState) throws -> Void = { _ in }) throws -> CanonicalState {
@@ -808,6 +839,10 @@ final class ContinuityCoordinator: @unchecked Sendable {
 
     private func writeAnchorAndVerify(_ expected: ContinuityAnchor) throws {
         do { try anchor.write(expected) } catch { /* Read-back, never infer a write outcome. */ }
+        try verifyAnchor(expected)
+    }
+
+    private func verifyAnchor(_ expected: ContinuityAnchor) throws {
         do {
             guard try readAnchor() == expected else {
                 quarantine = true

@@ -33,6 +33,15 @@ struct InjectedWrappingKeySource: WrappingKeySource {
     var read: @Sendable () throws -> WrappingKeyAvailability
     func wrappingKey() throws -> WrappingKeyAvailability { try read() }
 }
+struct PreparedWalletSeed: Sendable, CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
+    let mnemonic: Data
+    let network: String
+    let account: DerivedSeedAccount
+    var description: String { "PreparedWalletSeed(<redacted>)" }
+    var debugDescription: String { description }
+    var customMirror: Mirror { Mirror(self, children: ["material": "<redacted>"]) }
+}
+
 private struct MnemonicEnvelope: Codable {
     var profile: String
     var network: String
@@ -44,8 +53,27 @@ struct WalletSeedVault: Sendable {
     let keys: any WrappingKeySource
     let accounts: any SeedAccountProvider
 
-    func create(walletID: String, network: String) async throws -> WalletCustodyRecord {
-        try await protect(mnemonic: accounts.generateMnemonic(), walletID: walletID, network: network)
+    func prepareNew(network: String) async throws -> PreparedWalletSeed {
+        guard ["mainnet", "testnet", "chipnet"].contains(network) else { throw ContinuityError.invalidState }
+        let mnemonic = try accounts.generateMnemonic()
+        let account = try await accounts.deriveAccount(mnemonic: mnemonic, network: network)
+        return PreparedWalletSeed(mnemonic: mnemonic, network: network, account: account)
+    }
+
+    func protect(_ prepared: PreparedWalletSeed, walletID: String,
+                 wrappingKey: WrappingKeyAvailability) throws -> WalletCustodyRecord {
+        guard !walletID.isEmpty, ["mainnet", "testnet", "chipnet"].contains(prepared.network) else {
+            throw ContinuityError.invalidState
+        }
+        let envelope = MnemonicEnvelope(profile: WalletCustodyRecord.fixedProfile,
+            network: prepared.network, mnemonic: prepared.mnemonic)
+        let protector = PayloadProtector(profile: .encrypted, walletID: walletID, wrappingKey: wrappingKey)
+        let result = WalletCustodyRecord(walletID: walletID, network: prepared.network,
+            accountID: prepared.account.accountID,
+            encryptedMnemonic: try protector.protect(JSONEncoder().encode(envelope)),
+            publicDescriptor: prepared.account.publicDescriptor)
+        try result.validate()
+        return result
     }
 
     func protect(mnemonic: Data, walletID: String, network: String) async throws -> WalletCustodyRecord {
@@ -53,12 +81,8 @@ struct WalletSeedVault: Sendable {
             throw ContinuityError.invalidState
         }
         let account = try await accounts.deriveAccount(mnemonic: mnemonic, network: network)
-        let envelope = MnemonicEnvelope(profile: WalletCustodyRecord.fixedProfile, network: network, mnemonic: mnemonic)
-        let payload = try protector(walletID: walletID).protect(JSONEncoder().encode(envelope))
-        let result = WalletCustodyRecord(walletID: walletID, network: network, accountID: account.accountID,
-            encryptedMnemonic: payload, publicDescriptor: account.publicDescriptor)
-        try result.validate()
-        return result
+        return try protect(PreparedWalletSeed(mnemonic: mnemonic, network: network, account: account),
+            walletID: walletID, wrappingKey: keys.wrappingKey())
     }
 
     func open(_ record: WalletCustodyRecord) async throws -> Data {
@@ -97,6 +121,14 @@ struct OwnerRecoverySummary: Equatable, Sendable {
 struct OwnerWalletControl: Sendable {
     let continuity: ContinuityCoordinator
     let policy: AuthorityPolicy
+    private let newWalletCreation: KeychainNewWalletCreation?
+
+    init(continuity: ContinuityCoordinator, policy: AuthorityPolicy,
+         newWalletCreation: KeychainNewWalletCreation? = nil) {
+        self.continuity = continuity
+        self.policy = policy
+        self.newWalletCreation = newWalletCreation
+    }
 
     func inspect(owner: OwnerAuthenticationEvidence, now: Int64) throws -> OwnerRecoverySummary {
         try requireOwner(owner, now: now)
@@ -137,18 +169,64 @@ struct OwnerWalletControl: Sendable {
         }
     }
 
+    /// Explicit service composition fixes the key, anchor and state identities together.
+    func createNew(network: String, owner: OwnerAuthenticationEvidence, now: Int64,
+                   authorizationCheck: @Sendable () throws -> Void = {}) async throws -> WalletCustodyRecord {
+        guard let creation = newWalletCreation, creation.continuity === continuity else {
+            throw ContinuityError.invalidState
+        }
+        try authorizationCheck()
+        try requireOwner(owner, now: now)
+        try continuity.requireFreshWallet()
+        try creation.keys.requireAbsent()
+        let prepared = try await creation.vault.prepareNew(network: network)
+        try authorizationCheck()
+        try requireOwner(owner, now: now)
+        let commitID = UUID().uuidString
+        let state = try continuity.initializeFreshWallet(commitID: commitID,
+            preflight: {
+                try authorizationCheck()
+                try requireOwner(owner, now: now)
+                try creation.keys.requireAbsent()
+            }, makeState: {
+                let key = try creation.keys.provision()
+                let custody = try creation.vault.protect(prepared, walletID: creation.walletID,
+                    wrappingKey: .available(key))
+                return freshState(custody: custody, installationID: creation.installationID, commitID: commitID)
+            })
+        guard let custody = state.custody else { throw ContinuityError.invalidState }
+        return custody
+    }
+
+    // Preprovisioned/injected composition remains read-only with respect to wrapping keys.
     func createNew(vault: WalletSeedVault, network: String, owner: OwnerAuthenticationEvidence,
                    now: Int64, walletID: String = UUID().uuidString,
                    authorizationCheck: @Sendable () throws -> Void = {}) async throws -> WalletCustodyRecord {
+        guard !walletID.isEmpty else { throw ContinuityError.invalidState }
         try authorizationCheck()
         try requireOwner(owner, now: now)
-        let custody = try await vault.create(walletID: walletID, network: network)
+        try continuity.requireFreshWallet()
+        let prepared = try await vault.prepareNew(network: network)
         try authorizationCheck()
-        let initial = CanonicalState(installationID: UUID().uuidString,
-            authorization: AuthorizationLedger(walletID: walletID, network: network, generation: 1, grants: []),
-            mode: .restricted, history: .complete, custody: custody)
-        try continuity.initializeFreshWallet(initial)
+        try requireOwner(owner, now: now)
+        // This path has no provisioning effect: an unavailable existing key must leave
+        // fresh storage untouched, as before. Locked freshness is rechecked afterward.
+        let custody = try vault.protect(prepared, walletID: walletID, wrappingKey: vault.keys.wrappingKey())
+        let commitID = UUID().uuidString
+        let initial = freshState(custody: custody, installationID: UUID().uuidString, commitID: commitID)
+        _ = try continuity.initializeFreshWallet(commitID: commitID, preflight: {
+            try authorizationCheck()
+            try requireOwner(owner, now: now)
+        }, makeState: { initial })
         return custody
+    }
+
+    private func freshState(custody: WalletCustodyRecord, installationID: String,
+                            commitID: String) -> CanonicalState {
+        CanonicalState(installationID: installationID,
+            authorization: AuthorizationLedger(walletID: custody.walletID, network: custody.network,
+                generation: 1, grants: []), commitID: commitID,
+            mode: .restricted, history: .complete, custody: custody)
     }
 
     func restoreSeed(mnemonic: Data, vault: WalletSeedVault, network: String,

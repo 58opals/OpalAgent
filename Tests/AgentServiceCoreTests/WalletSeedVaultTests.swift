@@ -90,6 +90,25 @@ struct WalletSeedVaultTests {
         await #expect(throws: ContinuityError.invalidState) { try await provider.deriveAccount(mnemonic: disposableMnemonic, network: "regtest") }
     }
 
+    @Test(arguments: CreationKeyFailure.allCases)
+    private func unavailablePreprovisionedKeyLeavesFreshStorageUntouched(_ failure: CreationKeyFailure) async throws {
+        let fixture = try SeedControlFixture()
+        defer { fixture.remove() }
+        let vault = WalletSeedVault(keys: InjectedWrappingKeySource { failure.key }, accounts: CreationKeyAccounts())
+        await #expect(throws: failure.expected) {
+            try await fixture.control.createNew(vault: vault, network: "mainnet", owner: fixture.owner, now: 10)
+        }
+        #expect(try fixture.journal.read() == nil)
+        #expect(try fixture.anchor.read() == nil)
+        // Availability failure does not consume the fresh namespace or require recovery.
+        let available = WalletSeedVault(keys: InjectedWrappingKeySource {
+            .available(SymmetricKey(data: Data(repeating: 7, count: 32)))
+        }, accounts: CreationKeyAccounts())
+        let custody = try await fixture.control.createNew(vault: available, network: "mainnet",
+            owner: fixture.owner, now: 10)
+        #expect(try fixture.journal.read()?.custody == custody)
+    }
+
     @Test func newWalletRequiresSeparateOwnerEnablementAndIssuesNoGrant() async throws {
         let fixture = try SeedControlFixture()
         defer { fixture.remove() }
@@ -554,4 +573,29 @@ private func waitForSeedRacePayment(_ id: String, disposition: PaymentDispositio
         try await Task.sleep(for: .milliseconds(2))
     }
     throw PaymentFailure.invalidTransition
+}
+
+private enum CreationKeyFailure: String, CaseIterable, Sendable {
+    case missing, inaccessible, invalid
+    var key: WrappingKeyAvailability {
+        switch self {
+        case .missing: .missing
+        case .inaccessible: .inaccessible
+        case .invalid: .available(SymmetricKey(data: Data(repeating: 0, count: 16)))
+        }
+    }
+    var expected: PayloadProtectionError {
+        switch self {
+        case .missing: .wrappingKeyMissing
+        case .inaccessible: .wrappingKeyInaccessible
+        case .invalid: .invalidWrappingKey
+        }
+    }
+}
+
+private struct CreationKeyAccounts: SeedAccountProvider {
+    func generateMnemonic() throws -> Data { Data("public disposable creation fixture".utf8) }
+    func deriveAccount(mnemonic: Data, network: String) async throws -> DerivedSeedAccount {
+        DerivedSeedAccount(accountID: "creation-account", publicDescriptor: Data("public descriptor".utf8))
+    }
 }

@@ -46,6 +46,7 @@ struct OwnerControlService: Sendable {
     let consent: any OwnerConsentProvider
     let archives: (any OwnerRecoveryArchiveProvider)?
     let clock: any PaymentClock
+    private let newWalletCreation: KeychainNewWalletCreation?
 
     init(continuity: ContinuityCoordinator, policy: AuthorityPolicy,
          authority: @escaping @Sendable () throws -> ServiceAuthority, vault: WalletSeedVault,
@@ -56,6 +57,19 @@ struct OwnerControlService: Sendable {
         self.wallet = OwnerWalletControl(continuity: continuity, policy: policy)
         self.vault = vault; self.accounts = accounts; self.payments = payments
         self.consent = consent; self.archives = archives; self.clock = clock
+        self.newWalletCreation = nil
+    }
+
+    /// Explicit source composition only; shipping startup never selects live custody.
+    init(creation: KeychainNewWalletCreation, policy: AuthorityPolicy,
+         authority: @escaping @Sendable () throws -> ServiceAuthority,
+         accounts: any AccountChainBoundary, payments: PaymentEngine? = nil,
+         consent: any OwnerConsentProvider, archives: (any OwnerRecoveryArchiveProvider)? = nil,
+         clock: any PaymentClock = SystemPaymentClock()) {
+        self.continuity = creation.continuity; self.policy = policy; self.authority = authority
+        self.wallet = creation.ownerControl(policy: policy); self.vault = creation.vault
+        self.accounts = accounts; self.payments = payments; self.consent = consent
+        self.archives = archives; self.clock = clock; self.newWalletCreation = creation
     }
 
     func send(_ request: OwnerControlRequest, connection: OwnerConnectionContext) async throws -> OwnerControlResponse {
@@ -115,8 +129,13 @@ struct OwnerControlService: Sendable {
             return .inspectRecovery(OwnerRecoveryStatus(status: try status(owner),
                 availableSources: try archives?.availableSources() ?? []))
         case .createWallet(let network):
-            _ = try await wallet.createNew(vault: vault, network: network.rawValue, owner: owner,
-                now: clock.read().wall, authorizationCheck: check)
+            if newWalletCreation != nil {
+                _ = try await wallet.createNew(network: network.rawValue, owner: owner,
+                    now: clock.read().wall, authorizationCheck: check)
+            } else {
+                _ = try await wallet.createNew(vault: vault, network: network.rawValue, owner: owner,
+                    now: clock.read().wall, authorizationCheck: check)
+            }
             return .createWallet(try status(owner))
         case .restoreSeed(let request):
             let bytes = request.mnemonic.withBytes { $0 }

@@ -5,25 +5,24 @@ import Foundation
 
 /// The host must retain each separately configured endpoint. This source does not install or launch a service.
 /// Authority facts are produced only after Foundation delivers a message on an exact signed, same-user peer connection.
-final class NativeServiceEndpoint: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
+final class NativeServiceEndpoint: NSObject, NSXPCListenerDelegate, ServiceEndpointHost, @unchecked Sendable {
     private let deployment: any NativeDeploymentProvider
     private let configured: NativeDeploymentPolicy
     private let channel: NativeChannel
     private let listener: NSXPCListener
-    private let authority: @Sendable () throws -> ServiceAuthority
-    private let capabilities: CapabilityService
-    private let owner: @Sendable (any OwnerConsentProvider) -> OwnerControlService
-    private let clock: any PaymentClock
+    private let handlers: ServiceEndpointHandlers
     private let lock = NSLock()
+    private var active = false
+    private var closed = false
     private var connections: [String: NativeServiceConnection] = [:]
 
     init(channel: NativeChannel, deployment: any NativeDeploymentProvider, authorityPolicy: AuthorityPolicy,
-         authority: @escaping @Sendable () throws -> ServiceAuthority, capabilities: CapabilityService,
-         owner: @escaping @Sendable (any OwnerConsentProvider) -> OwnerControlService,
+         handlers: ServiceEndpointHandlers,
          clock: any PaymentClock = SystemPaymentClock()) throws {
         try deployment.requireQualifiedPrerequisites()
         let configured = try deployment.deployment()
-        guard authorityPolicy.bridge == SignedPeerIdentity(teamIdentifier: configured.bridge.teamIdentifier, signingIdentifier: configured.bridge.signingIdentifier),
+        guard handlers.channel == channel,
+              authorityPolicy.bridge == SignedPeerIdentity(teamIdentifier: configured.bridge.teamIdentifier, signingIdentifier: configured.bridge.signingIdentifier),
               authorityPolicy.owner == SignedPeerIdentity(teamIdentifier: configured.wallet.teamIdentifier, signingIdentifier: configured.wallet.signingIdentifier) else {
             throw NativeIPCFailure.untrustedPeer
         }
@@ -33,43 +32,55 @@ final class NativeServiceEndpoint: NSObject, NSXPCListenerDelegate, @unchecked S
                       signingIdentifier: configured.wallet.signingIdentifier) else { throw NativeIPCFailure.untrustedPeer }
         }
         self.deployment = deployment; self.configured = configured; self.channel = channel
-        self.authority = authority; self.capabilities = capabilities; self.owner = owner; self.clock = clock
+        self.handlers = handlers
         listener = NSXPCListener(machServiceName: configured.machService(for: channel))
         super.init()
         listener.setConnectionCodeSigningRequirement(configured.peer(for: channel).requirement)
         listener.delegate = self
     }
-    func activate() throws { try deployment.requireQualifiedPrerequisites(); listener.activate() }
+    func activate() throws {
+        try deployment.requireQualifiedPrerequisites()
+        try lock.withLock {
+            guard !closed, !active else { throw NativeIPCFailure.unavailable }
+            active = true
+        }
+        listener.activate()
+    }
     func invalidate() {
+        let retained = lock.withLock {
+            closed = true; active = false
+            let values = Array(connections.values); connections.removeAll(); return values
+        }
         listener.invalidate()
-        let retained = lock.withLock { let values = Array(connections.values); connections.removeAll(); return values }
         for connection in retained { connection.invalidate() }
     }
-    deinit {
-        listener.invalidate()
-        for connection in connections.values { connection.invalidate() }
-    }
+    deinit { invalidate() }
     func listener(_ listener: NSXPCListener, shouldAcceptNewConnection connection: NSXPCConnection) -> Bool {
         guard listener === self.listener, connection.effectiveUserIdentifier == geteuid(), connection.processIdentifier > 0,
               (try? deployment.requireQualifiedPrerequisites()) != nil else { return false }
-        let state = NativeServiceConnection(connection: connection, channel: channel, identity: configured.peer(for: channel))
+        let state = NativeServiceConnection(connection: connection, channel: channel,
+            identity: configured.peer(for: channel), handlers: handlers)
         connection.setCodeSigningRequirement(configured.peer(for: channel).requirement)
         if channel != .owner {
             connection.exportedInterface = NSXPCInterface(with: NativeIntegrationXPC.self)
-            connection.exportedObject = NativeIntegrationEndpoint(state: state, authority: authority, service: capabilities, clock: clock)
+            connection.exportedObject = NativeIntegrationEndpoint(state: state, handlers: handlers)
         } else {
             connection.exportedInterface = NSXPCInterface(with: NativeOwnerXPC.self)
             connection.remoteObjectInterface = NSXPCInterface(with: NativeWalletConsentXPC.self)
-            let provider = NativeConnectionConsentProvider(state: state)
-            connection.exportedObject = NativeOwnerEndpoint(state: state, service: owner(provider))
+            connection.exportedObject = NativeOwnerEndpoint(state: state, handlers: handlers)
         }
-        lock.withLock { connections[state.id] = state }
         let remove: @Sendable () -> Void = { [weak self, weak state] in
             state?.invalidate()
             if let state { _ = self?.lock.withLock { self?.connections.removeValue(forKey: state.id) } }
         }
         connection.interruptionHandler = remove
         connection.invalidationHandler = remove
+        let accepted = lock.withLock {
+            guard active, !closed else { return false }
+            connections[state.id] = state
+            return true
+        }
+        guard accepted else { state.invalidate(); return false }
         connection.activate()
         return true
     }
@@ -81,14 +92,16 @@ private final class NativeServiceConnection: @unchecked Sendable {
     let channel: NativeChannel
     private let connection: NSXPCConnection
     private let identity: NativeSignedIdentity
+    private let handlers: ServiceEndpointHandlers
     private let lock = NSLock()
     private var active = true
     let calls = NativeCallRegistry()
-    private var session: AuthorizationSession?
-    private var ownerContext: OwnerConnectionContext?
+    private var serviceConnection: ServiceConnection?
+    private var authenticated = false
     private var pending: [UUID: @Sendable (Result<Data, any Error>) -> Void] = [:]
-    init(connection: NSXPCConnection, channel: NativeChannel, identity: NativeSignedIdentity) {
-        self.connection = connection; self.channel = channel; self.identity = identity
+    init(connection: NSXPCConnection, channel: NativeChannel, identity: NativeSignedIdentity,
+         handlers: ServiceEndpointHandlers) {
+        self.connection = connection; self.channel = channel; self.identity = identity; self.handlers = handlers
     }
     var isActive: Bool { lock.withLock { active } }
     /// Must be evaluated synchronously inside the exported Objective-C invocation.
@@ -101,33 +114,53 @@ private final class NativeServiceConnection: @unchecked Sendable {
             return PeerEvidence(identity: SignedPeerIdentity(teamIdentifier: identity.teamIdentifier, signingIdentifier: identity.signingIdentifier), signatureValidated: true)
         }
     }
-    func bind(_ session: AuthorizationSession) throws {
+    func open(peer: PeerEvidence) async throws -> ServiceConnection {
+        if let retained = try lock.withLock({
+            guard active else { throw NativeIPCFailure.unavailable }
+            return serviceConnection
+        }) { return retained }
+        let candidate = try await handlers.connect(connectionID: id, peer: peer)
+        let accepted = lock.withLock {
+            guard active else { return false }
+            if let serviceConnection { return serviceConnection === candidate }
+            serviceConnection = candidate
+            return true
+        }
+        guard accepted else {
+            candidate.invalidate()
+            await handlers.disconnect(candidate)
+            throw NativeIPCFailure.unavailable
+        }
+        return candidate
+    }
+    func bindAuthenticated(_ handle: ServiceConnection) throws {
         try lock.withLock {
-            guard active, channel != .owner, self.session == nil, session.connectionID == id,
-                  session.peerProfile == (channel == .integration ? .mcp : .appleAutomation) else { throw NativeIPCFailure.unavailable }
-            self.session = session
+            guard active, channel != .owner, !authenticated,
+                  serviceConnection === handle else { throw NativeIPCFailure.unavailable }
+            authenticated = true
         }
     }
-    func integrationContext(peer: PeerEvidence) throws -> CapabilityConnectionContext {
+    func integrationConnection() throws -> ServiceConnection {
         try lock.withLock {
-            guard active, channel != .owner, let session else { throw NativeIPCFailure.unavailable }
-            return CapabilityConnectionContext(session: session, connectionID: id, peer: peer)
-        }
-    }
-    func ownerConnection(peer: PeerEvidence) throws -> OwnerConnectionContext {
-        try lock.withLock {
-            guard active, channel == .owner else { throw NativeIPCFailure.unavailable }
-            if let ownerContext { return ownerContext }
-            let context = OwnerConnectionContext(connectionID: id, peer: peer); ownerContext = context; return context
+            guard active, channel != .owner, authenticated, let serviceConnection else { throw NativeIPCFailure.unavailable }
+            return serviceConnection
         }
     }
     func invalidate() {
-        let result = lock.withLock { () -> (Bool, OwnerConnectionContext?, [@Sendable (Result<Data, any Error>) -> Void]) in
-            guard active else { return (false, nil, []) }; active = false; session = nil
-            let callbacks = Array(pending.values); pending.removeAll(); return (true, ownerContext, callbacks)
+        let result = lock.withLock { () -> (Bool, ServiceConnection?, [@Sendable (Result<Data, any Error>) -> Void]) in
+            guard active else { return (false, nil, []) }
+            let retained = serviceConnection
+            // Revoke the same proof token synchronously; actor-queued disconnect is bookkeeping.
+            retained?.invalidate()
+            active = false; authenticated = false; serviceConnection = nil
+            let callbacks = Array(pending.values); pending.removeAll(); return (true, retained, callbacks)
         }
         guard result.0 else { return }
-        result.1?.invalidate(); calls.close(); connection.exportedObject = nil; connection.invalidate()
+        calls.close(); connection.exportedObject = nil; connection.invalidate()
+        if let handle = result.1 {
+            let handlers = handlers
+            Task { await handlers.disconnect(handle) }
+        }
         for callback in result.2 { callback(.failure(NativeIPCFailure.unavailable)) }
     }
     private func complete(_ token: UUID, _ result: Result<Data, any Error>) {
@@ -159,11 +192,9 @@ private final class NativeServiceConnection: @unchecked Sendable {
 
 private final class NativeIntegrationEndpoint: NSObject, NativeIntegrationXPC, @unchecked Sendable {
     let state: NativeServiceConnection
-    let authority: @Sendable () throws -> ServiceAuthority
-    let service: CapabilityService
-    let clock: any PaymentClock
-    init(state: NativeServiceConnection, authority: @escaping @Sendable () throws -> ServiceAuthority, service: CapabilityService, clock: any PaymentClock) {
-        self.state = state; self.authority = authority; self.service = service; self.clock = clock
+    let handlers: ServiceEndpointHandlers
+    init(state: NativeServiceConnection, handlers: ServiceEndpointHandlers) {
+        self.state = state; self.handlers = handlers
     }
     func hello(_ frame: NSData, reply: @escaping @Sendable (NSData) -> Void) {
         nativeHello(frame, state: state, reply: reply)
@@ -176,19 +207,29 @@ private final class NativeIntegrationEndpoint: NSObject, NativeIntegrationXPC, @
             let envelope = try NativeWire.unpack(frame as Data, kind: .authenticate); id = envelope.requestID
             let binding = try NativeWire.decode(NativeHello.self, from: envelope.payload)
             guard state.channel != .owner, binding == NativeHello(channel: state.channel, connectionID: state.id) else { throw NativeIPCFailure.untrustedPeer }
-            let session = try authority().authenticate(connectionID: state.id, peer: peer, credential: credential as Data, now: clock.read().wall)
-            try state.bind(session)
-            reply(try NativeWire.frame(binding, kind: .authenticated, requestID: id) as NSData)
+            let requestID = id, credentialBytes = credential as Data
+            try state.calls.start { [self] in
+                do {
+                    guard state.isActive, !Task.isCancelled else { throw NativeIPCFailure.unavailable }
+                    let handle = try await state.open(peer: peer)
+                    guard state.isActive, !Task.isCancelled else { throw NativeIPCFailure.unavailable }
+                    try await handlers.authenticate(credentialBytes, connection: handle)
+                    try state.bindAuthenticated(handle)
+                    let output = try NativeWire.frame(binding, kind: .authenticated, requestID: requestID)
+                    guard state.isActive else { throw NativeIPCFailure.unavailable }
+                    reply(output as NSData)
+                } catch { reply(NativeWire.problem(.unavailable, requestID: requestID) as NSData) }
+            }
         } catch { reply(NativeWire.problem(.unavailable, requestID: id) as NSData) }
     }
     func call(_ frame: NSData, reply: @escaping @Sendable (NSData) -> Void) {
         do {
-            let peer = try state.capture()
+            _ = try state.capture()
             guard frame.length > 0, frame.length <= NativeWire.maximumFrameBytes else { throw NativeIPCFailure.malformedFrame }
-            let context = try state.integrationContext(peer: peer), bytes = frame as Data
+            let handle = try state.integrationConnection(), bytes = frame as Data
             try state.calls.start { [self] in
                 guard state.isActive, !Task.isCancelled else { reply(NativeWire.problem(.unavailable, requestID: nativeRequestID(bytes)) as NSData); return }
-                let output = await NativeServiceFrames.integration(bytes, service: service, context: context)
+                let output = await nativeCapabilityFrame(bytes, handlers: handlers, connection: handle)
                 guard state.isActive else { reply(NativeWire.problem(.unavailable, requestID: nativeRequestID(bytes)) as NSData); return }
                 reply(output as NSData)
             }
@@ -197,21 +238,25 @@ private final class NativeIntegrationEndpoint: NSObject, NativeIntegrationXPC, @
 }
 private final class NativeOwnerEndpoint: NSObject, NativeOwnerXPC, @unchecked Sendable {
     let state: NativeServiceConnection
-    let service: OwnerControlService
-    init(state: NativeServiceConnection, service: OwnerControlService) { self.state = state; self.service = service }
+    let handlers: ServiceEndpointHandlers
+    init(state: NativeServiceConnection, handlers: ServiceEndpointHandlers) { self.state = state; self.handlers = handlers }
     func hello(_ frame: NSData, reply: @escaping @Sendable (NSData) -> Void) { nativeHello(frame, state: state, reply: reply) }
     func call(_ frame: NSData, sensitive: NSData?, reply: @escaping @Sendable (NSData, NSData?) -> Void) {
         do {
             let peer = try state.capture()
             guard frame.length > 0, frame.length <= NativeWire.maximumFrameBytes,
                   sensitive.map({ $0.length <= NativeWire.maximumSensitiveBytes }) ?? true else { throw NativeIPCFailure.malformedFrame }
-            let context = try state.ownerConnection(peer: peer)
             let packet = NativeOwnerPacket(frame: frame as Data, sensitive: sensitive.map { $0 as Data })
             try state.calls.start { [self] in
                 guard state.isActive, !Task.isCancelled else { reply(NativeWire.problem(.unavailable, requestID: nativeRequestID(packet.frame)) as NSData, nil); return }
-                let output = await NativeServiceFrames.owner(packet, service: service, context: context)
-                guard state.isActive else { reply(NativeWire.problem(.unavailable, requestID: nativeRequestID(packet.frame)) as NSData, nil); return }
-                reply(output.frame as NSData, output.sensitive.map { $0 as NSData })
+                do {
+                    let handle = try await state.open(peer: peer)
+                    guard state.isActive, !Task.isCancelled else { throw NativeIPCFailure.unavailable }
+                    let output = await nativeOwnerFrame(packet, handlers: handlers, connection: handle,
+                        consent: NativeConnectionConsentProvider(state: state))
+                    guard state.isActive else { throw NativeIPCFailure.unavailable }
+                    reply(output.frame as NSData, output.sensitive.map { $0 as NSData })
+                } catch { reply(NativeWire.problem(.unavailable, requestID: nativeRequestID(packet.frame)) as NSData, nil) }
             }
         } catch { reply(NativeWire.problem(.unavailable, requestID: nativeRequestID(frame)) as NSData, nil) }
     }
@@ -243,8 +288,39 @@ private struct NativeConnectionConsentProvider: OwnerConsentProvider {
     }
 }
 
-/// Used by the exported adapters after peer capture. Tests may exercise this codec/dispatch seam;
-/// doing so proves service behavior and typed framing, not a qualified signed NSXPC connection.
+extension ServiceAssembly {
+    /// Explicit opt-in factory. It grants no prerequisite qualification or service activation.
+    static func nativeEndpoints(deployment: any NativeDeploymentProvider, policy: AuthorityPolicy,
+                                clock: any PaymentClock = SystemPaymentClock()) -> EndpointFactory {
+        { channel, handlers in
+            try NativeServiceEndpoint(channel: channel, deployment: deployment,
+                authorityPolicy: policy, handlers: handlers, clock: clock)
+        }
+    }
+}
+
+private func nativeCapabilityFrame(_ bytes: Data, handlers: ServiceEndpointHandlers,
+                                   connection: ServiceConnection) async -> Data {
+    let id = nativeRequestID(bytes)
+    do {
+        let (_, request) = try NativeWire.decodeCapabilityRequest(bytes)
+        let response = try await handlers.capability(request, connection: connection)
+        return try NativeWire.capabilityResponse(response, requestID: id)
+    } catch { return NativeWire.problem(nativeProblem(error), requestID: id) }
+}
+
+private func nativeOwnerFrame(_ packet: NativeOwnerPacket, handlers: ServiceEndpointHandlers,
+                              connection: ServiceConnection, consent: any OwnerConsentProvider) async -> NativeOwnerPacket {
+    let id = nativeRequestID(packet.frame)
+    do {
+        let (_, request) = try NativeWire.decodeOwnerRequest(packet)
+        let response = try await handlers.owner(request, connection: connection, consent: consent)
+        return try NativeWire.ownerResponse(response, requestID: id)
+    } catch { return NativeOwnerPacket(frame: NativeWire.problem(nativeProblem(error), requestID: id)) }
+}
+
+/// Direct codec/service seam for development fixtures and tests; native adapters use assembly handlers.
+/// This proves service behavior and typed framing, not a qualified signed NSXPC connection.
 enum NativeServiceFrames {
     static func integration(_ bytes: Data, service: CapabilityService, context: CapabilityConnectionContext) async -> Data {
         let id = nativeRequestID(bytes)

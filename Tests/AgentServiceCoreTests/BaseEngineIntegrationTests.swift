@@ -1,3 +1,5 @@
+import AgentNativeIPC
+import AgentValues
 import CryptoKit
 import Foundation
 import OpalBaseCore
@@ -238,6 +240,110 @@ private func bchComposedFixture(funded: Bool = true) async throws -> BCHComposed
 }
 
 @Suite(.serialized) struct BaseEngineIntegrationTests {
+    @Test func serviceAssemblyBindsActualBaseAdapterToProvisionedCustodyAndReopensDurableOperations() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("base-service-assembly-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let operations = KeychainTestOperations(), seeds = BCHAssemblySeeds(), endpoints = BCHAssemblyEndpoints()
+        let clock = BCHIntegrationClock(), chain = BCHPublicChain(clock: clock)
+        let factory = BCHAssemblyEffects(chain: chain, clock: clock)
+        let policy = AuthorityPolicy(bridge: .init(teamIdentifier: "synthetic", signingIdentifier: "bridge"),
+            owner: .init(teamIdentifier: "synthetic", signingIdentifier: "owner"), accountIDs: [],
+            capabilities: Set(IntegrationScope.allCases.map(\.rawValue)), ownerAuthenticationAge: 30)
+        let expectedAccount = try await freshBCHAccount()
+        let funded = try await expectedAccount.selectNextDerivedAddress(for: .receiving)
+        try chain.publish(integrationFunding(address: funded.address, byte: 0xB7), height: 1)
+        let consent = BCHAssemblyConsent(clock: clock)
+        let assembly = try ServiceAssembly.initializeNew(directory: directory, accessGroup: "test.OpalAgent.Service",
+            accounts: seeds, operations: operations, policy: policy, effects: { try await factory.bind($0) },
+            endpoints: { endpoints.make($0, handlers: $1) }, clock: clock, generateKey: { seeds.key() })
+        try await assembly.start()
+        #expect(factory.bindings.isEmpty)
+        let owner = try await endpoints.handlers(.owner).connect(connectionID: "base-owner",
+            peer: .init(identity: policy.owner, signatureValidated: true))
+        guard case .createWallet(let created) = try await endpoints.handlers(.owner).owner(
+            .init(call: .createWallet(network: .mainnet)), connection: owner, consent: consent).result,
+              let wallet = created.wallet else { throw BCHAssemblyFailure.unexpectedResult }
+        #expect(created.availability == .restricted && created.grants.isEmpty)
+        let provisioned = try factory.state(directory)
+        let custody = try #require(provisioned.custody)
+        let account = try AccountScope(wallet: wallet, accountID: custody.accountID)
+        #expect(factory.bindings == [.init(installationID: provisioned.installationID, custody: custody)])
+        _ = try await endpoints.handlers(.owner).owner(.init(call: .enableWallet(wallet)),
+            connection: owner, consent: consent)
+        let enrollment = try EnrollmentRequest(wallet: wallet, integrationID: "base-assembly",
+            accountIDs: [custody.accountID], scopes: IntegrationScope.allCases)
+        guard case .enrollIntegration(let issued) = try await endpoints.handlers(.owner).owner(
+            .init(call: .enrollIntegration(enrollment)), connection: owner, consent: consent).result else {
+            throw BCHAssemblyFailure.unexpectedResult
+        }
+        let integration = try endpoints.handlers(.integration)
+        let bridge = try await integration.connect(connectionID: "base-bridge",
+            peer: .init(identity: policy.bridge, signatureValidated: true))
+        let credential = issued.credential.withBytes { $0 }
+        try await integration.authenticate(credential, connection: bridge)
+        guard case .synchronizeAccount(let sync) = try await integration.capability(.init(call: .synchronizeAccount(
+            .init(account: account, requestKey: RequestKey(String(repeating: "a", count: 32))))), connection: bridge).result else {
+            throw BCHAssemblyFailure.unexpectedResult
+        }
+        _ = try await bchAssemblyOperation(sync.identity.selector, handlers: integration, connection: bridge) {
+            if case .synchronization(let value) = $0 { return value.state == .completed }; return false
+        }
+        guard case .getBalance(let balance) = try await integration.capability(.init(call: .getBalance(account)),
+            connection: bridge).result else { throw BCHAssemblyFailure.unexpectedResult }
+        #expect(balance.totalSatoshis == 50_000 && balance.observation.providerID == "raw-fixture")
+        let receiveRequest = KeyedAccountRequest(account: account, requestKey: try RequestKey(String(repeating: "b", count: 32)))
+        guard case .createReceiveRequest(let pendingReceive) = try await integration.capability(
+            .init(call: .createReceiveRequest(receiveRequest)), connection: bridge).result else {
+            throw BCHAssemblyFailure.unexpectedResult
+        }
+        guard case .receive(let receive) = try await bchAssemblyOperation(pendingReceive.identity.selector,
+            handlers: integration, connection: bridge, completed: {
+                if case .receive(let value) = $0 { return value.state == .allocated }; return false
+            }) else { throw BCHAssemblyFailure.unexpectedResult }
+        // Confirmed history bounds eligibility; only retained service issuance advances high-water.
+        #expect(receive.allocation?.index == 0 && receive.allocation?.address == funded.address.string)
+        let prepare = try PreparePaymentRequest(account: account, requestKey: RequestKey(String(repeating: "c", count: 32)),
+            destinationAddress: "bitcoincash:qpm2qsznhks23z7629mms6s4cwef74vcwvy22gdx6a", amountSatoshis: 10_000)
+        guard case .preparePayment(let pendingPayment) = try await integration.capability(.init(call: .preparePayment(prepare)),
+            connection: bridge).result else { throw BCHAssemblyFailure.unexpectedResult }
+        guard case .payment(let payment) = try await bchAssemblyOperation(pendingPayment.identity.selector,
+            handlers: integration, connection: bridge, completed: {
+                if case .payment(let value) = $0 { return value.state == .prepared }; return false
+            }) else { throw BCHAssemblyFailure.unexpectedResult }
+        #expect(payment.preview?.amountSatoshis == 10_000)
+        _ = try await integration.capability(.init(call: .cancelOperation(payment.identity.selector)), connection: bridge)
+        let original = try factory.state(directory)
+        #expect(original.allocations.first?.issuedHighWater == 0 && original.allocations.first?.issuedIndices == [0])
+        #expect(original.allocations.first?.confirmedHistoryHorizon == 0 && original.payments.count == 1)
+        #expect(seeds.generated == 1 && seeds.keys == 1 && factory.bindings.count == 1 && chain.sentBytes.isEmpty)
+        let custodyWrites = operations.addCount
+        await assembly.shutdown()
+        await #expect(throws: ServiceProblem(.unavailable)) {
+            try await integration.capability(.init(call: .getBalance(account)), connection: bridge)
+        }
+
+        let reopened = try ServiceAssembly.reopen(directory: directory, accessGroup: "test.OpalAgent.Service",
+            accounts: seeds, operations: operations, policy: policy, effects: { try await factory.bind($0) },
+            endpoints: { endpoints.make($0, handlers: $1) }, clock: clock)
+        try await reopened.start()
+        #expect(factory.bindings == Array(repeating: .init(installationID: original.installationID, custody: custody), count: 2))
+        let reconnected = try endpoints.handlers(.integration)
+        let newBridge = try await reconnected.connect(connectionID: "base-bridge-reopened",
+            peer: .init(identity: policy.bridge, signatureValidated: true))
+        try await reconnected.authenticate(credential, connection: newBridge)
+        guard case .createReceiveRequest(let replay) = try await reconnected.capability(
+            .init(call: .createReceiveRequest(receiveRequest)), connection: newBridge).result else {
+            throw BCHAssemblyFailure.unexpectedResult
+        }
+        #expect(replay == receive)
+        let retained = try factory.state(directory)
+        #expect(retained.installationID == original.installationID && retained.custody == custody)
+        #expect(retained.authorization == original.authorization && retained.allocations == original.allocations)
+        #expect(retained.payments == original.payments && retained.requests == original.requests)
+        #expect(seeds.generated == 1 && seeds.keys == 1 && operations.addCount == custodyWrites && chain.sentBytes.isEmpty)
+        await reopened.shutdown()
+    }
+
     @Test func publishedReceiveSurvivesCancelAndReopenWhileSpentHistoryStillAdvancesFrontier() async throws {
         var fixture: BCHComposedFixture? = try await bchComposedFixture(funded: false)
         let directory = try #require(fixture).directory
@@ -800,4 +906,102 @@ private actor AllocationLifecycleBoundary: AccountChainBoundary {
         }
     }
     func counts() -> [Int] { [refreshCalls, addressCalls] }
+}
+
+private enum BCHAssemblyFailure: Error { case unexpectedResult, timeout }
+
+/// The fixed published BIP39 vector supplies entropy only; Base derives and reopens custody.
+private final class BCHAssemblySeeds: SeedAccountProvider, @unchecked Sendable {
+    private let lock = NSLock()
+    private var generationCount = 0
+    private var keyCount = 0
+    var generated: Int { lock.withLock { generationCount } }
+    var keys: Int { lock.withLock { keyCount } }
+    func generateMnemonic() throws -> Data {
+        lock.withLock { generationCount += 1 }
+        return Data("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".utf8)
+    }
+    func deriveAccount(mnemonic: Data, network: String) async throws -> DerivedSeedAccount {
+        try await BaseSeedAccountProvider().deriveAccount(mnemonic: mnemonic, network: network)
+    }
+    func key() -> SymmetricKey {
+        lock.withLock { keyCount += 1 }
+        return SymmetricKey(data: Data(repeating: 0xB7, count: 32))
+    }
+}
+
+private struct BCHAssemblyConsent: OwnerConsentProvider {
+    let clock: BCHIntegrationClock
+    func authenticate(_ challenge: OwnerConsentChallenge) async throws -> OwnerConsentProof {
+        .init(challenge: challenge, authenticatedAt: clock.read().wall)
+    }
+}
+
+/// Records values and a weak reader; assertions never compete with the live SQLite writer.
+private final class BCHAssemblyEffects: @unchecked Sendable {
+    struct Binding: Equatable { let installationID: String; let custody: WalletCustodyRecord }
+    let chain: BCHPublicChain
+    let clock: BCHIntegrationClock
+    private let lock = NSLock()
+    private var recorded: [Binding] = []
+    private weak var continuity: ContinuityCoordinator?
+    var bindings: [Binding] { lock.withLock { recorded } }
+    init(chain: BCHPublicChain, clock: BCHIntegrationClock) { self.chain = chain; self.clock = clock }
+    func state(_ directory: URL) throws -> CanonicalState {
+        if let coordinator = lock.withLock({ continuity }) { return try coordinator.inspect { $0 } }
+        return try bchAssemblyState(directory)
+    }
+    func bind(_ context: ServiceCustodyContext) async throws -> ServiceEffectBoundaries {
+        let binding = try context.continuity.inspect { state in
+            guard state.custody == context.custody,
+                  state.authorization.walletID == context.custody.walletID else {
+                throw BCHAssemblyFailure.unexpectedResult
+            }
+            return Binding(installationID: state.installationID, custody: context.custody)
+        }
+        let account = try await BaseSeedAccountProvider().restoreSigningAccount(custody: context.custody, vault: context.vault)
+        let adapter = try await BaseBCHAdapter(account: account, custody: context.custody, vault: context.vault,
+            continuity: context.continuity, chain: chain.operations(), clock: clock, context: { [chain] in chain.context() },
+            canonicalProof: { [chain] hash, height, view in chain.proof(hash: hash, height: height, context: view) })
+        lock.withLock { recorded.append(binding); continuity = context.continuity }
+        return ServiceEffectBoundaries(payments: adapter, chain: adapter)
+    }
+}
+
+/// Captures shared dispatch handlers without constructing or qualifying any native listener.
+private final class BCHAssemblyEndpoints: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [NativeChannel: ServiceEndpointHandlers] = [:]
+    func make(_ channel: NativeChannel, handlers: ServiceEndpointHandlers) -> any ServiceEndpointHost {
+        lock.withLock { values[channel] = handlers }
+        return BCHAssemblyEndpoint()
+    }
+    func handlers(_ channel: NativeChannel) throws -> ServiceEndpointHandlers {
+        try lock.withLock { try #require(values[channel]) }
+    }
+}
+private struct BCHAssemblyEndpoint: ServiceEndpointHost {
+    func activate() throws {}
+    func invalidate() {}
+}
+
+private func bchAssemblyState(_ directory: URL) throws -> CanonicalState {
+    let journal = try SQLiteJournal(path: directory.appendingPathComponent("journal.sqlite").path, createIfMissing: false)
+    return try #require(try journal.read())
+}
+
+private func bchAssemblyOperation(_ selector: OperationSelector, handlers: ServiceEndpointHandlers,
+                                  connection: ServiceConnection,
+                                  completed: (OperationProjection) -> Bool) async throws -> OperationProjection {
+    let deadline = ContinuousClock.now + .seconds(8)
+    while ContinuousClock.now < deadline {
+        guard case .getOperation(let operation) = try await handlers.capability(
+            .init(call: .getOperation(.operation(selector))), connection: connection).result else {
+            throw BCHAssemblyFailure.unexpectedResult
+        }
+        if completed(operation) { return operation }
+        try await Task.sleep(for: .milliseconds(5))
+    }
+    Issue.record("Composed Base operation did not finish before its deadline")
+    throw BCHAssemblyFailure.timeout
 }

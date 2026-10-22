@@ -26,6 +26,10 @@ actor PaymentEngine {
     private var starting: Set<String> = []
     private var activeAttemptID: String?
     private var activeInvocation: PaymentTransportInvocation?
+    private var stopping = false
+    private var background: [UUID: Task<Void, Never>] = [:]
+    private var activeCalls = 0
+    private var drainWaiters: [CheckedContinuation<Void, Never>] = []
 
     init(continuity: ContinuityCoordinator, authorityPolicy: AuthorityPolicy,
          boundary: any PaymentExecutionBoundary, clock: any PaymentClock = SystemPaymentClock()) {
@@ -36,8 +40,19 @@ actor PaymentEngine {
         self.startedMonotonic = clock.read().monotonic
     }
 
+    // Terminal admission closure. Cancellation of a caller is not evidence that a boundary
+    // stopped: every admitted call and background result retains this owner until it returns.
+    func shutdown() async {
+        stopping = true
+        while !background.isEmpty || activeCalls > 0 {
+            if let task = background.values.first { await task.value }
+            else { await withCheckedContinuation { drainWaiters.append($0) } }
+        }
+    }
+
     func prepare(_ request: PaymentRequest, session: AuthorizationSession,
                  connectionID: String, peer: PeerEvidence) throws -> PaymentSnapshot {
+        try requireRunning()
         guard validPaymentKey(request.requestKey), request.amount > 0, request.amount <= 2_100_000_000_000_000,
               request.feeRate > 0, !request.destinationScript.isEmpty, request.destinationScript.count <= 10_000,
               !request.accountID.isEmpty, !request.network.isEmpty else { throw PaymentFailure.invalidRequest }
@@ -78,6 +93,7 @@ actor PaymentEngine {
 
     func get(operationID: String, session: AuthorizationSession,
              connectionID: String, peer: PeerEvidence) throws -> PaymentSnapshot {
+        try requireRunning()
         let access = PaymentAccess(session: session, connectionID: connectionID, peer: peer)
         let now = clock.read().wall
         return try command("payment.read") { state in
@@ -91,6 +107,7 @@ actor PaymentEngine {
 
     func lookup(requestKey: String, session: AuthorizationSession,
                 connectionID: String, peer: PeerEvidence) throws -> PaymentSnapshot {
+        try requireRunning()
         guard validPaymentKey(requestKey) else { throw PaymentFailure.invalidRequest }
         let access = PaymentAccess(session: session, connectionID: connectionID, peer: peer)
         let now = clock.read().wall
@@ -107,6 +124,11 @@ actor PaymentEngine {
     }
 
     func ownerStatus(operationID: String, owner: OwnerAuthenticationEvidence) throws -> PaymentSnapshot {
+        try requireRunning()
+        return try ownerSnapshot(operationID: operationID, owner: owner)
+    }
+
+    private func ownerSnapshot(operationID: String, owner: OwnerAuthenticationEvidence) throws -> PaymentSnapshot {
         let now = clock.read().wall
         return try continuity.inspect { state in
             try Self.authority(state, policy: authorityPolicy).requireOwner(owner: owner, now: now)
@@ -117,6 +139,7 @@ actor PaymentEngine {
 
     func submit(operationID: String, session: AuthorizationSession,
                 connectionID: String, peer: PeerEvidence) throws -> PaymentSnapshot {
+        try requireRunning()
         let access = PaymentAccess(session: session, connectionID: connectionID, peer: peer)
         let now = clock.read().wall
         let snapshot = try command("payment.submit") { state in
@@ -142,6 +165,7 @@ actor PaymentEngine {
 
     func approve(operationID: String, owner: OwnerAuthenticationEvidence,
                  expectedPreviewContextDigest: Data? = nil) throws -> PaymentSnapshot {
+        try requireRunning()
         let now = clock.read().wall
         let snapshot = try command("payment.approve") { state in
             try Self.authority(state, policy: authorityPolicy).requireOwner(owner: owner, now: now)
@@ -183,6 +207,8 @@ actor PaymentEngine {
 
     func cancel(operationID: String, session: AuthorizationSession,
                 connectionID: String, peer: PeerEvidence) async throws -> PaymentSnapshot {
+        try beginCall()
+        defer { finishCall() }
         let access = PaymentAccess(session: session, connectionID: connectionID, peer: peer)
         let now = clock.read().wall
         _ = try command("payment.cancel") { state in
@@ -204,6 +230,8 @@ actor PaymentEngine {
 
     func reject(operationID: String, owner: OwnerAuthenticationEvidence,
                 expectedPreviewContextDigest: Data? = nil) async throws -> PaymentSnapshot {
+        try beginCall()
+        defer { finishCall() }
         let now = clock.read().wall
         _ = try command("payment.cancel") { state in
             try Self.authority(state, policy: authorityPolicy).requireOwner(owner: owner, now: now)
@@ -217,11 +245,13 @@ actor PaymentEngine {
             Self.closeUnsubmitted(operationID, reason: "rejected", state: &state)
         }
         await disposeAndRelease(operationID)
-        return try ownerStatus(operationID: operationID, owner: owner)
+        return try ownerSnapshot(operationID: operationID, owner: owner)
     }
 
     func changePolicy(approvalRequired: Bool, owner: OwnerAuthenticationEvidence,
                       expectedRevision: UInt64? = nil) async throws {
+        try beginCall()
+        defer { finishCall() }
         let now = clock.read().wall
         let invalidated: [String] = try command("payment.policy") { state in
             try Self.authority(state, policy: authorityPolicy).requireOwner(owner: owner, now: now)
@@ -241,6 +271,9 @@ actor PaymentEngine {
 
     // Production startup/wake/continuation calls this; reads never schedule work.
     func continuePending() async {
+        guard !stopping else { return }
+        activeCalls += 1
+        defer { finishCall() }
         let now = clock.read().wall
         let payments: [PaymentRecord]
         do {
@@ -253,6 +286,7 @@ actor PaymentEngine {
             }
         } catch { return }
         for payment in payments {
+            guard !stopping else { return }
             if payment.disposition == .preparing { schedulePreparation(payment.id) }
             if !payment.disposition.isUnsubmitted && !payment.liabilityUnresolved &&
                 (payment.disposition == .invalidated || payment.terminalReason != nil) {
@@ -260,7 +294,7 @@ actor PaymentEngine {
             }
             var reconciledSequence: UInt64?
             if payment.liabilityUnresolved {
-                try? await reconcile(operationID: payment.id)
+                try? await completeReconciliation(operationID: payment.id)
                 reconciledSequence = try? continuity.inspect { state in
                     state.payments[try Self.index(payment.id, state)].observationSequence
                 }
@@ -276,6 +310,13 @@ actor PaymentEngine {
     }
 
     func reconcile(operationID: String) async throws {
+        try beginCall()
+        defer { finishCall() }
+        try await completeReconciliation(operationID: operationID)
+    }
+
+    private func completeReconciliation(operationID: String) async throws {
+        try requireRunning()
         let captured: (generation: UInt64, payment: PaymentRecord) = try command("payment.observeBegin", enabled: false) { state in
             let index = try Self.index(operationID, state)
             guard state.payments[index].observationSequence < UInt64.max else { throw PaymentFailure.invalidTransition }
@@ -295,8 +336,11 @@ actor PaymentEngine {
             throw error
         }
         let decisive = Self.accepts(observation, payment: captured.payment) || Self.conflicts(observation, payment: captured.payment)
-        var releasable = true
-        if decisive { do { try await boundary.dispose(operationID: operationID) } catch { releasable = false } }
+        // Retain a late factual observation without starting disposal after admission closes.
+        var releasable = !stopping
+        if decisive, releasable {
+            do { try await boundary.dispose(operationID: operationID) } catch { releasable = false }
+        }
         let canRelease = releasable
         try command("payment.observe", enabled: false) { state in
             let index = try Self.index(operationID, state)
@@ -316,6 +360,7 @@ actor PaymentEngine {
     // Called by the owning evidence adapter for an actual evidence defect, never for
     // ordinary propagation delay or a temporary unavailable network/key.
     func requireEvidenceRepair(operationID: String, reason: String) throws {
+        try requireRunning()
         guard !reason.isEmpty, reason.utf8.count <= 512 else { throw PaymentFailure.invalidRequest }
         try command("payment.damage", enabled: false) { state in
             let index = try Self.index(operationID, state)
@@ -327,11 +372,13 @@ actor PaymentEngine {
     }
 
     func authorizeRelay(_ command: OwnerRelayCommand, owner: OwnerAuthenticationEvidence) async throws -> PaymentSnapshot {
+        try beginCall()
+        defer { finishCall() }
         guard validPaymentKey(command.key) else { throw PaymentFailure.invalidRequest }
         if let retained = try retainedOwnerCommand(command, owner: owner) { return retained }
         do {
             _ = try await startRelay(command.operationID, ownerCommand: command, owner: owner)
-            return try retainedOwnerCommand(command, owner: owner) ?? ownerStatus(operationID: command.operationID, owner: owner)
+            return try retainedOwnerCommand(command, owner: owner) ?? ownerSnapshot(operationID: command.operationID, owner: owner)
         } catch {
             if let failure = error as? PaymentFailure, [.staleContext, .invalidTransition, .relayNotEligible].contains(failure) {
                 let now = clock.read().wall
@@ -363,6 +410,9 @@ actor PaymentEngine {
     }
 
     func cancelLocalTransport() async {
+        guard !stopping else { return }
+        activeCalls += 1
+        defer { finishCall() }
         guard let invocation = activeInvocation, let attemptID = activeAttemptID else { return }
         await invocation.cancel()
         if activeAttemptID == attemptID {
@@ -374,16 +424,18 @@ actor PaymentEngine {
     }
 
     private func schedulePreparation(_ id: String) {
-        guard preparing.insert(id).inserted else { return }
-        Task { await self.completePreparation(id) }
+        guard !stopping, preparing.insert(id).inserted else { return }
+        track { await self.completePreparation(id) }
     }
 
     private func completePreparation(_ id: String) async {
         defer { preparing.remove(id) }
+        guard !stopping else { return }
         do {
             let payment = try continuity.inspect { state in state.payments[try Self.index(id, state)] }
             guard payment.disposition == .preparing, let request = payment.request else { return }
             try await revalidateClosures(accountID: payment.accountID, excluding: id)
+            guard !stopping else { return }
             try continuity.inspect { state in
                 let current = state.payments[try Self.index(id, state)]
                 guard current.disposition == .preparing else { throw PaymentFailure.invalidTransition }
@@ -414,6 +466,7 @@ actor PaymentEngine {
                 state.payments[index].blocker = nil
             }
         } catch {
+            guard !stopping else { return }
             let transient = error as? PaymentFailure == .networkUnavailable || error as? PaymentFailure == .keyUnavailable
             try? command("payment.failure") { state in
                 let index = try Self.index(id, state)
@@ -431,17 +484,20 @@ actor PaymentEngine {
     }
 
     private func scheduleRelay(_ id: String, reconciledSequence: UInt64? = nil) {
-        guard starting.insert(id).inserted else { return }
-        Task {
-            defer { self.starting.remove(id) }
-            do { _ = try await self.startRelay(id, reconciledSequence: reconciledSequence) }
-            catch { self.recordBlocker(id, error: error) }
-        }
+        guard !stopping, starting.insert(id).inserted else { return }
+        track { await self.completeRelay(id, reconciledSequence: reconciledSequence) }
+    }
+
+    private func completeRelay(_ id: String, reconciledSequence: UInt64?) async {
+        defer { starting.remove(id) }
+        do { _ = try await startRelay(id, reconciledSequence: reconciledSequence) }
+        catch { recordBlocker(id, error: error) }
     }
 
     private func startRelay(_ id: String, ownerCommand: OwnerRelayCommand? = nil,
                             owner: OwnerAuthenticationEvidence? = nil,
                             reconciledSequence: UInt64? = nil) async throws -> PaymentSnapshot {
+        try requireRunning()
         var payment = try continuity.inspect { state in
             let current = state.payments[try Self.index(id, state)]
             try Self.relayGuards(current, state: state, policy: authorityPolicy, now: clock.read().wall,
@@ -450,9 +506,10 @@ actor PaymentEngine {
         }
         try await revalidateClosures(accountID: payment.accountID, excluding: id)
         if !payment.attempts.isEmpty && payment.observationSequence != reconciledSequence {
-            try await reconcile(operationID: id)
+            try await completeReconciliation(operationID: id)
             payment = try continuity.inspect { state in state.payments[try Self.index(id, state)] }
         }
+        try requireRunning()
         guard !payment.evidenceSupported else { throw PaymentFailure.relayNotEligible }
         if !payment.attempts.isEmpty {
             guard payment.lastReconciliationAt != nil,
@@ -471,11 +528,13 @@ actor PaymentEngine {
             signed = SignedPayment(operationID: id, bytes: payment.canonicalBytes,
                                    digest: payment.transactionDigest, transactionID: payment.transactionID)
         }
+        try requireRunning()
         do { try await boundary.preflight(signed) }
         catch {
             if error as? PaymentFailure == .staleContext { await invalidateStaleAdmission(id) }
             throw error
         }
+        try requireRunning()
         if let ownerCommand, let owner, let retained = try retainedOwnerCommand(ownerCommand, owner: owner) { return retained }
         guard activeAttemptID == nil else { throw PaymentFailure.transportBusy }
         let attemptID = UUID().uuidString
@@ -562,9 +621,11 @@ actor PaymentEngine {
                 })
             }
             activeInvocation = invocation
-            Task {
+            // Always retain a handed-off invocation, even when shutdown began while its
+            // middleware was suspended. Its result may be the only factual relay evidence.
+            track {
                 let result = await invocation.result()
-                self.finishTransport(result, operationID: id, attemptID: attemptID, evidenceRevision: admissionRevision)
+                await self.finishTransport(result, operationID: id, attemptID: attemptID, evidenceRevision: admissionRevision)
             }
             return try continuity.inspect { state in Self.snapshot(state.payments[try Self.index(id, state)], state: state) }
         } catch {
@@ -647,7 +708,7 @@ actor PaymentEngine {
                 $0.evidenceSupported && $0.closures.contains { ["reconciledAccepted", "reconciledConflict"].contains($0.reason) } }.map(\.id)
         }
         for id in ids {
-            try await reconcile(operationID: id)
+            try await completeReconciliation(operationID: id)
             let supported = try continuity.inspect { state in
                 let current = state.payments[try Self.index(id, state)]
                 return current.evidenceSupported && !current.liabilityUnresolved &&
@@ -666,7 +727,7 @@ actor PaymentEngine {
         let payment = try? continuity.inspect { state in state.payments[try Self.index(id, state)] }
         if let payment {
             try? await revalidateClosures(accountID: payment.accountID, excluding: id)
-            if !payment.attempts.isEmpty { try? await reconcile(operationID: id) }
+            if !payment.attempts.isEmpty { try? await completeReconciliation(operationID: id) }
             else { await disposeAndRelease(id) }
         }
     }
@@ -678,6 +739,7 @@ actor PaymentEngine {
     }
 
     private func disposeAndRelease(_ id: String) async {
+        guard !stopping else { return }
         do {
             try await boundary.dispose(operationID: id)
             try command("payment.cleanup", enabled: false) { state in
@@ -688,6 +750,33 @@ actor PaymentEngine {
         } catch { recordBlocker(id, error: error) }
     }
 
+    private func requireRunning() throws {
+        guard !stopping else { throw PaymentFailure.unavailable }
+    }
+
+    private func beginCall() throws {
+        try requireRunning()
+        activeCalls += 1
+    }
+
+    private func finishCall() {
+        activeCalls -= 1
+        if activeCalls == 0 {
+            let waiters = drainWaiters
+            drainWaiters.removeAll()
+            for waiter in waiters { waiter.resume() }
+        }
+    }
+
+    private func track(_ operation: @escaping @Sendable () async -> Void) {
+        let id = UUID()
+        background[id] = Task {
+            await operation()
+            self.background.removeValue(forKey: id)
+        }
+    }
+
+    // Completion writes remain available while shutdown drains previously admitted work.
     private func command<Result>(_ classification: String, enabled: Bool = true,
                                  _ body: (inout CanonicalState) throws -> Result) throws -> Result {
         let now = clock.read().wall

@@ -36,6 +36,7 @@ private final class PaymentBoundaryFixture: PaymentExecutionBoundary, @unchecked
     let clock: PaymentTestClock
     let preparationLatch = PaymentLatch()
     let signingLatch = PaymentLatch()
+    let preflightLatch = PaymentLatch()
     let handoffLatch = PaymentLatch()
     let resultLatch = PaymentLatch()
     let observationLatch = PaymentLatch()
@@ -50,6 +51,7 @@ private final class PaymentBoundaryFixture: PaymentExecutionBoundary, @unchecked
     private var preflightFailure: PaymentFailure?
     private var preflights = 0
     private var preparations = 0
+    private var disposals = 0
     private var signatures = 0
     private var admissionFailure: PaymentFailure?
     init(_ clock: PaymentTestClock) { self.clock = clock }
@@ -59,6 +61,7 @@ private final class PaymentBoundaryFixture: PaymentExecutionBoundary, @unchecked
     var observationCount: Int { lock.withLock { observations } }
     var preflightCount: Int { lock.withLock { preflights } }
     var preparationCount: Int { lock.withLock { preparations } }
+    var disposalCount: Int { lock.withLock { disposals } }
     var signingCount: Int { lock.withLock { signatures } }
     func delayNextObservation() { lock.withLock { delayObservation = true } }
     func setAdmissionFailure(_ value: PaymentFailure?) { lock.withLock { admissionFailure = value } }
@@ -82,6 +85,7 @@ private final class PaymentBoundaryFixture: PaymentExecutionBoundary, @unchecked
     }
     func preflight(_ payment: SignedPayment) async throws {
         let failure = lock.withLock { preflights += 1; return preflightFailure }
+        await preflightLatch.wait()
         if let failure { throw failure }
     }
     func validateAdmission(_ payment: SignedPayment) throws {
@@ -98,6 +102,7 @@ private final class PaymentBoundaryFixture: PaymentExecutionBoundary, @unchecked
         }
     }
     func dispose(operationID: String) async throws {
+        lock.withLock { disposals += 1 }
         if lock.withLock({ cleanupFails }) { throw PaymentFailure.networkUnavailable }
     }
     func observe(_ payment: PaymentRecord) async throws -> PaymentObservation {
@@ -354,6 +359,77 @@ private func positive(_ payment: PaymentRecord, clock: PaymentTestClock) -> Paym
     PaymentObservation(source: "fixture", view: "view", chainTip: "tip", observedAt: clock.read().wall,
         complete: true, fresh: true, exactTransactionBytes: payment.canonicalBytes,
         spentConsistently: payment.selectedInputs, accountedInputs: payment.selectedInputs, changeTracked: true)
+}
+
+@Test func shutdownRetainsLateDecisiveEvidenceWithoutStartingAnotherDisposal() async throws {
+    let f = try paymentFixture()
+    defer { try? FileManager.default.removeItem(at: f.directory) }
+    let id = try await f.prepare()
+    _ = try await f.engine.submit(operationID: id, session: f.session, connectionID: "connection", peer: f.peer)
+    try await f.wait(id, disposition: .uncertain)
+    let before = try await f.engine.get(operationID: id, session: f.session, connectionID: "connection", peer: f.peer)
+    f.boundary.setObservation(positive(before.payment, clock: f.clock))
+    await f.boundary.observationLatch.close()
+    f.boundary.delayNextObservation()
+    let count = f.boundary.observationCount
+    let observation = Task { try await f.engine.reconcile(operationID: id) }
+    defer { Task { await f.boundary.observationLatch.open() } }
+    try await waitObservation(f, count: count + 1)
+    let stop = Task { await f.engine.shutdown() }
+    // Observe terminal public admission, rather than infer it from task scheduling.
+    let deadline = ContinuousClock.now + .seconds(5)
+    var closed = false
+    while ContinuousClock.now < deadline {
+        do { _ = try await f.engine.get(operationID: id, session: f.session, connectionID: "connection", peer: f.peer) }
+        catch PaymentFailure.unavailable { closed = true; break }
+        await Task.yield()
+    }
+    try #require(closed)
+    let disposals = f.boundary.disposalCount
+    await f.boundary.observationLatch.open()
+    try await observation.value
+    await stop.value
+    let state = try f.continuity.inspect { $0 }
+    let after = try #require(state.payments.first { $0.id == id })
+    #expect(f.boundary.disposalCount == disposals)
+    #expect(after.evidenceSupported && after.liabilityUnresolved && after.blocker == "leaseCleanupFailed")
+    #expect(after.evidence.contains { $0.valid && $0.observation?.exactTransactionBytes == before.payment.canonicalBytes })
+    #expect(after.canonicalBytes == before.payment.canonicalBytes && after.attempts == before.payment.attempts)
+    #expect(state.gates.contains { $0.liabilityIDs.contains(id) })
+}
+
+@Test func shutdownRetainsCleanupGateWhenStalePreflightResumes() async throws {
+    let f = try paymentFixture()
+    defer { try? FileManager.default.removeItem(at: f.directory) }
+    let id = try await f.prepare()
+    let before = try f.continuity.inspect { $0 }
+    await f.boundary.preflightLatch.close()
+    defer { Task { await f.boundary.preflightLatch.open() } }
+    f.boundary.setPreflightFailure(.staleContext)
+    _ = try await f.engine.submit(operationID: id, session: f.session, connectionID: "connection", peer: f.peer)
+    try await waitBoundary { f.boundary.preflightCount == 1 }
+    let disposals = f.boundary.disposalCount
+    let stop = Task { await f.engine.shutdown() }
+    // The boundary stays paused until terminal public admission is observed.
+    let deadline = ContinuousClock.now + .seconds(5)
+    var closed = false
+    while ContinuousClock.now < deadline {
+        do { _ = try await f.engine.get(operationID: id, session: f.session, connectionID: "connection", peer: f.peer) }
+        catch PaymentFailure.unavailable { closed = true; break }
+        await Task.yield()
+    }
+    try #require(closed)
+    await f.boundary.preflightLatch.open()
+    await stop.value
+    let state = try f.continuity.inspect { $0 }
+    let after = try #require(state.payments.first { $0.id == id })
+    #expect(f.boundary.disposalCount == disposals)
+    #expect(f.boundary.sentPayments.isEmpty && after.attempts.isEmpty && after.ordinaryAdmissions == 0)
+    #expect(after.disposition == .closed && after.terminalReason == "invalidated" && !after.liabilityUnresolved)
+    #expect(after.closures.contains { $0.reason == "invalidated" && $0.evidenceIDs.isEmpty })
+    #expect(after.evidence.isEmpty && after.canonicalBytes.isEmpty)
+    #expect(state.gates == before.gates && state.gates.contains { $0.liabilityIDs.contains(id) })
+    #expect(state.requests.contains { $0.paymentID == id && $0.disposition == .closed && $0.tombstone })
 }
 
 @Test func acceptanceClosureInvalidationAndOwnerReopenNeverRestoreOrdinaryAllowance() async throws {

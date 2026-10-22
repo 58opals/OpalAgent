@@ -6,6 +6,8 @@ The internal durable BCH engine includes encrypted fixed-profile seed recovery, 
 
 Internal service Keychain adapter source reads existing 256-bit wrapping keys and complete continuity anchors through injectable Security operations. An explicit owner-authorized new-wallet composition can add and verify one new wrapping key, then initialize restricted custody without grants. It rejects existing or ambiguous evidence and never provisions during startup or recovery. `DurableWalletStore` provides distinct explicit fresh initialization and same-store reopening over one SQLite writer lease. A nonsecret scope locator only selects the exact independently anchored custody; reopening never creates storage or provisions a key. Shipping startup does not construct these adapters. Rotation, deletion and migration remain absent.
 
+An internal `ServiceAssembly` now connects the strict store, owner controls, capability dispatch and distinct endpoint roles under one terminal lifecycle. A trusted asynchronous factory builds the existing Base adapter against that same owned custody/coordinator. Cached readiness remains an explicit host input with an unavailable default. Startup admission waits for the complete endpoint set; fresh wallets remain owner-only until creation, enablement and enrollment succeed. Shutdown retires runtime handles and drains admitted calls plus retained effect work before releasing the writer. A reopened assembly preserves durable identity and rejects prior runtime handles. Synthetic lifecycle tests use injected endpoint hosts; shipping service startup remains unavailable and no native deployment qualification follows.
+
 ## Package
 
 Requires macOS 27.0, Xcode 27 and Swift 6.4. The products are:

@@ -91,21 +91,37 @@ actor ReceiveEngine {
     private let boundary: any AccountChainBoundary
     private let clock: any PaymentClock
     private var running: [String: Task<Void, any Error>] = [:]
+    private var stopping = false
+    private var activeCalls = 0
+    private var drainWaiters: [CheckedContinuation<Void, Never>] = []
 
     init(continuity: ContinuityCoordinator, policy: AuthorityPolicy, boundary: any AccountChainBoundary,
          clock: any PaymentClock = SystemPaymentClock()) {
         self.continuity = continuity; self.policy = policy; self.boundary = boundary; self.clock = clock
     }
 
+    // The boundary can ignore cancellation. Retain every admitted call and keyed task until
+    // it actually returns; shutdown does not close or erase its durable operation identity.
+    func shutdown() async {
+        stopping = true
+        while !running.isEmpty || activeCalls > 0 {
+            if let task = running.values.first { _ = await task.result }
+            else { await withCheckedContinuation { drainWaiters.append($0) } }
+        }
+    }
+
     // Compatibility entry: explicit unkeyed refresh remains an awaited sync command.
     func synchronize(accountID: String, network: String, session: AuthorizationSession,
                      connectionID: String, peer: PeerEvidence) async throws -> AccountSyncRecord {
-        try await refresh(accountID: accountID, network: network, capability: "sync",
-                          session: session, connectionID: connectionID, peer: peer)
+        try beginCall()
+        defer { finishCall() }
+        return try await refresh(accountID: accountID, network: network, capability: "sync",
+                                 session: session, connectionID: connectionID, peer: peer)
     }
 
     func synchronize(_ request: AccountOperationRequest, session: AuthorizationSession,
                      connectionID: String, peer: PeerEvidence) async throws -> AccountOperationSnapshot {
+        try requireRunning()
         let value = try begin(request, effect: .synchronize, session: session, connectionID: connectionID, peer: peer)
         if value.state == .pending { _ = schedule(value, session: session, connectionID: connectionID, peer: peer) }
         return value
@@ -113,6 +129,7 @@ actor ReceiveEngine {
 
     func createOperation(_ request: ReceiveRequest, session: AuthorizationSession,
                          connectionID: String, peer: PeerEvidence) async throws -> AccountOperationSnapshot {
+        try requireRunning()
         let value = try begin(AccountOperationRequest(accountID: request.accountID, network: request.network,
             requestKey: request.requestKey), effect: .receive, session: session, connectionID: connectionID, peer: peer)
         if value.state == .pending { _ = schedule(value, session: session, connectionID: connectionID, peer: peer) }
@@ -122,6 +139,8 @@ actor ReceiveEngine {
     // M2 callers await the same operation; the public facade uses createOperation for prompt pending results.
     func create(_ request: ReceiveRequest, session: AuthorizationSession,
                 connectionID: String, peer: PeerEvidence) async throws -> ReceiveAllocation {
+        try beginCall()
+        defer { finishCall() }
         let value = try begin(AccountOperationRequest(accountID: request.accountID, network: request.network,
             requestKey: request.requestKey), effect: .receive, session: session, connectionID: connectionID, peer: peer)
         if value.state == .pending {
@@ -135,7 +154,8 @@ actor ReceiveEngine {
 
     func cached(accountID: String, network: String, session: AuthorizationSession,
                 connectionID: String, peer: PeerEvidence) throws -> AccountSyncRecord? {
-        try command("account.read", accountID: accountID, network: network, capability: "read",
+        try requireRunning()
+        return try command("account.read", accountID: accountID, network: network, capability: "read",
                     session: session, connectionID: connectionID, peer: peer) { state in
             guard var snapshot = state.publicSnapshots.first(where: { $0.accountID == accountID && $0.network == network }) else { return nil }
             if snapshot.generation != state.authorization.generation { snapshot.fresh = false }
@@ -145,12 +165,14 @@ actor ReceiveEngine {
 
     func get(id: String, accountID: String, network: String, session: AuthorizationSession,
              connectionID: String, peer: PeerEvidence) throws -> AccountOperationSnapshot {
-        try disclose(id: id, request: .init(accountID: accountID, network: network, requestKey: ""), capability: "read",
+        try requireRunning()
+        return try disclose(id: id, request: .init(accountID: accountID, network: network, requestKey: ""), capability: "read",
                      session: session, connectionID: connectionID, peer: peer)
     }
 
     func lookup(request: AccountOperationRequest, effect: AccountOperationEffect, session: AuthorizationSession,
                 connectionID: String, peer: PeerEvidence) throws -> AccountOperationSnapshot {
+        try requireRunning()
         guard validPaymentKey(request.requestKey) else { throw PaymentFailure.invalidRequest }
         return try command("account.operationLookup", accountID: request.accountID, network: request.network, capability: "read",
             session: session, connectionID: connectionID, peer: peer) { state in
@@ -163,7 +185,8 @@ actor ReceiveEngine {
 
     func cancel(id: String, accountID: String, network: String, session: AuthorizationSession,
                 connectionID: String, peer: PeerEvidence) throws -> AccountOperationSnapshot {
-        try command("account.operationCancel", accountID: accountID, network: network, capability: "cancel",
+        try requireRunning()
+        return try command("account.operationCancel", accountID: accountID, network: network, capability: "cancel",
             session: session, connectionID: connectionID, peer: peer) { state in
             let index = try visibleIndex(id, accountID: accountID, network: network, session: session, state: state)
             let snapshot = try accountOperationSnapshot(state.requests[index], in: state)
@@ -218,6 +241,7 @@ actor ReceiveEngine {
 
     private func run(_ snapshot: AccountOperationSnapshot, session: AuthorizationSession,
                      connectionID: String, peer: PeerEvidence) async throws {
+        guard !stopping else { return }
         let request = snapshot.request
         let token: AccountSyncRecord? = try command("account.operationBegin", accountID: request.accountID,
             network: request.network, capability: snapshot.effect.capability, session: session, connectionID: connectionID, peer: peer) { state in
@@ -243,9 +267,10 @@ actor ReceiveEngine {
             }
             return value
         }
-        guard snapshot.effect == .receive, let observation else { return }
+        guard !stopping, snapshot.effect == .receive, let observation else { return }
         guard observation.complete, observation.fresh else { throw PaymentFailure.networkUnavailable }
         while true {
+            guard !stopping else { return }
             let next: UInt32? = try command("receive.select", accountID: request.accountID, network: request.network,
                 capability: "receive", session: session, connectionID: connectionID, peer: peer) { state in
                 let index = try visibleIndex(snapshot.operationID, accountID: request.accountID, network: request.network, session: session, state: state)
@@ -340,6 +365,25 @@ actor ReceiveEngine {
         }
     }
 
+    private func requireRunning() throws {
+        guard !stopping else { throw PaymentFailure.unavailable }
+    }
+
+    private func beginCall() throws {
+        try requireRunning()
+        activeCalls += 1
+    }
+
+    private func finishCall() {
+        activeCalls -= 1
+        if activeCalls == 0 {
+            let waiters = drainWaiters
+            drainWaiters.removeAll()
+            for waiter in waiters { waiter.resume() }
+        }
+    }
+
+    // Internal completion writes remain available while previously admitted work drains.
     private func command<T>(_ name: String, accountID: String, network: String, capability: String,
                             session: AuthorizationSession, connectionID: String, peer: PeerEvidence,
                             operation: (inout CanonicalState) throws -> T) throws -> T {

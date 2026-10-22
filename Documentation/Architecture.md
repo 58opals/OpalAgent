@@ -28,6 +28,30 @@ These are the primary source dependencies; `Package.swift` records the complete 
 
 `DurableWalletStore` owns the same-store writer lease, SQLite journal and continuity coordinator. The coordinator retains the lease even if a caller releases the wrapper. Startup invalidation finishes before integration authority becomes available. The generic injected-anchor initializer retains its authenticated owner recovery facade after a failed continuity check. The explicit custody `reopen` factory instead returns no composed runtime when its identity, key or startup checks fail; separately composed owner-recovery APIs remain unchanged. Each store configures and retains one payment engine and one receive engine; a second configuration fails rather than creating another local relay slot. The shipping entries do not yet construct this composition.
 
+## Internal service lifecycle
+
+`ServiceAssembly` owns one terminal lifecycle around the strict durable store. Explicit new-store initialization exposes only owner provisioning until creation succeeds; the same store then supplies one authority, payment engine, receive engine and capability dispatcher. Reopen verifies existing custody and finishes startup invalidation before endpoint startup. A trusted asynchronous effect factory receives the exact owned coordinator, vault and verified custody to build the existing Base adapter. It runs once per assembly; no second store or client custody access is needed. Custody and lifecycle state are rechecked after binding, and shutdown joins a binding that is still in progress. A failed binding remains failed for that assembly; it selects no replacement root or automatic retry. Integration authentication still requires separate owner enablement and enrollment. No missing or failed reopen selects a new root, identity, key or fresh initialization.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle: explicit initialize or verified reopen
+    Idle --> Starting: start distinct endpoint set
+    Starting --> Running: all endpoints activated
+    Starting --> Stopping: failure or cancellation
+    Running --> Stopping: shutdown
+    Idle --> Stopping: shutdown
+    Stopping --> Stopped: handlers and engine work drained
+    Stopped --> [*]
+```
+
+The owner, MCP and optionally configured Apple integration hosts receive separate typed handlers. Admission opens only after the complete endpoint set activates; a partial startup closes admission and invalidates every constructed host. Each accepted server-selected connection receives an opaque assembly-local handle. Peer identity, endpoint role and integration profile are checked independently of request contents. Physical native disconnection synchronously invalidates the same owner proof token before queuing actor bookkeeping; task cancellation alone supplies no revocation. Shutdown invalidates owner contexts and all connection handles. A new reopened assembly retains durable grant/request identity but cannot accept an old runtime handle; shutdown does not revoke persistent grants.
+
+Reopened startup and explicit trusted host wake share one retained payment-continuation job for existing reconciliation and bounded retry policy. Polling does not start continuation.
+
+Shutdown is terminal and idempotent. It closes admission, invalidates endpoints, awaits admitted handlers, drains both effect owners and only then releases its store. The engines retain preparation, relay startup, transport-result and receive tasks, including a handoff that returns while shutdown is in progress. Already entered boundaries may record their factual completion; later effect stages do not start after engine shutdown begins. Caller cancellation does not truncate drainage or establish that a remote effect never occurred. An uncooperative boundary keeps shutdown pending and retains the writer lease. No timeout clears requests, reservations, signed bytes, admission evidence or ambiguous liabilities. Reopening requires a new explicitly selected assembly after shutdown; the stopped instance never restarts.
+
+Native hosts use these same handlers while retaining qualified-deployment, exact signed-peer and same-user checks. Listener closure excludes a racing final connection insertion. Handler references do not retain the assembly, and discarding the assembly invalidates its hosts; callers use explicit awaited shutdown for proof of drainage. Injected hosts test lifecycle and typed dispatch without constructing real listeners. Shipping startup remains unavailable, and this internal composition does not qualify protected custody, signed IPC or installed lifecycle.
+
 Wallet remains the trusted owner-control deputy and must never reconstruct the Agent wallet, synchronize it independently or open its storage. Its personal wallet security and key namespace remain separate.
 
 ## Public capabilities and service dispatch
@@ -51,7 +75,7 @@ Wallet remains the trusted owner-control deputy and must never reconstruct the A
 | `get_operation` | `read` plus originating-principal visibility | Operation identity or retained effect key; observational lookup |
 | `cancel_operation` | `cancel` plus originating-principal visibility | Cancellation only while provably unsubmitted |
 
-The service supplies authorized discovery, cached public projections and durable generic sync/receive handling. A missing snapshot is explicit unavailable data; synchronization placeholders have no observation. Receive results distinguish pending, allocated and closed. Payment results distinguish historical closure reason from the current restriction, liability, blocker, evidence support/revision and admission count. UTXO reservations reveal an operation ID only to its current origin grant; other reservations remain opaque. Observations carry provider, view, tip, sequence and generation. Runtime readiness is separate: retained freshness cannot establish current key or provider availability. A trusted captured-facts projection may report runtime readiness; its default is unavailable and it cannot open custody or refresh chain state.
+The service supplies authorized discovery, cached public projections and durable generic sync/receive handling. A missing snapshot is explicit unavailable data; synchronization placeholders have no observation. Receive results distinguish pending, allocated and closed. Payment results distinguish historical closure reason from the current restriction, liability, blocker, evidence support/revision and admission count. UTXO reservations reveal an operation ID only to its current origin grant; other reservations remain opaque. Observations carry provider, view, tip, sequence and generation. A trusted assembly effect binding supplies the existing cached-facts readiness closure, with the same unavailable default. Runtime readiness is separate: retained freshness cannot establish current key or provider availability. A trusted captured-facts projection may report runtime readiness; its default is unavailable and it cannot open custody or refresh chain state.
 
 Final result disclosure rechecks the current peer/session, connection binding, generation, account scope and origin under the continuity serializer, including after asynchronous engine calls. Integration and grant identities remain distinct; credential rotation retains the original namespace without giving a newly enrolled grant access to an old grant's history. Unknown and foreign operation lookup share the same unavailable error. Command responses use their own command scope, including cancellation without an additional read prerequisite. Safe errors contain a fixed code rather than internal error descriptions or journal payloads. Cached reads and polling do not synchronize, select inputs, allocate addresses, open seed custody, sign, reconcile or relay. They may durably retire newly observed expired authority and invalidate its unsubmitted work; unchanged reads produce no authoritative write.
 

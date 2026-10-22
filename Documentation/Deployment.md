@@ -1,6 +1,6 @@
 # Proposed deployment dossier
 
-Status: proposed macOS 27 distribution and custody design, with an internal source/synthetic durable BCH engine. Native adapter source is present; no launch-agent property list, entitlement file, provisioning profile, installer or qualified production composition is delivered by the package. Neither shipping executable registers, installs, opens live Keychain/storage or starts a wallet runtime. No signed-service or distribution proof is claimed.
+Status: proposed macOS 27 distribution and custody design, with an internal source/synthetic durable BCH engine. The bounded uninstalled embedding contract below permits staging shipping artifacts for inspection; it does not assert that a payload has been built or accepted. Native adapter source is present; no launch-agent property list, entitlement file, provisioning profile, installer or qualified production composition is delivered by the package. Neither shipping executable registers, installs, opens live Keychain/storage or starts a wallet runtime. No signed-service or distribution proof is claimed.
 
 ## Artifact inventory
 
@@ -35,6 +35,47 @@ This is an inventory proposal, not a generated or installed bundle. Final signat
 Service and bridge identities are distinct from Wallet and each other. The standalone bridge's signing identifier is not an additional installed app bundle. The final Team identifier, provisioning prefix, certificate provenance and evaluated designated requirements remain to be established from signed artifacts; this document supplies no fabricated values.
 
 The service helper's app-like structure provides a location for its own provisioning profile. Apple's [TN3137](https://developer.apple.com/documentation/technotes/tn3137-on-mac-keychains) requires user-login context for the Data Protection Keychain and provisioned access-group entitlements in an app-like bundle. Apple's [restricted-entitlement packaging guidance](https://developer.apple.com/documentation/xcode/signing-a-daemon-with-a-restricted-entitlement) explains profile-bearing wrappers. Neither source proves this particular helper composition.
+
+## Uninstalled embedding payload
+
+A staging payload contains only the bounded shipping subset below. Paths are relative to the payload root and preserve their intended positions inside a future Wallet bundle:
+
+```text
+Contents/
+  MacOS/
+    AgentBridge
+  Library/
+    Helpers/
+      OpalAgentService.app/
+        Contents/
+          Info.plist
+          MacOS/AgentService
+```
+
+The root is not a runnable `Wallet.app`: it has no Wallet executable or outer application metadata. This subset adds no LaunchAgent, provisioning profile, entitlement file or installer; staging performs no registration, launch or signing. Existing build-artifact signature state must be recorded rather than assumed to qualify the payload. The larger inventory above remains a future distribution proposal. `AgentBridge` remains a standalone executable, not another app bundle. `StoreLockProbe`, `AgentProtocolFixture`, tests, test fixtures and build tools are excluded from the embedding payload.
+
+The helper's `Info.plist` contains exactly these string values for this staging contract:
+
+| Key | Staging value |
+| --- | --- |
+| `CFBundleExecutable` | `AgentService` |
+| `CFBundleIdentifier` | `com.58opals.OpalAgent.Service` |
+| `CFBundleName` | `OpalAgentService` |
+| `CFBundlePackageType` | `APPL` |
+| `CFBundleInfoDictionaryVersion` | `6.0` |
+| `CFBundleVersion` | `0` |
+| `LSMinimumSystemVersion` | `27.0` |
+| `OpalAgentSourceRevision` | The exact full source revision recorded for the build, as 40 lowercase hexadecimal characters. |
+
+Apple documents the [core bundle keys](https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html), [build version](https://developer.apple.com/documentation/bundleresources/information-property-list/cfbundleversion) and [minimum macOS version](https://developer.apple.com/documentation/bundleresources/information-property-list/lsminimumsystemversion). The selected `CFBundleVersion` value `0` is an explicit staging-only placeholder, not a product release version or an accepted distribution build number. `OpalAgentSourceRevision` is custom provenance metadata; it supplies no signing identity or authority. No Team identifier, access group, production Mach-service name, `LSUIElement` or launch option is selected by this metadata.
+
+Build `AgentService` and `AgentBridge` as separate explicit Release products using a fresh external scratch/cache and the exact `Package.resolved` graph. Exact-revision builds compile a fresh, clean snapshot containing only that revision's tracked Git blobs and modes, rather than the working checkout, so ignored or untracked working-tree extras cannot enter compilation. Preserve normal sandbox and security settings. Do not stage a previous build directory or infer configuration from an executable's name. Record the source revision and input hashes, manifest/lock hashes, exact dependency identities/origins/revisions and clean checkout state, toolchain/SDK, build commands and selected output paths.
+
+Inspect each fresh Release executable's actual architecture slices, platform, minimum OS and SDK load commands, linked dylibs and rpaths before embedding. Record observed values rather than claiming universal architecture support or copying an assumed dependency set. System SQLite linkage and a resolved package graph do not establish that all runtime dependencies are present in the payload. Missing resources or unresolved non-system load paths block payload acceptance; source manifests alone do not prove relocatability.
+
+Neither Agent executable target declares its own resources, but the service's transitive dependency closure includes OpalCrypto word-list resources and a Metal resource target/build plugin. Inspect the fresh build's actual resource bundles and generated `Bundle.module` accessors, including their lookup candidates and generated Metal library output. Helper resources belong under `Contents/Library/Helpers/OpalAgentService.app/Contents/Resources` only when that fresh accessor inspection supports the placement. Retain the exact bundle names and contents required by the shipping closure; do not copy all scratch output or rely on a build-directory fallback. Inspect the bridge's own dependency/resource closure separately. Apple's [macOS bundle structure](https://developer.apple.com/library/archive/documentation/CoreFoundation/Conceptual/CFBundles/BundleTypes/BundleTypes.html) defines the executable and resource directories; it does not prove a particular generated accessor resolves the staged resources.
+
+Acceptance requires an exact relative file inventory with modes and hashes, binding each staged executable/resource to its fresh Release input and recording generated helper metadata. Inventory and hash checks detect byte differences; they are not signatures, peer verification, entitlement or provisioning evidence, and they grant no authority. This contract claims no executed payload acceptance, runtime resource loading, installed operation or custody qualification. Shipping entry behavior remains unavailable, and the signed-runtime and distribution gates below remain separate.
 
 ## Registration and availability
 
@@ -137,7 +178,7 @@ Current evidence is source and synthetic only. The matrix's signed-runtime and d
 
 ## Apple reference basis
 
-Official documentation was retrieved on 2026-10-17, the native-connection references rechecked on 2026-10-18 and the Keychain backend, accessibility and access-group contracts rechecked on 2026-10-20; pages are current, unversioned publications rather than immutable SDK snapshots. API-specific metadata reports macOS 13 availability for `SMAppService.agent(plistName:)`, `register()`, `unregister()`, `NSXPCConnection.setCodeSigningRequirement(_:)` and `NSXPCListener.setConnectionCodeSigningRequirement(_:)`; metadata reports macOS 10.15 for `kSecUseDataProtectionKeychain` and `AES.GCM`. The installed macOS 27 SDK headers confirm the cited ServiceManagement and NSXPC declarations. Native XPC source compiles against the macOS 27 declarations and has synthetic frame/connection-policy coverage. No evaluated signature, live Keychain or installed-service evidence follows from compilation or reference inspection.
+Official documentation was retrieved on 2026-10-17, the native-connection references rechecked on 2026-10-18 and the Keychain backend, accessibility and access-group contracts rechecked on 2026-10-20; pages are current, unversioned publications rather than immutable SDK snapshots. Bundle structure/key references and the current `CFBundleVersion` and `LSMinimumSystemVersion` pages were checked on 2026-10-22 for the staging contract. Those key pages describe build identity and minimum macOS support; the staging values and custom source-revision key are product choices, not Apple qualification of this helper. API-specific metadata reports macOS 13 availability for `SMAppService.agent(plistName:)`, `register()`, `unregister()`, `NSXPCConnection.setCodeSigningRequirement(_:)` and `NSXPCListener.setConnectionCodeSigningRequirement(_:)`; metadata reports macOS 10.15 for `kSecUseDataProtectionKeychain` and `AES.GCM`. The installed macOS 27 SDK headers confirm the cited ServiceManagement and NSXPC declarations. Native XPC source compiles against the macOS 27 declarations and has synthetic frame/connection-policy coverage. No evaluated signature, live Keychain or installed-service evidence follows from compilation or reference inspection.
 
 ## Source boundary versus native proof
 

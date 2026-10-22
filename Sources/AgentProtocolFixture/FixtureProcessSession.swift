@@ -317,7 +317,7 @@ final class FixtureProcessSession: @unchecked Sendable {
     }
     func run() async throws {
         let server = MCPToolServer(client: runtime.client)
-        try await server.start(transport: FixtureStdioLifetime(ended: {
+        try await server.start(transport: FixtureStdioLifetime(base: BoundedStdioTransport(), ended: {
             let drain = await self.startShutdown()
             // Input termination also covers errors/cancellation; the parent proves OS-pipe EOF.
             var closed = FixtureControlMessage(kind: "admissionClosed")

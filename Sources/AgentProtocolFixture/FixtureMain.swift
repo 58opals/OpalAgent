@@ -17,7 +17,7 @@ import AgentMCP
             let runtime = try await FixtureRuntime.make(directory: options.directory, scenario: options.scenario,
                 tracePath: options.trace)
             let server = MCPToolServer(client: runtime.client)
-            let transport = FixtureStdioLifetime(ended: { await runtime.shutdown() }, outputSendFailed: {
+            let transport = FixtureStdioLifetime(base: BoundedStdioTransport(), ended: { await runtime.shutdown() }, outputSendFailed: {
                 try? runtime.trace?.emit(event: "stdio-output-send-failed", relayCount: runtime.chain.counts.relays)
             })
             do {

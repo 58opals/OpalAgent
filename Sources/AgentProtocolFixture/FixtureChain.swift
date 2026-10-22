@@ -55,13 +55,11 @@ final class FixturePublicChain: @unchecked Sendable {
     let relayLatch = FixtureRelayLatch()
     private let clock: FixtureClock
     init(clock: FixtureClock) { self.clock = clock }
-    var sentBytes: [Data] { lock.withLock { sent } }
     var counts: (queries: Int, relays: Int) { lock.withLock { (queryCount, sent.count) } }
     func onRelay(_ observer: @escaping @Sendable (Data) throws -> Void) { lock.withLock { relayObserver = observer } }
     private func query() { lock.withLock { queryCount += 1 } }
     func setAccepted(_ value: Bool) { lock.withLock { accepted = value } }
     func setFresh(_ value: Bool) { lock.withLock { fresh = value } }
-    func setView(_ value: String) { lock.withLock { view = value } }
     func context() -> BaseChainContext {
         lock.withLock { BaseChainContext(network: "mainnet", source: "raw-fixture", view: view,
             tip: "tip-10", tipHeight: 10, observedAt: clock.read().wall, complete: true, fresh: fresh) }
@@ -81,12 +79,6 @@ final class FixturePublicChain: @unchecked Sendable {
                         previousTransactionHash: .init(naturalOrder: hash), previousTransactionOutputIndex: UInt32(index)))
                 }
             }
-        }
-    }
-    func remove(_ bytes: Data) {
-        lock.withLock {
-            let hash = Self.hash(bytes); entries.removeValue(forKey: hash)
-            unspents.removeAll { $0.previousTransactionHash.naturalOrder == hash }
         }
     }
     private func script(_ address: String) throws -> Data {

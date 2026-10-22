@@ -28,6 +28,7 @@ private final class PaymentFileAnchor: ContinuityAnchorStore, @unchecked Sendabl
 private actor PaymentLatch {
     private var opened = true
     private var waiters: [CheckedContinuation<Void, Never>] = []
+    var hasSuspendedWaiter: Bool { !waiters.isEmpty }
     func close() { opened = false }
     func wait() async { if !opened { await withCheckedContinuation { waiters.append($0) } } }
     func open() { opened = true; let pending = waiters; waiters = []; for waiter in pending { waiter.resume() } }
@@ -240,18 +241,32 @@ private func paymentFixture(approvalRequired: Bool = false,
 @Test func cancellationWhilePreparationSuspendsRetainsIdentityAndDisposesGate() async throws {
     let f = try paymentFixture(); defer { try? FileManager.default.removeItem(at: f.directory) }
     await f.boundary.preparationLatch.close()
-    let operation = try await f.engine.prepare(f.request(), session: f.session, connectionID: "connection", peer: f.peer)
-    let cancelled = try await f.engine.cancel(operationID: operation.payment.id, session: f.session,
-                                             connectionID: "connection", peer: f.peer)
-    #expect(cancelled.payment.terminalReason == "cancelled")
-    await f.boundary.preparationLatch.open()
-    try await Task.sleep(for: .milliseconds(10))
-    #expect(try f.state().payments.first?.disposition == .closed)
-    #expect(try f.state().gates.isEmpty)
-    let replay = try await f.engine.prepare(f.request(), session: f.session, connectionID: "connection", peer: f.peer)
-    #expect(replay.payment.id == operation.payment.id)
-    #expect(replay.payment.disposition == .closed)
-    #expect(f.boundary.sentPayments.isEmpty)
+    do {
+        let operation = try await f.engine.prepare(f.request(), session: f.session, connectionID: "connection", peer: f.peer)
+        try await waitBoundary { await f.boundary.preparationLatch.hasSuspendedWaiter }
+        #expect(f.boundary.preparationCount == 0)
+        let cancelled = try await f.engine.cancel(operationID: operation.payment.id, session: f.session,
+                                                 connectionID: "connection", peer: f.peer)
+        #expect(cancelled.payment.terminalReason == "cancelled")
+        let retainedRequest = try #require(f.state().requests.first { $0.paymentID == operation.payment.id })
+        let initialDisposals = f.boundary.disposalCount
+        #expect(initialDisposals == 1)
+        await f.boundary.preparationLatch.open()
+        // A late returned plan must be disposed before shutdown closes new disposal admission.
+        try await waitBoundary { f.boundary.disposalCount == initialDisposals + 1 }
+        let replay = try await f.engine.prepare(f.request(), session: f.session, connectionID: "connection", peer: f.peer)
+        #expect(replay.payment.id == operation.payment.id && replay.payment.disposition == .closed)
+        await f.engine.shutdown()
+        let final = try f.continuity.inspect { $0 }
+        #expect(f.boundary.preparationCount == 1 && f.boundary.disposalCount == initialDisposals + 1)
+        #expect(final.payments.first?.disposition == .closed && final.payments.first?.terminalReason == "cancelled")
+        #expect(final.gates.isEmpty && final.requests.first { $0.paymentID == operation.payment.id } == retainedRequest)
+        #expect(f.boundary.sentPayments.isEmpty)
+    } catch {
+        await f.boundary.preparationLatch.open()
+        await f.engine.shutdown()
+        throw error
+    }
 }
 
 @Test func revocationWinsSuspendedHandoffAndDisallowsLaterResultDisclosure() async throws {
@@ -650,7 +665,8 @@ func multipleLiabilitiesAndUncertainChildDoNotVetoOwnerExactParentRelay(child: B
     f.boundary.setPreflightFailure(.keyUnavailable)
     let id = try await f.prepare()
     _ = try await f.engine.submit(operationID: id, session: f.session, connectionID: "connection", peer: f.peer)
-    try await Task.sleep(for: .milliseconds(20))
+    try await waitBoundary { (try? f.continuity.inspect { $0.payments.first?.blocker }) == "keyUnavailable" }
+    #expect(f.boundary.preflightCount == 1)
     #expect(try f.state().payments.first?.attempts.isEmpty == true)
     #expect(f.boundary.sentPayments.isEmpty)
     f.boundary.setPreflightFailure(nil)
@@ -895,10 +911,10 @@ enum PaymentCrashPrefix: String, Codable, Sendable, CaseIterable {
     #expect(restarted.boundary.sentPayments.count == 1)
 }
 
-private func waitBoundary(_ predicate: @Sendable () -> Bool) async throws {
+private func waitBoundary(_ predicate: @Sendable () async -> Bool) async throws {
     let deadline = ContinuousClock.now + .seconds(5)
     while ContinuousClock.now < deadline {
-        if predicate() { return }
+        if await predicate() { return }
         try await Task.sleep(for: .milliseconds(2))
     }
     Issue.record("External boundary did not reach expected phase")

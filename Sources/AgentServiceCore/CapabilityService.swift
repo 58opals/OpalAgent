@@ -65,11 +65,11 @@ final class CapabilityService: Sendable {
             return .listTransactions(try read(request.account, context: context) { state in
                 let record = try cached(state, account: request.account)
                 let snapshot = try JSONDecoder().decode(OpalBase.Account.Snapshot.self, from: record.snapshot)
-                let items = snapshot.addressBook.transactions.sorted { $0.transactionHash < $1.transactionHash }.map {
-                    TransactionSummary(transactionID: $0.transactionHash, deltaSatoshis: nil, confirmations: nil,
+                let items = try snapshot.addressBook.transactions.map {
+                    TransactionSummary(transactionID: try Self.snapshotTransactionID($0.transactionHash), deltaSatoshis: nil, confirmations: nil,
                         height: $0.confirmationHeight.flatMap(UInt32.init(exactly:)),
                         status: TransactionStatus(rawValue: $0.status.rawValue) ?? .unknown)
-                }
+                }.sorted { $0.transactionID < $1.transactionID }
                 guard Set(items.map(\.transactionID)).count == items.count else { throw ServiceProblem(.unavailable) }
                 return AccountPage(account: request.account,
                     observation: Self.observation(record, generation: state.authorization.generation),
@@ -83,7 +83,7 @@ final class CapabilityService: Sendable {
                 let snapshot = try JSONDecoder().decode(OpalBase.Account.Snapshot.self, from: record.snapshot)
                 let items = try snapshot.addressBook.utxos.map { utxo -> UTXOSummary in
                     guard let amount = Int64(exactly: utxo.value) else { throw ServiceProblem(.unavailable) }
-                    let point = Outpoint(transactionID: utxo.transactionHash, outputIndex: utxo.outputIndex)
+                    let point = Outpoint(transactionID: try Self.snapshotTransactionID(utxo.transactionHash), outputIndex: utxo.outputIndex)
                     let key = "\(point.transactionID):\(point.outputIndex)"
                     let holders = state.payments.filter { payment in
                         payment.accountID == request.account.accountID && payment.network == request.account.wallet.network.rawValue &&
@@ -403,6 +403,18 @@ final class CapabilityService: Sendable {
     private static func canonicalAddress(script: Data, network: WalletNetwork) throws -> String {
         guard let environment = OpalBase.Network.Environment(rawValue: network.rawValue) else { throw ServiceProblem(.invalidRequest) }
         return try OpalBase.Address(script: .decode(lockingScript: script), network: environment).string
+    }
+    private static func snapshotTransactionID(_ naturalHex: String) throws -> String {
+        guard naturalHex.utf8.count == 64, naturalHex.utf8.allSatisfy({
+            (48...57).contains($0) || (65...70).contains($0) || (97...102).contains($0)
+        }) else { throw ServiceProblem(.unavailable) }
+        var bytes = Data(); var offset = naturalHex.startIndex
+        while offset < naturalHex.endIndex {
+            let next = naturalHex.index(offset, offsetBy: 2)
+            guard let byte = UInt8(naturalHex[offset..<next], radix: 16) else { throw ServiceProblem(.unavailable) }
+            bytes.append(byte); offset = next
+        }
+        return hex(Data(bytes.reversed()))
     }
     private static func outpoint(_ value: String) throws -> Outpoint {
         let parts = value.split(separator: ":", omittingEmptySubsequences: false)

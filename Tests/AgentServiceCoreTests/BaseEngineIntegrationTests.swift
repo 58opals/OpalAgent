@@ -251,7 +251,8 @@ private func bchComposedFixture(funded: Bool = true) async throws -> BCHComposed
             capabilities: Set(IntegrationScope.allCases.map(\.rawValue)), ownerAuthenticationAge: 30)
         let expectedAccount = try await freshBCHAccount()
         let funded = try await expectedAccount.selectNextDerivedAddress(for: .receiving)
-        try chain.publish(integrationFunding(address: funded.address, byte: 0xB7), height: 1)
+        let funding = try integrationFunding(address: funded.address, byte: 0xB7)
+        try chain.publish(funding, height: 1)
         let consent = BCHAssemblyConsent(clock: clock)
         let assembly = try ServiceAssembly.initializeNew(directory: directory, accessGroup: "test.OpalAgent.Service",
             accounts: seeds, operations: operations, policy: policy, effects: { try await factory.bind($0) },
@@ -311,6 +312,20 @@ private func bchComposedFixture(funded: Bool = true) async throws -> BCHComposed
                 if case .payment(let value) = $0 { return value.state == .prepared }; return false
             }) else { throw BCHAssemblyFailure.unexpectedResult }
         #expect(payment.preview?.amountSatoshis == 10_000)
+        let naturalFundingHash = BCHPublicChain.hash(funding)
+        let expectedFundingID = BCHPublicChain.hex(Data(naturalFundingHash.reversed()))
+        #expect(naturalFundingHash != Data(naturalFundingHash.reversed()))
+        let expectedOutpoint = Outpoint(transactionID: expectedFundingID, outputIndex: 0)
+        #expect(payment.preview?.selectedInputs == [expectedOutpoint])
+        guard case .listTransactions(let history) = try await integration.capability(.init(call: .listTransactions(
+            .init(account: account, page: PageRequest()))), connection: bridge).result,
+              case .listUTXOs(let coins) = try await integration.capability(.init(call: .listUTXOs(
+                .init(account: account, page: PageRequest()))), connection: bridge).result else {
+            throw BCHAssemblyFailure.unexpectedResult
+        }
+        #expect(history.page.items.map(\.transactionID) == [expectedFundingID])
+        #expect(coins.page.items.map(\.outpoint) == [expectedOutpoint])
+        #expect(coins.page.items.map(\.reservation) == [.visibleOperation(payment.identity.selector.operationID)])
         _ = try await integration.capability(.init(call: .cancelOperation(payment.identity.selector)), connection: bridge)
         let original = try factory.state(directory)
         #expect(original.allocations.first?.issuedHighWater == 0 && original.allocations.first?.issuedIndices == [0])

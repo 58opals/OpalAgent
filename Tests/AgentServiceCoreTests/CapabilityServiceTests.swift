@@ -38,7 +38,7 @@ private final class CapabilityEffects: PaymentExecutionBoundary, AccountChainBou
         await preparation.wait()
         return PaymentPreview(operationID: request.operationID, accountID: request.accountID, network: request.network,
             destinationScript: request.destinationScript, amount: request.amount, fee: 100,
-            selectedInputs: [String(repeating: "a", count: 64) + ":1"], change: Data(),
+            selectedInputs: ["1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020180:1"], change: Data(),
             templateDigest: paymentDigest(try paymentEncoding(request)), leaseDeadline: 2_000)
     }
     func sign(_ preview: PaymentPreview) async throws -> SignedPayment {
@@ -74,15 +74,21 @@ private final class CapabilityEffects: PaymentExecutionBoundary, AccountChainBou
 }
 private func capabilityRecord(accountID: String = "account", network: String = "mainnet") throws -> AccountSyncRecord {
     var utxos: [OpalBase.Account.Snapshot.AddressBook.UTXO] = []
-    for index in 1...3 {
-        let character = ["a", "b", "c"][index - 1]
-        let hash = String(repeating: character, count: 64)
+    // Base snapshots use natural byte order; these hashes sort differently in RPC order.
+    let hashes = [
+        "800102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        "402122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+        "004142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f"
+    ]
+    for (offset, hash) in hashes.enumerated() {
+        let index = offset + 1
         let utxo = OpalBase.Account.Snapshot.AddressBook.UTXO(value: UInt64(index * 1_000), lockingScript: "51",
             tokenCategory: nil, tokenAmount: nil, nftCapability: nil, nftCommitment: nil,
             transactionHash: hash, outputIndex: UInt32(index))
         utxos.append(utxo)
     }
-    let transaction = OpalBase.Account.Snapshot.AddressBook.Transaction(transactionHash: String(repeating: "d", count: 64),
+    let transaction = OpalBase.Account.Snapshot.AddressBook.Transaction(
+        transactionHash: "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f",
         height: 100, fee: 100, scriptHashes: [], firstSeenAt: Date(timeIntervalSince1970: 900),
         lastUpdatedAt: Date(timeIntervalSince1970: 1_000), status: .confirmed, confirmationHeight: 100,
         confirmedAt: Date(timeIntervalSince1970: 1_000), verificationStatus: .pending, merkleProof: nil,
@@ -201,9 +207,15 @@ private func capabilityEventually(_ predicate: () throws -> Bool) async throws {
     #expect(balance.readiness.state == .unavailable)
     guard case .listTransactions(let history) = try await f.call(.listTransactions(AccountPageRequest(account: f.account, page: PageRequest()))) else { throw CapabilityFailure.invalidResponse }
     #expect(history.page.items.count == 1 && history.page.items[0].height == 100)
+    #expect(history.page.items.map(\.transactionID) == ["7f7e7d7c7b7a797877767574737271706f6e6d6c6b6a69686766656463626160"])
     #expect(history.page.items[0].deltaSatoshis == nil && history.page.items[0].confirmations == nil)
     guard case .listUTXOs(let coins) = try await f.call(.listUTXOs(AccountPageRequest(account: f.account, page: PageRequest()))) else { throw CapabilityFailure.invalidResponse }
     #expect(coins.page.items.count == 3 && coins.page.items.allSatisfy { $0.reservation == .unreserved })
+    #expect(coins.page.items.map(\.outpoint) == [
+        Outpoint(transactionID: "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020180", outputIndex: 1),
+        Outpoint(transactionID: "3f3e3d3c3b3a393837363534333231302f2e2d2c2b2a29282726252423222140", outputIndex: 2),
+        Outpoint(transactionID: "5f5e5d5c5b5a595857565554535251504f4e4d4c4b4a49484746454443424100", outputIndex: 3)
+    ])
     guard case .getSyncStatus(let syncStatus) = try await f.call(.getSyncStatus(f.account)) else { throw CapabilityFailure.invalidResponse }
     #expect(syncStatus.observation?.sequence == 3)
     #expect(f.effects.counts == [0, 0, 0, 0, 0, 0])
@@ -220,7 +232,7 @@ private func capabilityEventually(_ predicate: () throws -> Bool) async throws {
     guard case .preparePayment(let payment) = try await f.call(.preparePayment(f.payment())) else { throw CapabilityFailure.invalidResponse }
     try await f.waitPayment(payment.identity.selector.operationID)
     guard case .getOperation(.payment(let prepared)) = try await f.call(.getOperation(.request(account: f.account, effect: .preparePayment, key: f.key()))) else { throw CapabilityFailure.invalidResponse }
-    #expect(prepared.preview?.selectedInputs == [Outpoint(transactionID: String(repeating: "a", count: 64), outputIndex: 1)])
+    #expect(prepared.preview?.selectedInputs == [Outpoint(transactionID: "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020180", outputIndex: 1)])
     #expect(prepared.preview?.feeSatoshis == 100 && prepared.accountRestriction == .held)
     guard case .submitPayment(let pendingApproval) = try await f.call(.submitPayment(payment.identity.selector)) else { throw CapabilityFailure.invalidResponse }
     #expect(pendingApproval.state == .pendingApproval)
@@ -332,14 +344,17 @@ func capabilityAuthorityChangesDuringAwaitPreventDisclosure(_ change: String) as
     try await f.waitPayment(initial.identity.selector.operationID)
     let request = try AccountPageRequest(account: f.account, page: PageRequest(limit: 1))
     guard case .listUTXOs(let first) = try await f.call(.listUTXOs(request)) else { throw CapabilityFailure.invalidResponse }
+    #expect(first.page.items.map(\.outpoint) == [Outpoint(transactionID: "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020180", outputIndex: 1)])
     #expect(first.page.items[0].reservation == .visibleOperation(initial.identity.selector.operationID))
     let cursor = try #require(first.page.nextCursor)
     guard case .listUTXOs(let second) = try await f.call(.listUTXOs(AccountPageRequest(account: f.account, page: PageRequest(limit: 1, cursor: cursor)))) else { throw CapabilityFailure.invalidResponse }
+    #expect(second.page.items.map(\.outpoint) == [Outpoint(transactionID: "3f3e3d3c3b3a393837363534333231302f2e2d2c2b2a29282726252423222140", outputIndex: 2)])
     #expect(second.page.items[0].outpoint != first.page.items[0].outpoint && second.page.items[0].reservation == .unreserved)
     let issued = try f.authority.enroll(id: "foreign-grant", integrationID: "foreign-integration", accounts: ["account"], capabilities: ["read"], expiry: nil, owner: f.owner, now: 1_000)
     let session = try f.authority.authenticate(connectionID: "foreign", peer: f.context.peer, credential: issued.rawValue, now: 1_000)
     let context = CapabilityConnectionContext(session: session, connectionID: "foreign", peer: f.context.peer)
     guard case .listUTXOs(let foreign) = try await f.call(.listUTXOs(request), context: context) else { throw CapabilityFailure.invalidResponse }
+    #expect(foreign.page.items.map(\.outpoint) == first.page.items.map(\.outpoint))
     #expect(foreign.page.items[0].reservation == .otherOperation)
     await #expect(throws: ServiceProblem(.staleContext)) {
         try await f.call(.listUTXOs(AccountPageRequest(account: f.account, page: PageRequest(limit: 1, cursor: cursor))), context: context)

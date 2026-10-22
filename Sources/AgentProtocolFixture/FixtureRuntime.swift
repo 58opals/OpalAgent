@@ -281,13 +281,11 @@ final class FixtureRuntime: @unchecked Sendable {
     func openSession(credential: Data? = nil) async throws -> FixtureClientSession {
         try await Self.openSession(endpoints: endpoints, policy: policy, credential: credential ?? syntheticCredential, chain: chain, trace: trace)
     }
-    func integrationClient(credential: Data) async throws -> CapabilityClient { try await openSession(credential: credential).client }
     func openForeignSession() async throws -> FixtureClientSession {
         guard case .enrollIntegration(let issued) = try await ownerClient.call(.enrollIntegration(try EnrollmentRequest(wallet: account.wallet,
             integrationID: "foreign-fixture-integration", accountIDs: [account.accountID], scopes: [.read, .sync, .receive, .prepare, .submit, .cancel]))) else { throw FixtureFailure.fixtureUnavailable }
         return try await openSession(credential: issued.credential.withBytes { $0 })
     }
-    func foreignClient() async throws -> CapabilityClient { try await openForeignSession().client }
     func openOwnerSession(consent: any OwnerConsentProvider) async throws -> FixtureOwnerSession {
         let handlers = try endpoints.endpoint(.owner)
         return FixtureOwnerSession(handlers: handlers,

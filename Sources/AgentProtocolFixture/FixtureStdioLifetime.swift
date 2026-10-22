@@ -7,16 +7,16 @@ import MCP
 /// The host chooses explicit fixture-fault release separately and awaits factual drain.
 actor FixtureStdioLifetime: MCP.Transport {
     nonisolated let logger = MCP.InMemoryTransport().logger
-    private let base = BoundedStdioTransport()
+    private let base: any MCP.Transport
     private let ended: @Sendable () async -> Void
     private let outputSendFailed: @Sendable () async -> Void
     private var reader: Task<Void, Never>?
     private var disconnecting = false
     private var activeSends = 0
     private var sendWaiters: [CheckedContinuation<Void, Never>] = []
-    init(ended: @escaping @Sendable () async -> Void,
+    init(base: any MCP.Transport, ended: @escaping @Sendable () async -> Void,
          outputSendFailed: @escaping @Sendable () async -> Void = {}) {
-        self.ended = ended; self.outputSendFailed = outputSendFailed
+        self.base = base; self.ended = ended; self.outputSendFailed = outputSendFailed
     }
     func connect() async throws { try await base.connect() }
     func send(_ data: Data) async throws {
@@ -38,12 +38,16 @@ actor FixtureStdioLifetime: MCP.Transport {
     }
     func receive() -> AsyncThrowingStream<Data, any Error> {
         let base = self.base, ended = self.ended
-        return AsyncThrowingStream { continuation in
+        return AsyncThrowingStream(bufferingPolicy: .bufferingOldest(MCPBounds.concurrentRequests)) { continuation in
             let task = Task {
                 do {
                     for try await data in await base.receive() {
                         try Task.checkCancellation()
-                        continuation.yield(data)
+                        switch continuation.yield(data) {
+                        case .enqueued: break
+                        case .dropped, .terminated: throw MCPError.invalidRequest("Input capacity exceeded")
+                        @unknown default: throw MCPError.connectionClosed
+                        }
                     }
                     await ended()
                     continuation.finish()

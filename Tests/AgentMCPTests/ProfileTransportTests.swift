@@ -132,20 +132,36 @@ private actor CancellableClientBoundary: CapabilityTransport {
         let end = ContinuousClock.now.advanced(by: .seconds(3))
         while started == 0 { guard ContinuousClock.now < end else { throw MCPError.connectionClosed }; try await Task.sleep(for: .milliseconds(2)) }
     }
+    func waitCancelled() async throws {
+        let end = ContinuousClock.now.advanced(by: .seconds(3))
+        while cancelled == 0 { guard ContinuousClock.now < end else { throw MCPError.connectionClosed }; try await Task.sleep(for: .milliseconds(2)) }
+    }
 }
-@Test func profileCancellationAndEOFJoinOwnedToolWork() async throws {
+enum ProfileCancellationCause: Sendable, CaseIterable { case notification, inputEOF }
+@Test(arguments: ProfileCancellationCause.allCases)
+func profileCancellationAndEOFJoinOwnedToolWork(_ cause: ProfileCancellationCause) async throws {
     let (client, base) = await InMemoryTransport.createConnectedPair()
     let inbox = WireInbox(client); try await inbox.start()
     let boundary = CancellableClientBoundary()
     let server = MCPToolServer(client: CapabilityClient(transport: boundary)); try await server.start(transport: base)
-    try await ready(inbox)
-    try await inbox.send(["jsonrpc": "2.0", "id": "held", "method": "tools/call", "params": .object(["name": "list_wallets", "arguments": .object([:])])])
-    try await boundary.waitStarted()
-    try await inbox.send(["jsonrpc": "2.0", "method": "notifications/cancelled", "params": .object(["requestId": "held"])])
-    await inbox.stop()
-    await server.waitUntilCompleted()
-    #expect(await boundary.started == 1)
-    #expect(await boundary.cancelled == 1)
+    do {
+        try await ready(inbox)
+        try await inbox.send(["jsonrpc": "2.0", "id": "held", "method": "tools/call", "params": .object(["name": "list_wallets", "arguments": .object([:])])])
+        try await boundary.waitStarted()
+        if cause == .notification {
+            try await inbox.send(["jsonrpc": "2.0", "method": "notifications/cancelled", "params": .object(["requestId": "held"])])
+            // EOF/stop must not supply this notification-specific cancellation witness.
+            try await boundary.waitCancelled()
+            #expect(await boundary.cancelled == 1)
+        }
+        await inbox.stop()
+        await server.waitUntilCompleted()
+        #expect(await boundary.started == 1)
+        #expect(await boundary.cancelled == 1)
+    } catch {
+        await inbox.stop(); await server.stop()
+        throw error
+    }
 }
 
 @Test func profileInvalidNotificationsNeverEmitUnsolicitedNullIDResponse() async throws {

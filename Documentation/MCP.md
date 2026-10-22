@@ -20,6 +20,8 @@ All unknown wallet fields, including nested selectors and claimed authorization 
 
 Amounts and fee rates at the MCP boundary are exact canonical decimal integer strings. For example, `"amountSatoshis":"10000"` is valid; `10000`, `"1.0"`, `"1e4"`, whitespace, signs, leading zeros and overflow are invalid. Amounts follow the public service BCH supply bound; fee rate is positive Int64. Returned satoshi values are strings, including signed transaction deltas when known. UInt64 sequence, generation, revision and attempt/admission counters are also decimal strings; the adapter never routes them through Double. Bounded indexes, page limits, heights and exact Int64 timestamps use JSON integers. Unknown observed values remain null.
 
+Transaction IDs, including those in outpoints, use 64 lowercase hexadecimal characters in RPC/display byte order.
+
 Successful results contain the same safe JSON envelope in `structuredContent` and one text fallback: `{"ok":true,"method":"get_balance","result":{...}}`. Service failures return `isError:true` and `{"ok":false,"error":{"code":"unavailable"}}` using the fixed public error-code vocabulary. Unknown tools fail without service effects. No result contains a canonical journal row, signing plan, immutable transaction bytes, seed, credential or arbitrary error description. UTXO reservations disclose an operation ID only when the service permits origin visibility.
 
 | Tool | Arguments | Safe result |

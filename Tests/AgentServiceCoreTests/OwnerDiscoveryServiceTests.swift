@@ -86,14 +86,11 @@ private final class DiscoveryAuthorities: @unchecked Sendable {
         }
     }
 }
-private struct DiscoveryNativeTransport: OwnerControlTransport {
+private struct DiscoveryOwnerServiceTransport: OwnerControlTransport {
     let service: OwnerControlService
     let connection: OwnerConnectionContext
     func send(_ request: OwnerControlRequest) async throws -> OwnerControlResponse {
-        let id = UUID()
-        let packet = try NativeWire.ownerRequest(request, requestID: id)
-        let result = await NativeServiceFrames.owner(packet, service: service, context: connection)
-        return try NativeWire.decodeOwnerResponse(result, requestID: id, method: request.call.method)
+        try await service.send(request, connection: connection)
     }
 }
 private final class DiscoveryFixture: @unchecked Sendable {
@@ -134,7 +131,7 @@ private final class DiscoveryFixture: @unchecked Sendable {
             peer: peer ?? PeerEvidence(identity: policy.owner, signatureValidated: true))
     }
     func client(connection: OwnerConnectionContext? = nil) -> OwnerControlClient {
-        OwnerControlClient(transport: DiscoveryNativeTransport(service: service, connection: connection ?? self.connection()))
+        OwnerControlClient(transport: DiscoveryOwnerServiceTransport(service: service, connection: connection ?? self.connection()))
     }
     func create(restoring: Bool = false) async throws -> WalletScope {
         let result: OwnerControlResult
@@ -185,8 +182,8 @@ private final class DiscoveryFixture: @unchecked Sendable {
     }
 }
 
-// Actual public owner client + native frame dispatcher + SQLite/Core. Synthetic peer, consent,
-// seed and engine-boundary inputs do not qualify signed NSXPC, live custody or human authentication.
+// Public owner client + actual owner service + SQLite through the typed transport boundary.
+// Synthetic inputs do not qualify assembly request framing, signed NSXPC, live custody or human authentication.
 @Test(arguments: [false, true])
 func ownerDiscoveryFindsCreatedOrRestoredAccountWithoutGrantOrReadEffects(_ restoring: Bool) async throws {
     let f = try DiscoveryFixture(); defer { f.remove() }

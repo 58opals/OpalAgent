@@ -119,14 +119,11 @@ private final class NativeOwnerTestAuthorityBox: @unchecked Sendable {
         }
     }
 }
-private struct NativeOwnerEndpointTransport: OwnerControlTransport {
+private struct NativeOwnerServiceTransport: OwnerControlTransport {
     let service: OwnerControlService
     let connection: OwnerConnectionContext
     func send(_ request: OwnerControlRequest) async throws -> OwnerControlResponse {
-        let id = UUID()
-        let packet = try NativeWire.ownerRequest(request, requestID: id)
-        let response = await NativeServiceFrames.owner(packet, service: service, context: connection)
-        return try NativeWire.decodeOwnerResponse(response, requestID: id, method: request.call.method)
+        try await service.send(request, connection: connection)
     }
 }
 private final class NativeOwnerEndpointFixture: @unchecked Sendable {
@@ -165,7 +162,7 @@ private final class NativeOwnerEndpointFixture: @unchecked Sendable {
     }
     func remove() { try? FileManager.default.removeItem(at: directory) }
     func call(_ call: OwnerControlCall) async throws -> OwnerControlResult {
-        try await OwnerControlClient(transport: NativeOwnerEndpointTransport(service: service, connection: connection)).call(call)
+        try await OwnerControlClient(transport: NativeOwnerServiceTransport(service: service, connection: connection)).call(call)
     }
     func createEnabled() async throws -> (WalletScope, AccountScope) {
         guard case .createWallet(let status) = try await call(.createWallet(network: .mainnet)), let wallet = status.wallet else { throw PaymentFailure.unavailable }
@@ -194,8 +191,9 @@ private final class NativeOwnerEndpointFixture: @unchecked Sendable {
     }
 }
 
-// This is codec/public-client/actual service composition with synthetic peer and consent evidence.
-// It does not claim signed NSXPC admission, installed-service, or trusted human UI proof.
+// Public owner client and actual owner service with synthetic peer and consent evidence.
+// Consent challenge codecs remain covered here; assembly request framing is outside this unit seam.
+// This does not claim signed NSXPC admission, installed-service, or trusted human UI proof.
 @Test(arguments: ["policy", "origin"])
 func nativeOwnerSuspendedExactConsentRejectsChangedAuthorityWithoutEffect(_ change: String) async throws {
     let f = try NativeOwnerEndpointFixture(); defer { f.remove() }

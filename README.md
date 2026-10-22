@@ -8,6 +8,8 @@ Internal service Keychain adapter source reads existing 256-bit wrapping keys an
 
 An internal `ServiceAssembly` now connects the strict store, owner controls, capability dispatch and distinct endpoint roles under one terminal lifecycle. A trusted asynchronous factory builds the existing Base adapter against that same owned custody/coordinator. Cached readiness remains an explicit host input with an unavailable default. Startup admission waits for the complete endpoint set; fresh wallets remain owner-only until creation, enablement and enrollment succeed. Shutdown retires runtime handles and drains admitted calls plus retained effect work before releasing the writer. A reopened assembly preserves durable identity and rejects prior runtime handles. Synthetic lifecycle tests use injected endpoint hosts; shipping service startup remains unavailable and no native deployment qualification follows.
 
+Native owner and capability requests share the internal `NativeServiceFrames` dispatcher with actual assembly-backed synthetic callers. It decodes the existing bounded `NativeWire` format, invokes handlers using an opaque current `ServiceConnection`, and encodes the response; decoding grants no authority. Owner consent and the separate sensitive-data slot remain required by the existing method contract. This shared source path supplies no physical NSXPC, signed-peer, native handshake/callback, listener or installed-service qualification.
+
 ## Package
 
 Requires macOS 27.0, Xcode 27 and Swift 6.4. The products are:

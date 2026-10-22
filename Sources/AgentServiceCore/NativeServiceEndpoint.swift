@@ -229,7 +229,7 @@ private final class NativeIntegrationEndpoint: NSObject, NativeIntegrationXPC, @
             let handle = try state.integrationConnection(), bytes = frame as Data
             try state.calls.start { [self] in
                 guard state.isActive, !Task.isCancelled else { reply(NativeWire.problem(.unavailable, requestID: nativeRequestID(bytes)) as NSData); return }
-                let output = await nativeCapabilityFrame(bytes, handlers: handlers, connection: handle)
+                let output = await NativeServiceFrames.integration(bytes, handlers: handlers, connection: handle)
                 guard state.isActive else { reply(NativeWire.problem(.unavailable, requestID: nativeRequestID(bytes)) as NSData); return }
                 reply(output as NSData)
             }
@@ -252,7 +252,7 @@ private final class NativeOwnerEndpoint: NSObject, NativeOwnerXPC, @unchecked Se
                 do {
                     let handle = try await state.open(peer: peer)
                     guard state.isActive, !Task.isCancelled else { throw NativeIPCFailure.unavailable }
-                    let output = await nativeOwnerFrame(packet, handlers: handlers, connection: handle,
+                    let output = await NativeServiceFrames.owner(packet, handlers: handlers, connection: handle,
                         consent: NativeConnectionConsentProvider(state: state))
                     guard state.isActive else { throw NativeIPCFailure.unavailable }
                     reply(output.frame as NSData, output.sensitive.map { $0 as NSData })
@@ -299,41 +299,27 @@ extension ServiceAssembly {
     }
 }
 
-private func nativeCapabilityFrame(_ bytes: Data, handlers: ServiceEndpointHandlers,
-                                   connection: ServiceConnection) async -> Data {
-    let id = nativeRequestID(bytes)
-    do {
-        let (_, request) = try NativeWire.decodeCapabilityRequest(bytes)
-        let response = try await handlers.capability(request, connection: connection)
-        return try NativeWire.capabilityResponse(response, requestID: id)
-    } catch { return NativeWire.problem(nativeProblem(error), requestID: id) }
-}
-
-private func nativeOwnerFrame(_ packet: NativeOwnerPacket, handlers: ServiceEndpointHandlers,
-                              connection: ServiceConnection, consent: any OwnerConsentProvider) async -> NativeOwnerPacket {
-    let id = nativeRequestID(packet.frame)
-    do {
-        let (_, request) = try NativeWire.decodeOwnerRequest(packet)
-        let response = try await handlers.owner(request, connection: connection, consent: consent)
-        return try NativeWire.ownerResponse(response, requestID: id)
-    } catch { return NativeOwnerPacket(frame: NativeWire.problem(nativeProblem(error), requestID: id)) }
-}
-
-/// Direct codec/service seam for development fixtures and tests; native adapters use assembly handlers.
-/// This proves service behavior and typed framing, not a qualified signed NSXPC connection.
+/// Shared production request-frame dispatch into admitted service assembly handlers.
+/// Synthetic callers exercise this path without qualifying physical NSXPC capture,
+/// signed peers/listeners or human consent authentication.
 enum NativeServiceFrames {
-    static func integration(_ bytes: Data, service: CapabilityService, context: CapabilityConnectionContext) async -> Data {
+    static func integration(_ bytes: Data, handlers: ServiceEndpointHandlers,
+                            connection: ServiceConnection) async -> Data {
         let id = nativeRequestID(bytes)
         do {
             let (_, request) = try NativeWire.decodeCapabilityRequest(bytes)
-            return try NativeWire.capabilityResponse(await service.handle(request, context: context), requestID: id)
+            let response = try await handlers.capability(request, connection: connection)
+            return try NativeWire.capabilityResponse(response, requestID: id)
         } catch { return NativeWire.problem(nativeProblem(error), requestID: id) }
     }
-    static func owner(_ packet: NativeOwnerPacket, service: OwnerControlService, context: OwnerConnectionContext) async -> NativeOwnerPacket {
+
+    static func owner(_ packet: NativeOwnerPacket, handlers: ServiceEndpointHandlers,
+                      connection: ServiceConnection, consent: any OwnerConsentProvider) async -> NativeOwnerPacket {
         let id = nativeRequestID(packet.frame)
         do {
             let (_, request) = try NativeWire.decodeOwnerRequest(packet)
-            return try NativeWire.ownerResponse(await service.send(request, connection: context), requestID: id)
+            let response = try await handlers.owner(request, connection: connection, consent: consent)
+            return try NativeWire.ownerResponse(response, requestID: id)
         } catch { return NativeOwnerPacket(frame: NativeWire.problem(nativeProblem(error), requestID: id)) }
     }
 }

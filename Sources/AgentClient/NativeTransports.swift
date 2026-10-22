@@ -25,9 +25,11 @@ public struct NativeClientFactory: Sendable {
 
 public struct NativeIntegrationTransport: CapabilityTransport, CustomReflectable {
     public var customMirror: Mirror { Mirror(self, children: ["transport": "<native integration transport>"]) }
-    private let channel: NativeClientChannel
+    private let channel: NativeClientChannel<NativeClientLink>
     fileprivate init(deployment: any NativeDeploymentProvider, policy: NativeDeploymentPolicy, credential: Data, channel: NativeChannel) {
-        self.channel = NativeClientChannel(deployment: deployment, policy: policy, channel: channel, credential: credential, consent: nil)
+        self.channel = NativeClientChannel(deployment: deployment, channel: channel, credential: credential) {
+            NativeClientLink(policy: policy, channel: channel, consent: nil)
+        }
     }
     /// Completes the peer and credential handshake without invoking a capability.
     /// An active authenticated connection may be reused. This is not a fresh revocation
@@ -44,9 +46,11 @@ public struct NativeIntegrationTransport: CapabilityTransport, CustomReflectable
 }
 public struct NativeOwnerTransport: OwnerControlTransport, CustomReflectable {
     public var customMirror: Mirror { Mirror(self, children: ["transport": "<native owner transport>"]) }
-    private let channel: NativeClientChannel
+    private let channel: NativeClientChannel<NativeClientLink>
     fileprivate init(deployment: any NativeDeploymentProvider, policy: NativeDeploymentPolicy, consent: any NativeWalletConsentProvider) {
-        channel = NativeClientChannel(deployment: deployment, policy: policy, channel: .owner, credential: nil, consent: consent)
+        channel = NativeClientChannel(deployment: deployment, channel: .owner, credential: nil) {
+            NativeClientLink(policy: policy, channel: .owner, consent: consent)
+        }
     }
     public func send(_ request: OwnerControlRequest) async throws -> OwnerControlResponse {
         let id = UUID(), link = try await channel.ready()
@@ -58,44 +62,51 @@ public struct NativeOwnerTransport: OwnerControlTransport, CustomReflectable {
     }
 }
 
-private actor NativeClientChannel {
-    let deployment: any NativeDeploymentProvider
-    let policy: NativeDeploymentPolicy
-    let channel: NativeChannel
-    let credential: Data?
-    let consent: (any NativeWalletConsentProvider)?
-    var initialization: Task<NativeClientLink, any Error>?
-    var initializationID: UUID?
-    init(deployment: any NativeDeploymentProvider, policy: NativeDeploymentPolicy, channel: NativeChannel,
-         credential: Data?, consent: (any NativeWalletConsentProvider)?) {
-        self.deployment = deployment; self.policy = policy; self.channel = channel; self.credential = credential; self.consent = consent
+/// The production handshake uses the same bounded link contract as synthetic qualification.
+/// The native adapter remains private and owns activation, identity and reply continuations.
+protocol NativeClientLinking: Sendable {
+    var isActive: Bool { get }
+    var sameUserPeer: Bool { get }
+    func exchange(_ mode: NativeExchange, packet: NativeOwnerPacket, credential: Data?) async throws -> NativeOwnerPacket
+    func bindConsent(connectionID: String)
+    func invalidate()
+}
+
+actor NativeClientChannel<Link: NativeClientLinking> {
+    struct Initialization: Sendable {
+        let id: UUID
+        let task: Task<Link, any Error>
     }
-    deinit { initialization?.cancel() }
-    func ready() async throws -> NativeClientLink {
-        if let initialization {
-            let observed = initializationID
-            do {
-                let link = try await initialization.value
-                if link.isActive { return link }
-                guard initializationID == observed else { return try await ready() }
-                self.initialization = nil; initializationID = nil
-            } catch {
-                if initializationID == observed { self.initialization = nil; initializationID = nil }
-                throw error
-            }
-        }
+    private let deployment: any NativeDeploymentProvider
+    private let channel: NativeChannel
+    private let credential: Data?
+    private let makeLink: @Sendable () -> Link
+    private var initialization: Initialization?
+    init(deployment: any NativeDeploymentProvider, channel: NativeChannel,
+         credential: Data?, makeLink: @escaping @Sendable () -> Link) {
+        self.deployment = deployment; self.channel = channel; self.credential = credential; self.makeLink = makeLink
+    }
+    deinit { initialization?.task.cancel() }
+    func ready() async throws -> Link {
+        try await finishInitialization(acquireInitialization())
+    }
+    /// Admission is actor-isolated and synchronous, so every overlapping caller
+    /// observes the same generation before its handshake can suspend.
+    func acquireInitialization() throws -> Initialization {
+        if let initialization { return initialization }
         try deployment.requireQualifiedPrerequisites()
-        let link = NativeClientLink(policy: policy, channel: channel, consent: consent)
+        let link = makeLink()
         let task = Task { [channel, credential] in
             do {
                 let id = UUID()
                 let hello = try NativeWire.frame(NativeHello(channel: channel, connectionID: ""), kind: .hello, requestID: id)
-                let response = try await link.exchange(.hello, packet: NativeOwnerPacket(frame: hello))
+                let response = try await link.exchange(.hello, packet: NativeOwnerPacket(frame: hello), credential: nil)
                 let frame = try NativeWire.unpack(response.frame, kind: .helloResponse, requestID: id)
                 let greeting = try NativeWire.decode(NativeHello.self, from: frame.payload)
                 guard greeting.channel == channel, UUID(uuidString: greeting.connectionID) != nil,
                       link.sameUserPeer else { throw NativeIPCFailure.untrustedPeer }
-                link.consentReceiver?.bind(connectionID: greeting.connectionID)
+                link.bindConsent(connectionID: greeting.connectionID)
+                guard link.isActive else { throw ClientFailure.unavailable }
                 if channel != .owner {
                     guard let credential, credential.count == 32 else { throw NativeIPCFailure.unavailable }
                     let authID = UUID()
@@ -104,23 +115,37 @@ private actor NativeClientChannel {
                     let ack = try NativeWire.unpack(authenticated.frame, kind: .authenticated, requestID: authID)
                     guard try NativeWire.decode(NativeHello.self, from: ack.payload) == greeting else { throw NativeIPCFailure.untrustedPeer }
                 }
+                guard link.isActive else { throw ClientFailure.unavailable }
                 return link
             } catch { link.invalidate(); throw error }
         }
-        let generation = UUID()
-        initialization = task; initializationID = generation
-        do { return try await task.value }
+        let created = Initialization(id: UUID(), task: task)
+        initialization = created
+        return created
+    }
+    func finishInitialization(_ observed: Initialization) async throws -> Link {
+        do {
+            let link = try await observed.task.value
+            guard initialization?.id == observed.id else { return try await ready() }
+            // Liveness is sampled here, not promised after this return. A retired
+            // cached connection must qualify and authenticate a fresh generation.
+            guard link.isActive else {
+                initialization = nil
+                return try await ready()
+            }
+            return link
+        }
         catch {
-            if initializationID == generation { initialization = nil; initializationID = nil }
+            if initialization?.id == observed.id { initialization = nil }
             throw error
         }
     }
 }
 
-private enum NativeExchange: Sendable { case hello, authenticate, integration, owner }
+enum NativeExchange: Sendable { case hello, authenticate, integration, owner }
 /// Foundation invokes reply, error, and invalidation handlers on queues with no ordering guarantee.
 /// This lock owns connection liveness and every continuation; each is removed before resumption.
-private final class NativeClientLink: @unchecked Sendable {
+private final class NativeClientLink: NativeClientLinking, @unchecked Sendable {
     let connection: NSXPCConnection
     let channel: NativeChannel
     let consentReceiver: NativeConsentReceiver?
@@ -144,6 +169,7 @@ private final class NativeClientLink: @unchecked Sendable {
     deinit { connection.invalidate() }
     var isActive: Bool { lock.withLock { active } }
     var sameUserPeer: Bool { isActive && connection.effectiveUserIdentifier == geteuid() && connection.processIdentifier > 0 }
+    func bindConsent(connectionID: String) { consentReceiver?.bind(connectionID: connectionID) }
     func invalidate() {
         let result = lock.withLock { () -> (Bool, [@Sendable (Result<NativeOwnerPacket, any Error>) -> Void]) in
             guard active else { return (false, []) }; active = false

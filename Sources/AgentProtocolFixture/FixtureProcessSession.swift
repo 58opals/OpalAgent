@@ -330,6 +330,10 @@ final class FixtureProcessSession: @unchecked Sendable {
             var drained = FixtureControlMessage(kind: "assemblyDrained")
             drained.epoch = self.epoch; drained.phase = "stdio-ended"
             try? self.socket.send(drained)
+        }, outputSendFailed: {
+            var failed = FixtureControlMessage(kind: "outputSendFailed")
+            failed.epoch = self.epoch; failed.phase = "stdio-send-failed"
+            try? self.socket.send(failed)
         }))
         var requests: [Task<Void, Never>] = []
         do {

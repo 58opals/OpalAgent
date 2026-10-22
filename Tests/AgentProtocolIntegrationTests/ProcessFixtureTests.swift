@@ -15,6 +15,9 @@ private enum FixtureLaunchMode {
     case controlled
     case ordinary(directory: URL, trace: URL)
 }
+private enum FixtureStdioClosure: String, CaseIterable {
+    case stdinEOF, unterminatedStdinEOF, stdoutLoss
+}
 
 private final class OwnedFixtureChild: @unchecked Sendable {
     let pid: pid_t
@@ -33,7 +36,7 @@ private final class OwnedFixtureChild: @unchecked Sendable {
     private var outputClosed = false
     private var events: [FixtureControlMessage] = []
     private var consentNonces = Set<UUID>()
-    private static let eventKinds: Set<String> = ["relayEntered", "phaseReached", "admissionClosed", "shutdownComplete", "assemblyDrained"]
+    private static let eventKinds: Set<String> = ["relayEntered", "phaseReached", "admissionClosed", "shutdownComplete", "assemblyDrained", "outputSendFailed"]
     private init(pid: pid_t, control: FixtureControlSocket?, input: Int32, output: Int32) {
         self.pid = pid; self.controlSocket = control; self.input = input; self.output = output
     }
@@ -168,10 +171,11 @@ private final class OwnedFixtureChild: @unchecked Sendable {
     func closeInput() {
         lock.withLock { guard !inputClosed else { return }; inputClosed = true; Darwin.close(input) }
     }
-    func closePipes() {
-        closeInput()
+    /// The borrowed SDK reader must be joined before retiring only this parent read end.
+    func closeOutput() {
         lock.withLock { guard !outputClosed else { return }; outputClosed = true; Darwin.close(output) }
     }
+    func closePipes() { closeInput(); closeOutput() }
     func terminateIfRunning() async {
         if !lock.withLock({ joined }) { _ = try? await join(signal: SIGKILL) }
     }
@@ -193,13 +197,13 @@ private final class OwnedFixtureChild: @unchecked Sendable {
     }
 }
 
-/// Serializes the final parent write with every SDK send before transferring stdin to EOF.
-/// Disconnect still joins borrowed-FD activity; it never supplies the asserted EOF trigger.
+/// Gates and joins SDK writes before an OS stdio half-close or a final raw stimulus.
+/// Disconnect joins borrowed-FD activity without closing either parent pipe descriptor.
 private actor HalfClosingProcessTransport: MCP.Transport {
     nonisolated let logger = MCP.InMemoryTransport().logger
     private let child: OwnedFixtureChild
     private let base: BoundedStdioTransport
-    private var inputEnding = false
+    private var sdkSendsRetired = false
     private var activeSends = 0
     private var sendsDrained: CheckedContinuation<Void, Never>?
     private var reader: Task<Void, Never>?
@@ -209,7 +213,7 @@ private actor HalfClosingProcessTransport: MCP.Transport {
     }
     func connect() async throws { try await base.connect() }
     func send(_ data: Data) async throws {
-        guard !inputEnding else { throw MCPError.connectionClosed }
+        guard !sdkSendsRetired else { throw MCPError.connectionClosed }
         activeSends += 1
         defer {
             activeSends -= 1
@@ -233,23 +237,37 @@ private actor HalfClosingProcessTransport: MCP.Transport {
             continuation.onTermination = { _ in task.cancel() }
         }
     }
-    func finishInput(unterminatedFrame: Data? = nil) async throws {
-        guard !inputEnding else { return }
-        inputEnding = true
+    func retireSDKSends() async {
+        sdkSendsRetired = true
         if activeSends > 0 { await withCheckedContinuation { sendsDrained = $0 } }
+    }
+    private func writeRaw(_ frame: Data) async throws {
+        try #require(sdkSendsRetired && !frame.isEmpty && frame.count <= MCPBounds.inputBytes + 1)
+        let deadline = ContinuousClock.now + .seconds(5)
+        var offset = 0
+        while offset < frame.count {
+            try #require(ContinuousClock.now < deadline)
+            let count = frame.withUnsafeBytes { Darwin.write(child.input, $0.baseAddress!.advanced(by: offset), frame.count - offset) }
+            if count > 0 { offset += count }
+            else if count < 0 && [EAGAIN, EWOULDBLOCK, EINTR].contains(errno) { await Task.yield() }
+            else { throw WireFixtureFailure.invalidReply }
+        }
+    }
+    func finishInput(unterminatedFrame: Data? = nil) async throws {
+        guard !sdkSendsRetired else { return }
+        await retireSDKSends()
         if let frame = unterminatedFrame {
             try #require(!frame.isEmpty && frame.count <= MCPBounds.inputBytes && !frame.contains(10))
-            let deadline = ContinuousClock.now + .seconds(5)
-            var offset = 0
-            while offset < frame.count {
-                try #require(ContinuousClock.now < deadline)
-                let count = frame.withUnsafeBytes { Darwin.write(child.input, $0.baseAddress!.advanced(by: offset), frame.count - offset) }
-                if count > 0 { offset += count }
-                else if count < 0 && [EAGAIN, EWOULDBLOCK, EINTR].contains(errno) { await Task.yield() }
-                else { throw WireFixtureFailure.invalidReply }
-            }
+            try await writeRaw(frame)
         }
         child.closeInput()
+    }
+    func sendRawPing() async throws {
+        let request: MCP.Value = .object(["jsonrpc": .string("2.0"), "id": .string("stdout-loss-" + UUID().uuidString), "method": .string("ping")])
+        var frame = try JSONEncoder().encode(request)
+        try #require(!frame.contains(10))
+        frame.append(10)
+        try await writeRaw(frame)
     }
     func disconnect() async {
         reader?.cancel()
@@ -756,14 +774,14 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
         try FileManager.default.removeItem(at: ownership.namespace)
     }
 
-    @Test(arguments: [false, true])
-    func ordinaryCLIStdinEOFCompletesAndPreservesOnlyTerminatedReceiveRequests(_ incompleteFinalFrame: Bool) async throws {
+    @Test(arguments: FixtureStdioClosure.allCases)
+    private func ordinaryCLIStdioClosureCompletesAndPreservesTerminatedReceiveRequests(_ trigger: FixtureStdioClosure) async throws {
         let parent = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
         let directory = parent.appendingPathComponent("opal-process-cli-" + UUID().uuidString)
         let trace = directory.appendingPathComponent("trace.jsonl")
         let child = try OwnedFixtureChild.launch(executable: fixtureExecutable(), mode: .ordinary(directory: directory, trace: trace))
         let transport = HalfClosingProcessTransport(child)
-        try await withProcessSDK(child, name: "Ordinary CLI input EOF", transport: transport) { client in
+        try await withProcessSDK(child, name: "Ordinary CLI stdio closure", transport: transport) { client in
             let wallets = try await processCall(client, name: "list_wallets", arguments: [:])
             let wallet = try #require(wallets.result["items"]?.arrayValue?.first?.objectValue?["scope"])
             let accounts = try await processCall(client, name: "list_accounts", arguments: ["wallet": wallet, "page": .object([:])])
@@ -773,7 +791,7 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
             let created = try await processCall(client, name: "create_receive_request", arguments: ["account": account, "requestKey": .string(requestKey)])
             let operationID = try #require(created.operationID)
             let lookup = try retainedLookup(scope, key: requestKey, effect: "createReceiveRequest")
-            try await wireEventually("Ordinary CLI must retain the completed allocation before stdin EOF") {
+            try await wireEventually("Ordinary CLI must retain the completed allocation before stdio closure") {
                 try await processCall(client, name: "get_operation", arguments: lookup).operation["state"]?.stringValue == "allocated"
             }
             let allocated = try await processCall(client, name: "get_operation", arguments: lookup)
@@ -787,11 +805,23 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
             let frame = try JSONEncoder().encode(candidate)
             // This is a valid effect request except for the missing stdio newline, not malformed JSON.
             #expect(try JSONDecoder().decode(MCP.Value.self, from: frame) == candidate)
-            try await transport.finishInput(unterminatedFrame: incompleteFinalFrame ? frame : nil)
-            #expect(fcntl(child.output, F_GETFD) >= 0)
-            // No SDK disconnect, control request, cancellation or signal establishes this exit.
+            switch trigger {
+            case .stdinEOF, .unterminatedStdinEOF:
+                try await transport.finishInput(unterminatedFrame: trigger == .unterminatedStdinEOF ? frame : nil)
+                #expect(fcntl(child.output, F_GETFD) >= 0)
+                // The SDK remains connected; only parent stdin EOF establishes this exit.
+            case .stdoutLoss:
+                await transport.retireSDKSends()
+                await client.disconnect() // Joins borrowed tasks while both OS pipe descriptors remain open.
+                try #require(fcntl(child.input, F_GETFD) >= 0 && fcntl(child.output, F_GETFD) >= 0)
+                child.closeOutput()
+                try #require(fcntl(child.input, F_GETFD) >= 0)
+                try await transport.sendRawPing()
+            }
+            // No control request, input cleanup, signal or timeout supplies successful completion.
             let exit = try await child.join()
-            #expect(exit == 0)
+            #expect(exit == 0) // A broken stdout must not terminate this child with SIGPIPE.
+            if trigger == .stdoutLoss { #expect(fcntl(child.input, F_GETFD) >= 0) }
             #expect(try FixtureFileIdentity.capture(directory.path, directory: true) == directoryIdentity)
             let state: CanonicalState
             do {
@@ -812,21 +842,28 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
             let events = try String(contentsOf: trace, encoding: .utf8).split(separator: "\n").map {
                 try JSONDecoder().decode([String: MCP.Value].self, from: Data($0.utf8))
             }
-            #expect(events.first?["event"]?.stringValue == "fixture-ready" && events.last?["event"]?.stringValue == "fixture-stop")
+            if trigger == .stdoutLoss {
+                #expect(events.first?["event"]?.stringValue == "fixture-ready")
+                #expect(events.contains { $0["event"]?.stringValue == "fixture-stop" })
+            } else {
+                #expect(events.first?["event"]?.stringValue == "fixture-ready" && events.last?["event"]?.stringValue == "fixture-stop")
+            }
             #expect(events.allSatisfy { $0["relayCount"]?.intValue == 0 })
             #expect(events.filter { $0["method"]?.stringValue == "create_receive_request" }.count == 1)
+            #expect(events.filter { $0["event"]?.stringValue == "stdio-output-send-failed" }.count == (trigger == .stdoutLoss ? 1 : 0))
         }
         try FileManager.default.removeItem(at: directory)
     }
 
-    @Test func stdinEOFClosesAdmissionAndDrainsHeldRelayBeforeFreshReopen() async throws {
+    @Test(arguments: [FixtureStdioClosure.stdinEOF, .stdoutLoss])
+    private func stdioClosureClosesAdmissionAndDrainsHeldRelayBeforeFreshReopen(_ trigger: FixtureStdioClosure) async throws {
         let ownership = try ownedNamespace(), executable = try fixtureExecutable()
         let first = try OwnedFixtureChild.launch(executable: executable)
         let ready = try await first.bootstrap(ownership, resume: false)
         let credential = try await first.control.receiveAsync(); try #require(credential.0 == 2 && credential.1.count == 32)
         let scope = try #require(ready.snapshot?.account), firstEpoch = try #require(ready.epoch), requestKey = key(112)
         let transport = HalfClosingProcessTransport(first)
-        try await withProcessSDK(first, name: "Stdin EOF retains held relay ownership", transport: transport) { client in
+        try await withProcessSDK(first, name: "Stdio closure retains held relay ownership", transport: transport) { client in
             let id = try await prepareProcessPayment(first, client, scope: scope, key: requestKey)
             let lookup = try retainedLookup(scope, key: requestKey)
             _ = try await processCall(client, name: "submit_payment", arguments: ["account": try processAccount(scope), "operationID": .string(id)])
@@ -850,13 +887,36 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
             let entry = try JSONDecoder().decode([String: MCP.Value].self, from: Data(try #require(entries.first)))
             #expect(entry["version"]?.intValue == 1 && entry["ordinal"]?.intValue == 1 && entry["attempt"]?.intValue == 1)
             #expect(entry["operationID"]?.stringValue == id && entry["digest"]?.stringValue == before.0.byteDigest && entry["epoch"]?.stringValue == firstEpoch.uuidString)
-            try await transport.finishInput()
+            let originalLookup = OperationLookup.request(account: scope, effect: .preparePayment, key: try RequestKey(requestKey))
+            if trigger == .stdoutLoss {
+                await transport.retireSDKSends()
+                await client.disconnect() // Retire and join SDK activity before closing its borrowed read descriptor.
+                try #require(fcntl(first.input, F_GETFD) >= 0 && fcntl(first.output, F_GETFD) >= 0)
+                var stillAdmitted = FixtureControlMessage(kind: "integrationLookup")
+                stillAdmitted.connection = "original"; stillAdmitted.lookup = originalLookup
+                try first.control.send(stillAdmitted)
+                let admitted = try await first.response(id: stillAdmitted.id)
+                try #require(admitted.kind == "integrationLookup")
+                let active = try #require(admitted.payment)
+                #expect(active.identity.selector.operationID == id && active.state == .submitting)
+                #expect(active.identity.requestKey.value == requestKey && admitted.snapshot?.stateDigest == before.0.stateDigest)
+                first.closeOutput()
+                let control = try first.control
+                try #require(fcntl(first.input, F_GETFD) >= 0 && fcntl(control.descriptor, F_GETFD) >= 0)
+                try await transport.sendRawPing()
+                // Send-failure and receive-ended observers can race; both must be present before release.
+                let failed = try await first.event("outputSendFailed", phase: "stdio-send-failed")
+                #expect(failed.epoch == firstEpoch)
+            } else {
+                try #require(trigger == .stdinEOF)
+                try await transport.finishInput()
+                #expect(fcntl(first.output, F_GETFD) >= 0)
+            }
             let closed = try await first.event("admissionClosed", phase: "stdio-ended")
             #expect(closed.epoch == firstEpoch)
-            #expect(fcntl(first.output, F_GETFD) >= 0)
-            // The same authenticated handle was valid immediately before EOF. Control stays open.
+            // The same authenticated handle was valid immediately before OS closure. Control stays open.
             var probe = FixtureControlMessage(kind: "integrationLookup")
-            probe.connection = "original"; probe.lookup = .request(account: scope, effect: .preparePayment, key: try RequestKey(requestKey))
+            probe.connection = "original"; probe.lookup = originalLookup
             try first.control.send(probe)
             let unavailable = try await first.response(id: probe.id)
             #expect(unavailable.kind == "problem" && unavailable.problem == "unavailable")
@@ -874,7 +934,7 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
             #expect(afterDrain.1 == before.1 && afterDrain.0.byteDigest == before.0.byteDigest && afterDrain.0.gateHeld)
             #expect(afterDrain.0.totalAdmissions == 1 && afterDrain.0.ordinaryAdmissions == 1 && afterDrain.0.relayEntries == 1)
             #expect(try FixtureProcessOwnership.readOwned(oraclePath, maximum: 16_384) == oracle)
-            // Cleanup starts only after actual EOF admission closure, relay completion and writer release.
+            // Cleanup starts only after actual stdio-loss admission closure, relay completion and writer release.
             let firstExit = try await first.close(); #expect(firstExit == 0)
             await client.disconnect()
             let retained: CanonicalState
@@ -890,12 +950,12 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
             let restarted = try await second.bootstrap(ownership, resume: true, credential: credential.1)
             let secondEpoch = try #require(restarted.epoch)
             #expect(secondEpoch != firstEpoch && restarted.problem == nil)
-            try await wireEventually("Fresh EOF reopen continuation must settle before observational baselines") {
+            try await wireEventually("Fresh stdio-closure reopen continuation must settle before observational baselines") {
                 try await second.facts().blocker == "relayNotEligible"
             }
             let baseline = try await second.snapshot(), facts = try await second.facts()
             #expect(facts.blocker == "relayNotEligible" && facts.generation == drainedFacts.generation)
-            try await withProcessSDK(second, name: "Fresh authenticated assembly after stdin EOF") { next in
+            try await withProcessSDK(second, name: "Fresh authenticated assembly after stdio closure") { next in
                 let result = try await processCall(next, name: "get_operation", arguments: lookup)
                 #expect(result.isError != true && result.operationID == id && result.operation["state"]?.stringValue == "uncertain")
                 #expect(result.operation["identity"] == original.operation["identity"] && result.operation["request"] == original.operation["request"])
@@ -928,7 +988,8 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
                 #expect(payment.closures.allSatisfy { row.closures.contains($0) })
                 #expect(try FixtureProcessOwnership.readOwned(oraclePath, maximum: 16_384) == oracle)
                 #expect(try writerLeaseAvailable(ownership, identity: writer))
-                try appendProcessProof(scenario: "stdin-eof-held-relay-drain-reopen", children: [(first.pid, firstEpoch), (second.pid, secondEpoch)],
+                try appendProcessProof(scenario: trigger == .stdoutLoss ? "stdout-loss-held-relay-drain-reopen" : "stdin-eof-held-relay-drain-reopen",
+                    children: [(first.pid, firstEpoch), (second.pid, secondEpoch)],
                     snapshot: after.0, generation: drainedFacts.generation, bytesEqual: after.1 == before.1,
                     lookupDelta: after.0.totalAdmissions - baseline.0.totalAdmissions + after.0.relayEntries - baseline.0.relayEntries,
                     exits: [firstExit, secondExit], facts: afterFacts)

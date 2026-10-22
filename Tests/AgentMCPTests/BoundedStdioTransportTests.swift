@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import MCP
 import OpalDiagnostics
 import Testing
 @testable import AgentMCP
@@ -17,6 +18,80 @@ private struct TestPipes {
     func closeAll() { for fd in [inputRead, inputWrite, outputRead, outputWrite] { _ = Darwin.close(fd) } }
 }
 private enum PipeFailure: Error { case failed }
+
+private actor BrokenOutputResults {
+    private var sent: Bool?
+    private var received: Bool?
+    func finishSend(_ connectionClosed: Bool) { sent = connectionClosed }
+    func finishReceive(_ connectionClosed: Bool) { received = connectionClosed }
+    func waitForCompletion() async throws -> (sent: Bool, received: Bool) {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while true {
+            if let sent, let received { return (sent, received) }
+            guard ContinuousClock.now < deadline else { throw PipeFailure.failed }
+            await Task.yield()
+        }
+    }
+}
+
+@Test func boundedStdioBrokenOutputFailsSendAndReceiveWithInputOpen() async throws {
+    let configuration = OpalDiagnostics.Configuration(
+        subsystem: "com.58opals.agent.tests", categoryFilter: .enabled(["agent.mcp"]),
+        bufferPolicy: .enabled(capacity: 4), routingPolicy: .disabled)
+    try await OpalDiagnostics.withConfiguration(configuration) {
+        let pipes = try TestPipes()
+        var ownsOutputRead = true
+        defer {
+            if ownsOutputRead { _ = Darwin.close(pipes.outputRead) }
+            for fd in [pipes.inputRead, pipes.inputWrite, pipes.outputWrite] { _ = Darwin.close(fd) }
+        }
+        let transport = BoundedStdioTransport(inputDescriptor: pipes.inputRead, outputDescriptor: pipes.outputWrite)
+        try await transport.connect()
+        var sender: Task<Void, Never>?
+        var receiver: Task<Void, Never>?
+        do {
+            ownsOutputRead = false
+            try #require(Darwin.close(pipes.outputRead) == 0)
+            // This independent raw probe observes EPIPE; the transport/child public error does not expose errno.
+            var probe: UInt8 = 0
+            let written = withUnsafeBytes(of: &probe) { Darwin.write(pipes.outputWrite, $0.baseAddress, $0.count) }
+            let observedErrno = errno
+            #expect(written == -1 && observedErrno == EPIPE)
+            #expect(fcntl(pipes.inputWrite, F_GETFD) >= 0)
+            let results = BrokenOutputResults()
+            receiver = Task {
+                do {
+                    for try await _ in await transport.receive() {}
+                    await results.finishReceive(false)
+                } catch MCPError.connectionClosed { await results.finishReceive(true) }
+                catch { await results.finishReceive(false) }
+            }
+            sender = Task {
+                do {
+                    try await transport.send(Data("{\"id\":1}".utf8))
+                    await results.finishSend(false)
+                } catch MCPError.connectionClosed { await results.finishSend(true) }
+                catch { await results.finishSend(false) }
+            }
+            let completed = try await results.waitForCompletion()
+            #expect(completed.sent && completed.received)
+            #expect(fcntl(pipes.inputWrite, F_GETFD) >= 0)
+            let records = OpalDiagnostics.recentRecords
+            #expect(records.count == 1)
+            #expect(records.first?.event.rawValue == "transport_failed")
+            #expect(records.first?.fields == [.publicField("reason", value: "write")])
+            await #expect(throws: MCPError.self) { try await transport.send(Data("{\"id\":2}".utf8)) }
+            #expect(OpalDiagnostics.configuration == configuration)
+        } catch {
+            await transport.disconnect()
+            await sender?.value; await receiver?.value
+            throw error
+        }
+        // Neither disconnect nor cancellation can supply the terminal observations above.
+        await transport.disconnect()
+        await sender?.value; await receiver?.value
+    }
+}
 
 @Test func boundedStdioClosesOversizeUnterminatedInputBeforeSDKAccumulation() async throws {
     let pipes = try TestPipes(); defer { pipes.closeAll() }

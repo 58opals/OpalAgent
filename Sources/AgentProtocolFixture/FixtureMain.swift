@@ -17,15 +17,21 @@ import AgentMCP
             let runtime = try await FixtureRuntime.make(directory: options.directory, scenario: options.scenario,
                 tracePath: options.trace)
             let server = MCPToolServer(client: runtime.client)
+            let transport = FixtureStdioLifetime(ended: { await runtime.shutdown() }, outputSendFailed: {
+                try? runtime.trace?.emit(event: "stdio-output-send-failed", relayCount: runtime.chain.counts.relays)
+            })
             do {
-                try await server.start(transport: FixtureStdioLifetime(ended: { await runtime.shutdown() }))
+                try await server.start(transport: transport)
                 await server.waitUntilCompleted()
+                // SDK receive completion does not join every response-send task.
+                await transport.disconnect()
                 await runtime.shutdown()
             } catch {
                 let drain = await runtime.beginShutdown()
                 await runtime.releaseFixtureFaults()
                 await drain.value
                 await server.stop()
+                await transport.disconnect()
                 throw error
             }
         } catch {

@@ -37,7 +37,7 @@ final class FixtureTrace: @unchecked Sendable {
     }
     func emit(event: String, method: CapabilityMethod? = nil, status: String? = nil, relayCount: Int) throws {
         try lock.withLock {
-            guard ["fixture-ready", "capability-call", "fixture-stop"].contains(event),
+            guard ["fixture-ready", "capability-call", "fixture-stop", "stdio-output-send-failed"].contains(event),
                   status.map({ ["succeeded", "rejected"].contains($0) }) ?? true else { throw FixtureFailure.fixtureUnavailable }
             var data = try JSONEncoder().encode(Event(event: event, method: method?.rawValue, status: status, relayCount: relayCount))
             data.append(10)

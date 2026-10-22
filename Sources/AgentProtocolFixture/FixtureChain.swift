@@ -13,44 +13,10 @@ final class FixtureClock: PaymentClock, @unchecked Sendable {
     func read() -> PaymentClockReading { lock.withLock { value } }
     func advance(_ seconds: UInt64) { lock.withLock { value.wall += Int64(seconds); value.monotonic += seconds } }
 }
-final class FixtureAnchor: ContinuityAnchorStore, @unchecked Sendable {
-    let path: URL
-    private let lock = NSLock()
-    init(_ path: URL) { self.path = path }
-    func read() throws -> ContinuityAnchor? {
-        try lock.withLock {
-            guard FileManager.default.fileExists(atPath: path.path) else { return nil }
-            return try JSONDecoder().decode(ContinuityAnchor.self, from: Data(contentsOf: path))
-        }
-    }
-    func write(_ value: ContinuityAnchor) throws {
-        try lock.withLock {
-            let temporary = path.deletingLastPathComponent().appendingPathComponent(".anchor-" + UUID().uuidString)
-            try FixtureProcessOwnership.writeNew(JSONEncoder().encode(value), to: temporary)
-            guard Darwin.rename(temporary.path, path.path) == 0 else {
-                try? FileManager.default.removeItem(at: temporary)
-                throw FixtureFailure.fixtureUnavailable
-            }
-        }
-    }
-}
-final class FixtureKeys: @unchecked Sendable {
-    private let lock = NSLock()
-    private var present = true
-    private var accessCount = 0
-    var reads: Int { lock.withLock { accessCount } }
-    var isPresent: Bool { lock.withLock { present } }
-    func setPresent(_ value: Bool) { lock.withLock { present = value } }
-    func read() -> WrappingKeyAvailability {
-        lock.withLock {
-            accessCount += 1
-            return present ? .available(SymmetricKey(data: Data(repeating: 0x42, count: 32))) : .missing
-        }
-    }
-}
 actor FixtureRelayLatch {
     private var opened = true
     private var waiters: [UUID: CheckedContinuation<Void, any Error>] = [:]
+    private var retainedWaiters: [CheckedContinuation<Void, Never>] = []
     func close() { opened = false }
     func wait() async throws {
         try Task.checkCancellation()
@@ -60,8 +26,20 @@ actor FixtureRelayLatch {
             try await withCheckedThrowingContinuation { waiters[id] = $0 }
         } onCancel: { Task { await self.cancel(id) } }
     }
+    /// Synthetic transport fault: cancellation does not prove its underlying work drained.
+    /// Explicit parent release is the only completion boundary for a held relay.
+    func waitUntilReleased() async {
+        guard !opened else { return }
+        await withCheckedContinuation { retainedWaiters.append($0) }
+    }
     private func cancel(_ id: UUID) { waiters.removeValue(forKey: id)?.resume(throwing: CancellationError()) }
-    func open() { opened = true; let pending = waiters; waiters = [:]; for waiter in pending.values { waiter.resume() } }
+    func open() {
+        opened = true
+        let pending = waiters; waiters = [:]
+        let retained = retainedWaiters; retainedWaiters = []
+        for waiter in pending.values { waiter.resume() }
+        for waiter in retained { waiter.resume() }
+    }
 }
 final class FixturePublicChain: @unchecked Sendable {
     private struct Entry { var bytes: Data; var transaction: OpalBase.Transaction; var height: Int }
@@ -150,7 +128,7 @@ final class FixturePublicChain: @unchecked Sendable {
             let bytes = try Self.data(raw)
             self.lock.withLock { self.sent.append(bytes) }
             try self.lock.withLock { self.relayObserver }?(bytes)
-            try await self.relayLatch.wait()
+            await self.relayLatch.waitUntilReleased()
             if self.lock.withLock({ self.accepted }) { return Self.hex(Data(Self.hash(bytes).reversed())) }
             throw CancellationError() // Request ownership happened; the remote result is unknown.
         }, fetchConfirmations: { _ in self.query(); return nil }, fetchConfirmationStatus: { hash in

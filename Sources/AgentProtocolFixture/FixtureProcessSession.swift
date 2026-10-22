@@ -48,6 +48,37 @@ final class FixtureRelayOracle: @unchecked Sendable {
     static func digest(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
 }
 
+/// Installed before actual assembly startup can resume retained work.
+private final class FixtureProcessStartup: @unchecked Sendable {
+    let ownership: FixtureProcessOwnership
+    let resume: Bool
+    let socket: FixtureControlSocket
+    let epoch: UUID
+    private let lock = NSLock()
+    private var retainedOracle: FixtureRelayOracle?
+    init(ownership: FixtureProcessOwnership, resume: Bool, socket: FixtureControlSocket, epoch: UUID) {
+        self.ownership = ownership; self.resume = resume; self.socket = socket; self.epoch = epoch
+    }
+    var oracle: FixtureRelayOracle { get throws { try lock.withLock {
+        guard let retainedOracle else { throw FixtureFailure.fixtureUnavailable }; return retainedOracle
+    } } }
+    func prepare(chain: FixturePublicChain, inspection: FixtureInspection) throws {
+        let oracle = try FixtureRelayOracle(ownership: ownership, resume: resume)
+        lock.withLock { retainedOracle = oracle }
+        chain.onRelay { bytes in
+            let observed = Result { try inspection.inspect { $0 } }
+            let payment = (try? observed.get())?.payments.first(where: { $0.canonicalBytes == bytes })
+            try oracle.append(epoch: self.epoch, payment: payment, bytes: bytes)
+            let state = try observed.get()
+            guard let payment, payment.disposition == .submitting, let custody = state.custody else { throw FixtureFailure.fixtureUnavailable }
+            let account = try AccountScope(wallet: WalletScope(walletID: custody.walletID, network: .mainnet), accountID: custody.accountID)
+            var message = FixtureControlMessage(kind: "relayEntered"); message.epoch = self.epoch
+            message.snapshot = try FixtureProcessSession.snapshot(state: state, account: account, oracle: oracle)
+            try self.socket.send(message)
+        }
+    }
+}
+
 /// Synthetic reverse consent is held until a correlated decision arrives. It obtains no
 /// human/LA proof and never invents a service result. Actual service challenge/frames are used.
 actor FixtureProcessConsent: OwnerConsentProvider {
@@ -128,14 +159,15 @@ final class FixtureProcessSession: @unchecked Sendable {
         let clock = FixtureClock(wall: wall)
         let phases = FixturePhaseController()
         let consent = FixtureProcessConsent(socket: socket, clock: clock)
+        let startup = FixtureProcessStartup(ownership: ownership, resume: resume, socket: socket, epoch: epoch)
         let runtime = try await FixtureRuntime.owned(ownership, resume: resume, credential: credential,
-            consent: consent, clock: clock, phases: phases)
-        let oracle = try FixtureRelayOracle(ownership: ownership, resume: resume)
+            consent: consent, clock: clock, phases: phases, recoveryOnly: bootstrap.recoveryOnly == true,
+            beforeStart: { chain, inspection in try startup.prepare(chain: chain, inspection: inspection) })
+        let oracle = try startup.oracle
         if !resume {
-            try ownership.seal(walletID: runtime.custody.walletID, installationID: "protocol-fixture-installation",
-                accountID: runtime.custody.accountID, profile: runtime.custody.profile)
+            try ownership.seal(walletID: runtime.custody.walletID, installationID: runtime.state().installationID,
+                accountID: runtime.custody.accountID, profile: runtime.custody.profile, grantID: runtime.grantID)
         }
-        await runtime.chain.relayLatch.close()
         let session = FixtureProcessSession(runtime: runtime, ownership: ownership, oracle: oracle,
             socket: socket, consent: consent, epoch: epoch, phases: phases)
         await phases.observe { [weak session] phase in
@@ -143,35 +175,21 @@ final class FixtureProcessSession: @unchecked Sendable {
             var message = FixtureControlMessage(kind: "phaseReached"); message.epoch = epoch; message.phase = phase.rawValue
             message.snapshot = try session.snapshot(); try socket.send(message)
         }
-        runtime.chain.onRelay { [weak runtime, weak session] bytes in
-            let observed = Result {
-                guard let runtime else { throw FixtureFailure.fixtureUnavailable }
-                return try runtime.state()
-            }
-            let payment = (try? observed.get())?.payments.first(where: { $0.canonicalBytes == bytes })
-            // Count the actual relay entry even if admission/state validation is defective.
-            // Only the later phase ACK certifies a clean promoted submitting state.
-            try oracle.append(epoch: epoch, payment: payment, bytes: bytes)
-            _ = try observed.get()
-            guard let runtime, let session, let payment,
-                  payment.disposition == .submitting else { throw FixtureFailure.fixtureUnavailable }
-            var message = FixtureControlMessage(kind: "relayEntered"); message.epoch = epoch
-            message.snapshot = try session.snapshot(); try socket.send(message)
-        }
         var ready = FixtureControlMessage(id: bootstrap.id, kind: "ready"); ready.epoch = epoch
         ready.snapshot = try? session.snapshot()
-        if runtime.context == nil { ready.problem = "integrationUnavailable" }
+        ready.grant = try? runtime.grantProjection()
+        if !runtime.integrationAvailable { ready.problem = "integrationUnavailable" }
         try socket.send(ready)
         if !resume { try socket.send(kind: 2, payload: runtime.syntheticCredential) }
         return session
     }
     func facts() throws -> FixtureDurableFacts {
-        try runtime.store.continuity.inspect { state in
+        try runtime.inspect { state in
             let reading = runtime.clock.read()
             return FixtureDurableFacts(generation: state.authorization.generation, mode: state.mode.rawValue,
                 allGrantsRevoked: state.authorization.grants.allSatisfy(\.revoked),
                 allApprovalsInactive: state.approvals.allSatisfy { !$0.active },
-                credentialGeneration: state.authorization.grants.first { $0.id == "protocol-fixture-grant" }?.credentialGeneration,
+                credentialGeneration: state.authorization.grants.first { $0.id == runtime.grantID }?.credentialGeneration,
                 receiveRequests: state.requests.filter { $0.method == "create_receive_request" }.count,
                 issuedIndices: state.allocations.first { $0.accountID == runtime.account.accountID && $0.branch == "receiving" }?.issuedIndices ?? [],
                 ownerReceipts: state.requests.filter { $0.principalID == "owner" && $0.method == "authorize_payment_relay" }.count,
@@ -180,17 +198,18 @@ final class FixtureProcessSession: @unchecked Sendable {
         }
     }
     func snapshot() throws -> FixtureProcessSnapshot {
-        try runtime.store.continuity.inspect { state in
-            let payment = state.payments.first
-            return FixtureProcessSnapshot(account: runtime.account, paymentID: payment?.id,
-                requestKey: payment.flatMap { p in state.requests.first { $0.paymentID == p.id && $0.method == "prepare_payment" }?.key }, state: payment?.disposition.rawValue,
-                ordinaryAdmissions: payment?.ordinaryAdmissions ?? 0,
-                totalAdmissions: state.payments.reduce(0) { $0 + $1.attempts.count },
-                gateHeld: payment.map { p in state.gates.contains { $0.liabilityIDs.contains(p.id) } } ?? false,
-                byteDigest: payment.flatMap { $0.canonicalBytes.isEmpty ? nil : FixtureRelayOracle.digest($0.canonicalBytes) },
-                stateDigest: try state.reference().commitment.map { String(format: "%02x", $0) }.joined(),
-                relayEntries: try oracle.count, policyRevision: state.paymentPolicy.revision)
-        }
+        try runtime.inspect { state in try Self.snapshot(state: state, account: runtime.account, oracle: oracle) }
+    }
+    static func snapshot(state: CanonicalState, account: AccountScope, oracle: FixtureRelayOracle) throws -> FixtureProcessSnapshot {
+        let payment = state.payments.first
+        return FixtureProcessSnapshot(account: account, paymentID: payment?.id,
+            requestKey: payment.flatMap { p in state.requests.first { $0.paymentID == p.id && $0.method == "prepare_payment" }?.key }, state: payment?.disposition.rawValue,
+            ordinaryAdmissions: payment?.ordinaryAdmissions ?? 0,
+            totalAdmissions: state.payments.reduce(0) { $0 + $1.attempts.count },
+            gateHeld: payment.map { p in state.gates.contains { $0.liabilityIDs.contains(p.id) } } ?? false,
+            byteDigest: payment.flatMap { $0.canonicalBytes.isEmpty ? nil : FixtureRelayOracle.digest($0.canonicalBytes) },
+            stateDigest: try state.reference().commitment.map { String(format: "%02x", $0) }.joined(),
+            relayEntries: try oracle.count, policyRevision: state.paymentPolicy.revision)
     }
     private func reply(_ message: FixtureControlMessage) async {
         let isController = message.controller == true
@@ -227,7 +246,7 @@ final class FixtureProcessSession: @unchecked Sendable {
                 if let selector = message.grantSelector { call = .rotateGrant(selector) }
                 else {
                     guard let wallet = message.wallet else { throw FixtureFailure.invalidArguments }
-                    call = .rotateGrant(try GrantSelector(wallet: wallet, grantID: "protocol-fixture-grant"))
+                    call = .rotateGrant(try GrantSelector(wallet: wallet, grantID: runtime.grantID))
                 }
             case "revokeGrant":
                 guard let selector = message.grantSelector else { throw FixtureFailure.invalidArguments }; call = .revokeGrant(selector)
@@ -244,8 +263,7 @@ final class FixtureProcessSession: @unchecked Sendable {
             if isController { response = try await controller.send(OwnerControlRequest(call: call), id: message.id) }
             else {
                 let request = try NativeWire.ownerRequest(OwnerControlRequest(call: call), requestID: message.id)
-                let output = await NativeServiceFrames.owner(request, service: runtime.ownerService, context: runtime.ownerConnection)
-                response = try NativeWire.decodeOwnerResponse(output, requestID: message.id, method: call.method)
+                response = try await runtime.ownerPacket(request, requestID: message.id, method: call.method)
             }
             var reply = FixtureControlMessage(id: message.id, kind: message.kind == "setApprovalPolicy" ? "policy" : message.kind)
             var sensitive: Data?
@@ -288,9 +306,24 @@ final class FixtureProcessSession: @unchecked Sendable {
             reply.snapshot = try? snapshot(); reply.facts = try? facts(); try? socket.send(reply)
         }
     }
+    /// Stop, close and EOF share terminal admission closure. Releasing synthetic faults is
+    /// a separate cleanup choice; the explicit stop proof keeps them held until parent release.
+    private func startShutdown() async -> Task<Void, Never> { await runtime.beginShutdown() }
+    private func finish(server: MCPToolServer) async {
+        let drain = await startShutdown()
+        await consent.cancel(); await runtime.releaseFixtureFaults()
+        await drain.value
+        await controller.close(); await server.stop()
+    }
     func run() async throws {
         let server = MCPToolServer(client: runtime.client)
-        try await server.start(transport: BoundedStdioTransport())
+        try await server.start(transport: FixtureStdioLifetime(ended: {
+            let drain = await self.startShutdown()
+            await self.consent.cancel()
+            // The owned control reader can still release a held synthetic boundary.
+            // EOF closes admission but does not silently satisfy that separate test action.
+            await drain.value
+        }))
         var requests: [Task<Void, Never>] = []
         do {
             var usedIDs = Set<UUID>()
@@ -298,6 +331,17 @@ final class FixtureProcessSession: @unchecked Sendable {
             while true {
                 let message = try FixtureControlSocket.message(await socket.receiveAsync())
                 switch message.kind {
+                case "stop":
+                    let drain = await startShutdown()
+                    var closed = FixtureControlMessage(id: message.id, kind: "admissionClosed")
+                    closed.snapshot = try? snapshot(); closed.facts = try? facts(); try socket.send(closed)
+                    requests.append(Task {
+                        await drain.value
+                        await server.stop()
+                        var complete = FixtureControlMessage(id: message.id, kind: "shutdownComplete")
+                        complete.snapshot = try? self.snapshot(); complete.facts = try? self.facts()
+                        try? self.socket.send(complete)
+                    }); continue
                 case "close": break
                 case "consentDecision": try await consent.decide(message); continue
                 case "integrationPrepare", "integrationSubmit", "integrationLookup":
@@ -340,8 +384,7 @@ final class FixtureProcessSession: @unchecked Sendable {
                     var reply = FixtureControlMessage(id: message.id, kind: "facts"); reply.facts = try facts()
                     reply.snapshot = try snapshot(); try socket.send(reply); continue
                 case "continuePending":
-                    guard runtime.context != nil else { throw FixtureFailure.fixtureUnavailable }
-                    await runtime.payments.continuePending()
+                    try await runtime.continuePending()
                     var reply = FixtureControlMessage(id: message.id, kind: "continued"); reply.snapshot = try snapshot()
                     try socket.send(reply); continue
                 case "lookupReceive":
@@ -369,14 +412,16 @@ final class FixtureProcessSession: @unchecked Sendable {
                 break
             }
         } catch {
-            for request in requests { request.cancel() }; await consent.cancel(); await phases.release()
+            _ = await startShutdown()
+            for request in requests { request.cancel() }; await consent.cancel(); await runtime.releaseFixtureFaults()
             for request in requests { await request.value }
-            await controller.close(); runtime.ownerConnection.invalidate(); await server.stop(); await runtime.shutdown(); socket.close()
+            await finish(server: server); socket.close()
             throw error
         }
-        for request in requests { request.cancel() }; await consent.cancel(); await phases.release()
+        _ = await startShutdown()
+        for request in requests { request.cancel() }; await consent.cancel(); await runtime.releaseFixtureFaults()
         for request in requests { await request.value }
-        await controller.close(); runtime.ownerConnection.invalidate(); await server.stop(); await runtime.shutdown(); socket.close()
+        await finish(server: server); socket.close()
     }
 }
 

@@ -1,6 +1,7 @@
 #if DEBUG
 import AgentClient
 import AgentValues
+import AgentNativeIPC
 import CryptoKit
 import Darwin
 import Foundation
@@ -45,266 +46,293 @@ final class FixtureTrace: @unchecked Sendable {
     }
 }
 
-private struct FixtureCapabilityTransport: CapabilityTransport {
-    let service: CapabilityService
-    let context: CapabilityConnectionContext
-    let chain: FixturePublicChain
-    let trace: FixtureTrace?
-    func send(_ request: CapabilityRequest) async throws -> CapabilityResponse {
-        do {
-            let result = try await service.handle(request, context: context)
-            try trace?.emit(event: "capability-call", method: request.call.method, status: "succeeded", relayCount: chain.counts.relays)
-            return result
-        } catch {
-            try trace?.emit(event: "capability-call", method: request.call.method, status: "rejected", relayCount: chain.counts.relays)
-            throw error
-        }
-    }
-}
-private struct FixtureConsent: OwnerConsentProvider {
-    let clock: FixtureClock
-    func authenticate(_ challenge: OwnerConsentChallenge) async throws -> OwnerConsentProof {
-        .init(challenge: challenge, authenticatedAt: clock.read().wall)
-    }
-}
-private struct FixtureOwnerTransport: OwnerControlTransport {
-    let service: OwnerControlService
-    let connection: OwnerConnectionContext
-    func send(_ request: OwnerControlRequest) async throws -> OwnerControlResponse {
-        try await service.send(request, connection: connection)
-    }
-}
-
-/// NONSHIPPING composition of actual service owners and public Base APIs. Every external
-/// custody/peer/chain/relay fact is explicitly synthetic and owned by this development target.
+/// NONSHIPPING actual service assembly with synthetic custody items, peers, listeners and public chain.
 final class FixtureRuntime: @unchecked Sendable {
     static let destination = "bitcoincash:qpm2qsznhks23z7629mms6s4cwef74vcwvy22gdx6a"
     let directory: URL
     let scenario: FixtureScenario
-    let store: DurableWalletStore
     let policy: AuthorityPolicy
-    let vault: WalletSeedVault
-    let keys: FixtureKeys
+    let keys: FixtureKeychainOperations
     let custody: WalletCustodyRecord
     let chain: FixturePublicChain
     let clock: FixtureClock
-    let payments: PaymentEngine
-    let receives: ReceiveEngine
-    let service: CapabilityService
-    let context: CapabilityConnectionContext?
     let client: CapabilityClient
+    let primarySession: FixtureClientSession?
     let ownerClient: OwnerControlClient
     let account: AccountScope
     let trace: FixtureTrace?
     let syntheticCredential: Data
-    let ownerService: OwnerControlService
-    let ownerConnection: OwnerConnectionContext
-    private let ownerEvidence: OwnerAuthenticationEvidence
+    let grant: GrantSelector
+    var grantID: String { grant.grantID }
+    let integrationAvailable: Bool
+    let recoveryOnly: Bool
+    let inspection: FixtureInspection
+    private let assembly: ServiceAssembly?
+    private let endpoints: FixtureEndpointRegistry
+    private let ownerSession: FixtureOwnerSession?
+    private let recovery: FixtureRecoveryRuntime?
+    private let phases: FixturePhaseController?
+    private let stopLock = NSLock()
+    private var stopTask: Task<Void, Never>?
 
-    private init(directory: URL, scenario: FixtureScenario, store: DurableWalletStore, policy: AuthorityPolicy,
-                 vault: WalletSeedVault, keys: FixtureKeys, custody: WalletCustodyRecord, chain: FixturePublicChain,
-                 clock: FixtureClock, payments: PaymentEngine, receives: ReceiveEngine, service: CapabilityService,
-                 context: CapabilityConnectionContext?, client: CapabilityClient, ownerClient: OwnerControlClient,
-                 account: AccountScope, trace: FixtureTrace?, ownerEvidence: OwnerAuthenticationEvidence,
-                 syntheticCredential: Data, ownerService: OwnerControlService, ownerConnection: OwnerConnectionContext) {
-        self.directory = directory; self.scenario = scenario; self.store = store; self.policy = policy
-        self.vault = vault; self.keys = keys; self.custody = custody; self.chain = chain; self.clock = clock
-        self.payments = payments; self.receives = receives; self.service = service; self.context = context
-        self.client = client; self.ownerClient = ownerClient; self.account = account; self.trace = trace
-        self.ownerEvidence = ownerEvidence
-        self.syntheticCredential = syntheticCredential; self.ownerService = ownerService; self.ownerConnection = ownerConnection
+    private init(directory: URL, scenario: FixtureScenario, policy: AuthorityPolicy, keys: FixtureKeychainOperations,
+                 custody: WalletCustodyRecord, chain: FixturePublicChain, clock: FixtureClock,
+                 session: FixtureClientSession?, ownerSession: FixtureOwnerSession?, recovery: FixtureRecoveryRuntime? = nil,
+                 account: AccountScope, trace: FixtureTrace?, credential: Data, grant: GrantSelector,
+                 assembly: ServiceAssembly?, endpoints: FixtureEndpointRegistry, inspection: FixtureInspection,
+                 phases: FixturePhaseController?) {
+        self.directory = directory; self.scenario = scenario; self.policy = policy; self.keys = keys
+        self.custody = custody; self.chain = chain; self.clock = clock; self.account = account; self.trace = trace
+        self.syntheticCredential = credential; self.grant = grant; self.assembly = assembly; self.endpoints = endpoints
+        self.inspection = inspection; self.ownerSession = ownerSession; self.recovery = recovery; self.phases = phases
+        self.integrationAvailable = session != nil; self.recoveryOnly = recovery != nil
+        self.primarySession = session
+        self.client = session?.client ?? CapabilityClient()
+        if let ownerSession { self.ownerClient = OwnerControlClient(transport: ownerSession) }
+        else if let recovery { self.ownerClient = OwnerControlClient(transport: recovery) }
+        else { self.ownerClient = OwnerControlClient() }
     }
 
     static func make(directory: URL, scenario: FixtureScenario, tracePath: URL? = nil) async throws -> FixtureRuntime {
         try createFreshTemporaryDirectory(directory)
-        return try await assemble(directory: directory, scenario: scenario, tracePath: tracePath)
+        return try await assemble(directory: directory.appendingPathComponent("state", isDirectory: true),
+            itemsPath: directory.appendingPathComponent("synthetic-keychain.json"),
+            group: "synthetic.protocol-fixture." + UUID().uuidString, scenario: scenario, tracePath: tracePath,
+            traceDirectory: directory)
     }
 
-    /// Only the capability-checked process fixture can take this path. Normal make/CLI
-    /// remain fresh-only. Resume performs no initial write, enrollment or generation reset.
+    /// Resume never creates a directory, custody item, wallet or grant. Recovery is a separately selected owner-only composition.
     static func owned(_ ownership: FixtureProcessOwnership, resume: Bool, credential: Data?,
-                      consent: any OwnerConsentProvider, clock: FixtureClock,
-                      phases: FixturePhaseController) async throws -> FixtureRuntime {
+                      consent: any OwnerConsentProvider, clock: FixtureClock, phases: FixturePhaseController,
+                      recoveryOnly: Bool = false,
+                      beforeStart: (@Sendable (FixturePublicChain, FixtureInspection) throws -> Void)? = nil) async throws -> FixtureRuntime {
         try ownership.prepare(resume: resume)
-        return try await assemble(directory: ownership.directory, scenario: .uncertain,
-            retainedCredential: credential, ownership: resume ? ownership : nil, consent: consent, clock: clock, phases: phases)
+        guard !recoveryOnly || resume else { throw FixtureFailure.invalidArguments }
+        return try await assemble(directory: ownership.directory,
+            itemsPath: ownership.namespace.appendingPathComponent("synthetic-keychain.json"),
+            group: "synthetic.protocol-fixture." + ownership.runID.uuidString,
+            scenario: .uncertain, resume: resume, credential: credential, consent: consent,
+            clock: clock, phases: phases, recoveryOnly: recoveryOnly, beforeStart: beforeStart,
+            manifest: resume ? ownership.storeManifest() : nil)
     }
 
-    private static func assemble(directory: URL, scenario: FixtureScenario, tracePath: URL? = nil,
-                                 retainedCredential: Data? = nil, ownership: FixtureProcessOwnership? = nil,
-                                 consent: (any OwnerConsentProvider)? = nil, clock providedClock: FixtureClock? = nil,
-                                 phases: FixturePhaseController? = nil) async throws -> FixtureRuntime {
-        let trace = try tracePath.map { try FixtureTrace(path: $0, directory: directory) }
-        // Published, permanently disposable test vector. Never fund or treat this as real custody.
-        let mnemonic = Data("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".utf8)
-        let keys = FixtureKeys()
-        let vault = WalletSeedVault(keys: InjectedWrappingKeySource(read: { keys.read() }), accounts: BaseSeedAccountProvider())
+    private static func assemble(directory: URL, itemsPath: URL, group: String, scenario: FixtureScenario,
+                                 tracePath: URL? = nil, traceDirectory: URL? = nil, resume: Bool = false,
+                                 credential retainedCredential: Data? = nil, consent: (any OwnerConsentProvider)? = nil,
+                                 clock providedClock: FixtureClock? = nil, phases: FixturePhaseController? = nil,
+                                 recoveryOnly: Bool = false,
+                                 beforeStart: (@Sendable (FixturePublicChain, FixtureInspection) throws -> Void)? = nil,
+                                 manifest: FixtureStoreManifest? = nil) async throws -> FixtureRuntime {
+        let trace = try tracePath.map { try FixtureTrace(path: $0, directory: traceDirectory ?? directory) }
         let clock = providedClock ?? FixtureClock()
-        let bridge = SignedPeerIdentity(teamIdentifier: "synthetic-protocol-fixture", signingIdentifier: "integration")
-        let owner = SignedPeerIdentity(teamIdentifier: "synthetic-protocol-fixture", signingIdentifier: "owner")
-        let anchor = FixtureAnchor(directory.appendingPathComponent("independent-anchor.json"))
-        let policyFor: (String) -> AuthorityPolicy = { accountID in
-            AuthorityPolicy(bridge: bridge, owner: owner, accountIDs: [accountID],
-                capabilities: ["read", "sync", "receive", "prepare", "submit", "cancel"], ownerAuthenticationAge: 30)
-        }
-        let custody: WalletCustodyRecord
-        let store: DurableWalletStore
-        let policy: AuthorityPolicy
-        if let ownership {
-            let manifest = try ownership.storeManifest()
-            policy = policyFor(manifest.accountID)
-            // Acquire actual writer exclusion/startup before any SQLite read/configuration.
-            store = try DurableWalletStore(directory: directory, anchor: anchor, policy: policy)
-            guard let retained = try store.continuity.inspectRecoveryState() else { throw FixtureFailure.fixtureUnavailable }
-            guard let value = retained.custody,
-                  retained.installationID == manifest.installationID,
-                  value.walletID == manifest.walletID, value.accountID == manifest.accountID,
-                  value.profile == manifest.profile, value.network == "mainnet" else { throw FixtureFailure.fixtureUnavailable }
-            custody = value
+        let accounts = FixtureSeedAccountProvider()
+        let accountID: String
+        if resume {
+            guard let manifest else { throw FixtureFailure.invalidArguments }
+            accountID = manifest.accountID
         } else {
-            custody = try await vault.protect(mnemonic: mnemonic, walletID: "protocol-fixture-wallet", network: "mainnet")
-            let journal = try SQLiteJournal(path: directory.appendingPathComponent("journal.sqlite").path)
-            var state = CanonicalState(installationID: "protocol-fixture-installation",
-                authorization: .init(walletID: custody.walletID, network: custody.network, generation: 1, grants: []),
-                mode: .enabled, history: .complete)
-            state.custody = custody
-            state.paymentPolicy.approvalRequired = scenario == .approvalRequired
-            try journal.write(state)
-            try anchor.write(.init(committed: state.reference()))
-            policy = policyFor(custody.accountID)
-            store = try DurableWalletStore(directory: directory, anchor: anchor, policy: policy)
+            accountID = try await accounts.deriveAccount(mnemonic: FixtureSeedAccountProvider.mnemonic, network: "mainnet").accountID
         }
-        var resumedContext: CapabilityConnectionContext?
-        if ownership != nil {
-            guard let retainedCredential, retainedCredential.count == 32, let consent else { throw FixtureFailure.invalidArguments }
-            let trusted = try? store.continuity.inspect { $0 }
-            let peer = PeerEvidence(identity: bridge, signatureValidated: true)
-            let connectionID = "protocol-fixture-connection-" + UUID().uuidString
-            let session = trusted?.mode == .enabled ? (try? store.integrationAuthority().authenticate(connectionID: connectionID, peer: peer,
-                credential: retainedCredential, now: clock.read().wall)) : nil
-            guard let session else {
-                return try ownerOnly(directory: directory, scenario: scenario, store: store, policy: policy,
-                    custody: custody, vault: vault, keys: keys, credential: retainedCredential, clock: clock, consent: consent)
-            }
-            resumedContext = CapabilityConnectionContext(session: session, connectionID: connectionID, peer: peer)
-        }
-        // Writer/startup and exact anchor validation precede reopening the disposable key.
-        _ = try store.continuity.inspect { state in
-            guard state.custody == custody else { throw FixtureFailure.fixtureUnavailable }
-        }
-        let baseAccount: OpalBase.Account
-        if ownership == nil { baseAccount = try await BaseSeedAccountProvider().restoreSigningAccount(custody: custody, vault: vault) }
-        else { baseAccount = try await BaseSeedAccountProvider().restorePublicAccount(custody: custody) }
+        let policy = AuthorityPolicy(
+            bridge: SignedPeerIdentity(teamIdentifier: "synthetic-protocol-fixture", signingIdentifier: "integration"),
+            owner: SignedPeerIdentity(teamIdentifier: "synthetic-protocol-fixture", signingIdentifier: "owner"),
+            accountIDs: [accountID], capabilities: ["read", "sync", "receive", "prepare", "submit", "cancel"],
+            ownerAuthenticationAge: 30)
+        let keys = try FixtureKeychainOperations(path: itemsPath, group: group, resume: resume)
         let chain = FixturePublicChain(clock: clock)
         chain.setAccepted(scenario != .uncertain)
-        let receiving = try await baseAccount.selectNextDerivedAddress(for: .receiving)
-        let funding = try OpalBase.Transaction(version: 2,
-            inputs: [.init(previousTransactionHash: .init(naturalOrder: Data(repeating: 0, count: 32)),
-                previousTransactionOutputIndex: UInt32.max, unlockingScript: Data([0xA1]))],
-            outputs: [.init(value: 50_000, address: receiving.address)], lockTime: 0).encode()
-        if scenario != .missingSnapshot { try chain.publish(funding, height: 1) }
-        let adapter = try await BaseBCHAdapter(account: baseAccount, custody: custody, vault: vault, continuity: store.continuity,
-            chain: chain.operations(), clock: clock, context: { chain.context() },
-            canonicalProof: { hash, height, context in chain.proof(hash: hash, height: height, context: context) })
-        let boundary: any PaymentExecutionBoundary
-        if let phases { boundary = FixturePhaseBoundary(base: adapter, phases: phases) } else { boundary = adapter }
-        let payments = try store.paymentEngine(boundary: boundary, clock: clock)
-        let receives = try store.receiveEngine(boundary: adapter, clock: clock)
-        let service = CapabilityService(continuity: store.continuity, policy: policy, payments: payments, receives: receives,
-            clock: clock, availability: { _ in
+        // Process fixtures install their independent oracle before reopen can schedule continuation.
+        if phases != nil { await chain.relayLatch.close() }
+        let inspection = FixtureInspection(directory: directory)
+        try beforeStart?(chain, inspection)
+        let endpoints = FixtureEndpointRegistry()
+        if recoveryOnly {
+            guard let retainedCredential, let manifest else { throw FixtureFailure.invalidArguments }
+            let recovery = try FixtureRecoveryRuntime(directory: directory, group: group, keys: keys,
+                policy: policy, manifest: manifest, consent: consent ?? FixtureConsent(clock: clock), clock: clock, inspection: inspection)
+            let state = try recovery.rawState()
+            guard let custody = state.custody else { throw FixtureFailure.fixtureUnavailable }
+            try validate(state, custody: custody, manifest: manifest)
+            let account = try AccountScope(wallet: WalletScope(walletID: custody.walletID, network: .mainnet), accountID: custody.accountID)
+            return FixtureRuntime(directory: directory, scenario: scenario, policy: policy, keys: keys,
+                custody: custody, chain: chain, clock: clock, session: nil, ownerSession: nil, recovery: recovery,
+                account: account, trace: trace, credential: retainedCredential,
+                grant: try GrantSelector(wallet: account.wallet, grantID: manifest.grantID), assembly: nil,
+                endpoints: endpoints, inspection: inspection, phases: phases)
+        }
+        let effects: ServiceAssembly.EffectFactory = { context in
+            inspection.bind(context.continuity)
+            let base = BaseSeedAccountProvider()
+            let account: OpalBase.Account
+            if resume { account = try await base.restorePublicAccount(custody: context.custody) }
+            else { account = try await base.restoreSigningAccount(custody: context.custody, vault: context.vault) }
+            let receiving = try await account.selectNextDerivedAddress(for: .receiving)
+            let funding = try OpalBase.Transaction(version: 2,
+                inputs: [.init(previousTransactionHash: .init(naturalOrder: Data(repeating: 0, count: 32)),
+                    previousTransactionOutputIndex: UInt32.max, unlockingScript: Data([0xA1]))],
+                outputs: [.init(value: 50_000, address: receiving.address)], lockTime: 0).encode()
+            if scenario != .missingSnapshot { try chain.publish(funding, height: 1) }
+            let adapter = try await BaseBCHAdapter(account: account, custody: context.custody, vault: context.vault,
+                continuity: context.continuity, chain: chain.operations(), clock: clock,
+                context: { chain.context() }, canonicalProof: { hash, height, context in chain.proof(hash: hash, height: height, context: context) })
+            let payments: any PaymentExecutionBoundary
+            if let phases { payments = FixturePhaseBoundary(base: adapter, phases: phases) } else { payments = adapter }
+            return ServiceEffectBoundaries(payments: payments, chain: adapter, availability: { _ in
                 let context = chain.context()
                 if !keys.isPresent { return AccountReadiness(state: .blocked, blockers: [.keyUnavailable]) }
                 if !context.fresh || !context.complete { return AccountReadiness(state: .blocked, blockers: [.staleSnapshot]) }
                 return AccountReadiness(state: .ready)
             })
-        let peer = PeerEvidence(identity: bridge, signatureValidated: true)
-        let ownerPeer = PeerEvidence(identity: owner, signatureValidated: true)
-        let ownerEvidence = OwnerAuthenticationEvidence(peer: ownerPeer, authenticationSucceeded: true, authenticatedAt: clock.read().wall)
-        let authority = try store.integrationAuthority()
-        let credential: Data
-        if let retainedCredential {
-            guard ownership != nil, retainedCredential.count == 32 else { throw FixtureFailure.invalidArguments }
-            credential = retainedCredential
+        }
+        let factory: ServiceAssembly.EndpointFactory = { channel, handlers in endpoints.host(channel, handlers: handlers) }
+        let assembly: ServiceAssembly
+        if resume {
+            guard retainedCredential?.count == 32, manifest != nil else { throw FixtureFailure.invalidArguments }
+            assembly = try ServiceAssembly.reopen(directory: directory, accessGroup: group, accounts: accounts,
+                operations: keys, policy: policy, effects: effects, endpoints: factory, clock: clock)
         } else {
-            guard ownership == nil else { throw FixtureFailure.invalidArguments }
-            credential = try authority.enroll(id: "protocol-fixture-grant", integrationID: "protocol-fixture-integration",
-                accounts: [custody.accountID], capabilities: ["read", "sync", "receive", "prepare", "submit", "cancel"],
-                expiry: nil, owner: ownerEvidence, now: clock.read().wall).rawValue
+            guard retainedCredential == nil else { throw FixtureFailure.invalidArguments }
+            assembly = try ServiceAssembly.initializeNew(directory: directory, accessGroup: group, accounts: accounts,
+                operations: keys, policy: policy, effects: effects, endpoints: factory, clock: clock)
         }
-        let context: CapabilityConnectionContext
-        if let resumedContext { context = resumedContext }
-        else {
-            let connectionID = "protocol-fixture-connection-" + UUID().uuidString
-            let session = try authority.authenticate(connectionID: connectionID, peer: peer,
-                credential: credential, now: clock.read().wall)
-            context = CapabilityConnectionContext(session: session, connectionID: connectionID, peer: peer)
+        do {
+            try await assembly.start()
+            // Join the assembly-owned continuation/reconciliation pass. Derived relay-start and
+            // result work remains retained asynchronously; scenario read baselines must observe
+            // the relevant terminal policy blocker or controlled latch.
+            if resume { try await assembly.continuePending() }
+            let ownerHandlers = try endpoints.endpoint(.owner)
+            let ownerPeer = PeerEvidence(identity: policy.owner, signatureValidated: true)
+            let bootstrapOwner = FixtureOwnerSession(handlers: ownerHandlers,
+                connection: try await ownerHandlers.connect(connectionID: UUID().uuidString, peer: ownerPeer),
+                consent: FixtureConsent(clock: clock))
+            let bootstrap = OwnerControlClient(transport: bootstrapOwner)
+            var issued: OwnerIssuedCredential?
+            if !resume {
+                guard case .createWallet(let status) = try await bootstrap.call(.createWallet(network: .mainnet)), let wallet = status.wallet,
+                      case .listAccounts(let directory) = try await bootstrap.call(.listAccounts(wallet)), let account = directory.accounts.first,
+                      case .enableWallet = try await bootstrap.call(.enableWallet(wallet)) else { throw FixtureFailure.fixtureUnavailable }
+                if scenario == .approvalRequired {
+                    guard case .setApprovalPolicy = try await bootstrap.call(.setApprovalPolicy(.init(wallet: wallet, expectedRevision: 1, approvalRequired: true))) else { throw FixtureFailure.fixtureUnavailable }
+                }
+                guard case .enrollIntegration(let value) = try await bootstrap.call(.enrollIntegration(try EnrollmentRequest(wallet: wallet,
+                    integrationID: "protocol-fixture-integration", accountIDs: [account.accountID], scopes: [.read, .sync, .receive, .prepare, .submit, .cancel]))) else { throw FixtureFailure.fixtureUnavailable }
+                issued = value
+            }
+            let state = try inspection.inspect { $0 }
+            guard let custody = state.custody else { throw FixtureFailure.fixtureUnavailable }
+            if let manifest { try validate(state, custody: custody, manifest: manifest) }
+            let account = try AccountScope(wallet: WalletScope(walletID: custody.walletID, network: .mainnet), accountID: custody.accountID)
+            let credential: Data
+            let grant: GrantSelector
+            if let issued { credential = issued.credential.withBytes { $0 }; grant = issued.grant.selector }
+            else {
+                guard let retainedCredential, let manifest else { throw FixtureFailure.fixtureUnavailable }
+                credential = retainedCredential
+                grant = try GrantSelector(wallet: account.wallet, grantID: manifest.grantID)
+            }
+            await bootstrapOwner.close()
+            let ownerSession = FixtureOwnerSession(handlers: ownerHandlers,
+                connection: try await ownerHandlers.connect(connectionID: UUID().uuidString, peer: ownerPeer),
+                consent: consent ?? FixtureConsent(clock: clock))
+            let session: FixtureClientSession?
+            if resume {
+                // Restricted/revoked authority still exposes the actual assembly owner endpoint.
+                session = try? await openSession(endpoints: endpoints, policy: policy, credential: credential, chain: chain, trace: trace)
+            } else { session = try await openSession(endpoints: endpoints, policy: policy, credential: credential, chain: chain, trace: trace) }
+            try trace?.emit(event: "fixture-ready", relayCount: chain.counts.relays)
+            return FixtureRuntime(directory: directory, scenario: scenario, policy: policy, keys: keys, custody: custody,
+                chain: chain, clock: clock, session: session, ownerSession: ownerSession, account: account,
+                trace: trace, credential: credential, grant: grant, assembly: assembly, endpoints: endpoints,
+                inspection: inspection, phases: phases)
+        } catch {
+            let drain = Task { await assembly.shutdown() }
+            await chain.relayLatch.open(); await phases?.release()
+            await drain.value
+            throw error
         }
-        let client = CapabilityClient(transport: FixtureCapabilityTransport(service: service, context: context, chain: chain, trace: trace))
-        let ownerService = OwnerControlService(continuity: store.continuity, policy: policy,
-            authority: { try store.integrationAuthority() }, vault: vault, accounts: adapter, payments: payments,
-            consent: consent ?? FixtureConsent(clock: clock), clock: clock)
-        let ownerConnection = OwnerConnectionContext(connectionID: UUID().uuidString, peer: ownerPeer)
-        let ownerClient = OwnerControlClient(transport: FixtureOwnerTransport(service: ownerService, connection: ownerConnection))
-        let scope = try AccountScope(wallet: WalletScope(walletID: custody.walletID, network: .mainnet), accountID: custody.accountID)
-        try trace?.emit(event: "fixture-ready", relayCount: chain.counts.relays)
-        return FixtureRuntime(directory: directory, scenario: scenario, store: store, policy: policy, vault: vault, keys: keys,
-            custody: custody, chain: chain, clock: clock, payments: payments, receives: receives, service: service,
-            context: context, client: client, ownerClient: ownerClient, account: scope, trace: trace, ownerEvidence: ownerEvidence,
-            syntheticCredential: credential, ownerService: ownerService, ownerConnection: ownerConnection)
     }
 
-    func state() throws -> CanonicalState { try store.continuity.inspect { $0 } }
-    func reference() throws -> StateReference { try store.continuity.inspect { try $0.reference() } }
-    func integrationClient(credential: Data) throws -> CapabilityClient {
+    private static func validate(_ state: CanonicalState, custody: WalletCustodyRecord, manifest: FixtureStoreManifest) throws {
+        guard state.installationID == manifest.installationID, custody.walletID == manifest.walletID,
+              custody.accountID == manifest.accountID, custody.profile == manifest.profile, custody.network == "mainnet",
+              state.authorization.grants.contains(where: { $0.id == manifest.grantID && $0.integrationID == "protocol-fixture-integration" }) else { throw FixtureFailure.fixtureUnavailable }
+    }
+    func inspect<T>(_ body: (CanonicalState) throws -> T) throws -> T { try inspection.inspect(body) }
+    func state() throws -> CanonicalState { try inspect { $0 } }
+    func reference() throws -> StateReference { try inspect { try $0.reference() } }
+    func grantProjection() throws -> GrantProjection {
+        try inspect { state in
+            guard let value = state.authorization.grants.first(where: { $0.id == grantID }) else { throw FixtureFailure.fixtureUnavailable }
+            return GrantProjection(selector: grant, integrationID: value.integrationID, accountIDs: value.accountIDs,
+                scopes: value.capabilities.compactMap(IntegrationScope.init(rawValue:)), expiresAt: value.expiresAt,
+                credentialGeneration: value.credentialGeneration, state: value.revoked ? .revoked : .active, peerProfile: value.peerProfile)
+        }
+    }
+    private static func openSession(endpoints: FixtureEndpointRegistry, policy: AuthorityPolicy, credential: Data,
+                                    chain: FixturePublicChain, trace: FixtureTrace?) async throws -> FixtureClientSession {
         guard credential.count == 32 else { throw FixtureFailure.invalidArguments }
-        let peer = PeerEvidence(identity: policy.bridge, signatureValidated: true)
-        let connectionID = "protocol-fixture-connection-" + UUID().uuidString
-        let session = try store.integrationAuthority().authenticate(connectionID: connectionID,
-            peer: peer, credential: credential, now: clock.read().wall)
-        let context = CapabilityConnectionContext(session: session, connectionID: connectionID, peer: peer)
-        return CapabilityClient(transport: FixtureCapabilityTransport(service: service,
-            context: context, chain: chain, trace: trace))
+        let handlers = try endpoints.endpoint(.integration)
+        let connection = try await handlers.connect(connectionID: UUID().uuidString, peer: PeerEvidence(identity: policy.bridge, signatureValidated: true))
+        do { try await handlers.authenticate(credential, connection: connection) }
+        catch { connection.invalidate(); await handlers.disconnect(connection); throw error }
+        return FixtureClientSession(handlers: handlers, connection: connection, chain: chain, trace: trace)
     }
-    func foreignClient() throws -> CapabilityClient {
-        guard let context else { throw FixtureFailure.fixtureUnavailable }
-        let authority = try store.integrationAuthority()
-        let credential = try authority.enroll(id: "foreign-fixture-grant", integrationID: "foreign-fixture-integration",
-            accounts: [custody.accountID], capabilities: ["read", "sync", "receive", "prepare", "submit", "cancel"],
-            expiry: nil, owner: ownerEvidence, now: clock.read().wall)
-        let session = try authority.authenticate(connectionID: "foreign-fixture-connection", peer: context.peer,
-            credential: credential.rawValue, now: clock.read().wall)
-        return CapabilityClient(transport: FixtureCapabilityTransport(service: service,
-            context: .init(session: session, connectionID: "foreign-fixture-connection", peer: context.peer), chain: chain, trace: trace))
+    func openSession(credential: Data? = nil) async throws -> FixtureClientSession {
+        try await Self.openSession(endpoints: endpoints, policy: policy, credential: credential ?? syntheticCredential, chain: chain, trace: trace)
     }
-    private static func ownerOnly(directory: URL, scenario: FixtureScenario, store: DurableWalletStore,
-                                  policy: AuthorityPolicy, custody: WalletCustodyRecord, vault: WalletSeedVault,
-                                  keys: FixtureKeys, credential: Data, clock: FixtureClock,
-                                  consent: any OwnerConsentProvider) throws -> FixtureRuntime {
-        let boundary = FixtureUnavailableBoundary()
-        let payments = PaymentEngine(continuity: store.continuity, authorityPolicy: policy, boundary: boundary, clock: clock)
-        let receives = ReceiveEngine(continuity: store.continuity, policy: policy, boundary: boundary, clock: clock)
-        let service = CapabilityService(continuity: store.continuity, policy: policy, payments: payments, receives: receives,
-            clock: clock, availability: { _ in .unavailable })
-        let peer = PeerEvidence(identity: policy.owner, signatureValidated: true)
-        let ownerEvidence = OwnerAuthenticationEvidence(peer: peer, authenticationSucceeded: true, authenticatedAt: clock.read().wall)
-        let ownerService = OwnerControlService(continuity: store.continuity, policy: policy,
-            authority: { try store.integrationAuthority() }, vault: vault, accounts: boundary,
-            payments: payments, consent: consent, clock: clock)
-        let ownerConnection = OwnerConnectionContext(connectionID: UUID().uuidString, peer: peer)
-        let scope = try AccountScope(wallet: WalletScope(walletID: custody.walletID, network: .mainnet), accountID: custody.accountID)
-        return FixtureRuntime(directory: directory, scenario: scenario, store: store, policy: policy, vault: vault, keys: keys,
-            custody: custody, chain: FixturePublicChain(clock: clock), clock: clock, payments: payments, receives: receives,
-            service: service, context: nil, client: CapabilityClient(),
-            ownerClient: OwnerControlClient(transport: FixtureOwnerTransport(service: ownerService, connection: ownerConnection)),
-            account: scope, trace: nil, ownerEvidence: ownerEvidence, syntheticCredential: credential,
-            ownerService: ownerService, ownerConnection: ownerConnection)
+    func integrationClient(credential: Data) async throws -> CapabilityClient { try await openSession(credential: credential).client }
+    func openForeignSession() async throws -> FixtureClientSession {
+        guard case .enrollIntegration(let issued) = try await ownerClient.call(.enrollIntegration(try EnrollmentRequest(wallet: account.wallet,
+            integrationID: "foreign-fixture-integration", accountIDs: [account.accountID], scopes: [.read, .sync, .receive, .prepare, .submit, .cancel]))) else { throw FixtureFailure.fixtureUnavailable }
+        return try await openSession(credential: issued.credential.withBytes { $0 })
     }
+    func foreignClient() async throws -> CapabilityClient { try await openForeignSession().client }
+    func openOwnerSession(consent: any OwnerConsentProvider) async throws -> FixtureOwnerSession {
+        let handlers = try endpoints.endpoint(.owner)
+        return FixtureOwnerSession(handlers: handlers,
+            connection: try await handlers.connect(connectionID: UUID().uuidString, peer: PeerEvidence(identity: policy.owner, signatureValidated: true)), consent: consent)
+    }
+    func ownerPacket(_ packet: NativeOwnerPacket, requestID: UUID, method: OwnerControlMethod) async throws -> OwnerControlResponse {
+        if let ownerSession { return try await ownerSession.packet(packet, requestID: requestID, method: method) }
+        guard let recovery else { throw FixtureFailure.fixtureUnavailable }
+        let (_, request) = try NativeWire.decodeOwnerRequest(packet)
+        return try NativeWire.decodeOwnerResponse(NativeWire.ownerResponse(try await recovery.send(request), requestID: requestID), requestID: requestID, method: method)
+    }
+    func continuePending() async throws {
+        guard let assembly else { throw FixtureFailure.fixtureUnavailable }
+        try await assembly.continuePending()
+    }
+    /// Starts terminal admission closure without releasing an intentionally held fixture boundary.
+    func beginShutdown() async -> Task<Void, Never> {
+        let task = stopLock.withLock { () -> Task<Void, Never> in
+            if let stopTask { return stopTask }
+            let assembly = self.assembly, recovery = self.recovery, inspection = self.inspection
+            let task = Task {
+                if let assembly { await assembly.shutdown() }
+                await recovery?.shutdown()
+                inspection.didStop()
+            }
+            stopTask = task
+            return task
+        }
+        if let assembly {
+            while true {
+                let phase = await assembly.phase
+                if phase == .stopping || phase == .stopped { break }
+                await Task.yield()
+            }
+        } else { await task.value }
+        return task
+    }
+    /// Explicit test-fault release is separate from factual assembly drainage.
+    func releaseFixtureFaults() async { await chain.relayLatch.open(); await phases?.release() }
     func shutdown() async {
-        await chain.relayLatch.open()
-        await payments.cancelLocalTransport()
+        let drain = await beginShutdown()
+        await releaseFixtureFaults()
+        await drain.value
         try? trace?.emit(event: "fixture-stop", relayCount: chain.counts.relays)
     }
-
     private static func createFreshTemporaryDirectory(_ directory: URL) throws {
         guard directory.isFileURL, directory.path.hasPrefix("/") else { throw FixtureFailure.invalidArguments }
         let parent = directory.deletingLastPathComponent().resolvingSymlinksInPath().standardizedFileURL.path

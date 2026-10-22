@@ -17,30 +17,23 @@ private struct FixtureControllerConsent: OwnerConsentProvider {
 /// Closed development controls, not an owner transport or an MCP capability.
 actor FixtureProcessController {
     private let runtime: FixtureRuntime
-    private let owner: OwnerControlService
-    private let ownerConnection: OwnerConnectionContext
-    private var current: CapabilityClient?
+    private var owner: FixtureOwnerSession?
+    private var current: FixtureClientSession?
 
     init(runtime: FixtureRuntime) {
         self.runtime = runtime
-        current = runtime.context == nil ? nil : runtime.client
-        let source = runtime.ownerService
-        owner = OwnerControlService(continuity: source.continuity, policy: source.policy,
-            authority: source.authority, vault: source.vault, accounts: source.accounts,
-            payments: source.payments, consent: FixtureControllerConsent(clock: runtime.clock), clock: runtime.clock)
-        ownerConnection = OwnerConnectionContext(connectionID: UUID().uuidString,
-            peer: PeerEvidence(identity: runtime.policy.owner, signatureValidated: true))
+        current = runtime.primarySession
     }
 
-    func disconnectCurrent() { current = nil }
-    func connect(_ credential: Data) throws { current = try runtime.integrationClient(credential: credential) }
+    func disconnectCurrent() async { await current?.close(); current = nil }
+    func connect(_ credential: Data) async throws { current = try await runtime.openSession(credential: credential) }
 
     func integration(_ message: FixtureControlMessage) async throws -> PaymentOperation {
         let client: CapabilityClient
         switch message.connection {
         case "original": client = runtime.client
         case "current":
-            guard let value = current else { throw FixtureFailure.fixtureUnavailable }; client = value
+            guard let value = current else { throw FixtureFailure.fixtureUnavailable }; client = value.client
         default: throw FixtureFailure.invalidArguments
         }
         switch message.kind {
@@ -82,10 +75,11 @@ actor FixtureProcessController {
         default: throw FixtureFailure.invalidArguments
         }
         let input = try NativeWire.ownerRequest(request, requestID: id)
-        let output = await NativeServiceFrames.owner(input, service: owner, context: ownerConnection)
-        return try NativeWire.decodeOwnerResponse(output, requestID: id, method: request.call.method)
+        if owner == nil { owner = try await runtime.openOwnerSession(consent: FixtureControllerConsent(clock: runtime.clock)) }
+        guard let owner else { throw FixtureFailure.fixtureUnavailable }
+        return try await owner.packet(input, requestID: id, method: request.call.method)
     }
 
-    func close() { current = nil; ownerConnection.invalidate() }
+    func close() async { await disconnectCurrent(); await owner?.close(); owner = nil }
 }
 #endif

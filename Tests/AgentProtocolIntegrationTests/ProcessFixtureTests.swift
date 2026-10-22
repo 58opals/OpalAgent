@@ -6,8 +6,10 @@ import CryptoKit
 import Darwin
 import Foundation
 import MCP
+import Security
 import Testing
 @testable import AgentProtocolFixture
+@testable import AgentServiceCore
 
 private final class OwnedFixtureChild: @unchecked Sendable {
     let pid: pid_t
@@ -19,6 +21,7 @@ private final class OwnedFixtureChild: @unchecked Sendable {
     private var pipesClosed = false
     private var events: [FixtureControlMessage] = []
     private var consentNonces = Set<UUID>()
+    private static let eventKinds: Set<String> = ["relayEntered", "phaseReached", "admissionClosed", "shutdownComplete"]
     private init(pid: pid_t, control: FixtureControlSocket, input: Int32, output: Int32) {
         self.pid = pid; self.control = control; self.input = input; self.output = output
     }
@@ -53,11 +56,12 @@ private final class OwnedFixtureChild: @unchecked Sendable {
         }
         return try OwnedFixtureChild(pid: pid, control: FixtureControlSocket(descriptor: sockets[0]), input: input[1], output: output[0])
     }
-    func bootstrap(_ ownership: FixtureProcessOwnership, resume: Bool, credential: Data? = nil, wallTime: Int64? = nil) async throws -> FixtureControlMessage {
+    func bootstrap(_ ownership: FixtureProcessOwnership, resume: Bool, credential: Data? = nil, wallTime: Int64? = nil,
+                   recoveryOnly: Bool = false) async throws -> FixtureControlMessage {
         var request = FixtureControlMessage(kind: "bootstrap")
         request.namespace = ownership.namespace.path; request.runID = ownership.runID
         request.capability = ownership.capability; request.resume = resume; request.epoch = UUID()
-        request.wallTime = wallTime
+        request.wallTime = wallTime; request.recoveryOnly = recoveryOnly ? true : nil
         try control.send(request)
         if let credential { try control.send(kind: 2, payload: credential) }
         let ready = try FixtureControlSocket.message(await control.receiveAsync())
@@ -75,7 +79,7 @@ private final class OwnedFixtureChild: @unchecked Sendable {
     func response(id: UUID) async throws -> FixtureControlMessage {
         while true {
             let message = try FixtureControlSocket.message(await control.receiveAsync())
-            if message.kind == "relayEntered" || message.kind == "phaseReached" {
+            if Self.eventKinds.contains(message.kind) {
                 lock.withLock { events.append(message) }; continue
             }
             try #require(message.id == id)
@@ -90,7 +94,7 @@ private final class OwnedFixtureChild: @unchecked Sendable {
         while true {
             let message = try FixtureControlSocket.message(await control.receiveAsync())
             if message.kind == kind && (phase == nil || message.phase == phase) { return message }
-            guard message.kind == "relayEntered" || message.kind == "phaseReached" else { throw WireFixtureFailure.invalidReply }
+            guard Self.eventKinds.contains(message.kind) else { throw WireFixtureFailure.invalidReply }
             lock.withLock { events.append(message) }
         }
     }
@@ -102,6 +106,7 @@ private final class OwnedFixtureChild: @unchecked Sendable {
         return reply
     }
     func facts() async throws -> FixtureDurableFacts { try #require(try await command("facts").facts) }
+    func observe() async throws -> FixtureProcessSnapshot { try #require(try await command("facts").snapshot) }
     func ownerBegin(_ message: FixtureControlMessage, call: OwnerControlCall) async throws {
         try control.send(message)
         let challengeMessage = try await response(id: message.id)
@@ -193,6 +198,16 @@ private func fixtureExecutable(environment: [String: String] = ProcessInfo.proce
 private func ownedNamespace() throws -> FixtureProcessOwnership {
     let parent = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
     return try FixtureProcessOwnership.create(namespace: parent.appendingPathComponent("opal-process-" + UUID().uuidString, isDirectory: true))
+}
+/// Probe the existing owned inode independently of the service's lease implementation.
+private func writerLeaseAvailable(_ ownership: FixtureProcessOwnership, identity: FixtureFileIdentity) throws -> Bool {
+    let fd = Darwin.open(ownership.directory.appendingPathComponent("writer.lock").path, O_RDWR | O_NOFOLLOW | O_CLOEXEC)
+    try #require(fd >= 0)
+    defer { Darwin.close(fd) }
+    try #require(try FixtureFileIdentity.capture(descriptor: fd, directory: false) == identity)
+    if flock(fd, LOCK_EX | LOCK_NB) == 0 { return true }
+    try #require(errno == EWOULDBLOCK)
+    return false
 }
 private func processCall(_ client: MCP.Client, name: String, arguments: [String: MCP.Value]) async throws -> WireReply {
     let context = try await client.send(CallTool.request(.init(name: name, arguments: arguments)))
@@ -446,6 +461,16 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
                 try await processCall(client, name: "get_operation", arguments: lookup).operation["state"]?.stringValue == "accepted"
             }
         }
+        let original = try await processCall(client, name: "get_operation", arguments: lookup)
+        let originalAttempt = try #require(original.operation["latestAttempt"]?.objectValue)
+        let attemptID = try #require(originalAttempt["attemptID"]?.stringValue)
+        let transactionID = try #require(original.operation["transactionID"]?.stringValue)
+        #expect(!attemptID.isEmpty && !transactionID.isEmpty && originalAttempt["number"]?.stringValue == "1")
+        #expect(original.operation["liabilityUnresolved"]?.boolValue == true && original.operation["accountRestriction"]?.stringValue == "held")
+        if prefix == .promotedAcceptance {
+            #expect(original.operation["state"]?.stringValue == "accepted")
+            #expect(original.operation["evidence"]?.objectValue?["support"]?.stringValue == "supported")
+        }
         let (before, beforeBytes) = try await first.snapshot()
         #expect(before.paymentID == id && before.requestKey == requestKey && before.state == (prefix == .promotedAcceptance ? "accepted" : "submitting"))
         #expect(before.ordinaryAdmissions == 1 && before.totalAdmissions == 1 && before.relayEntries == prefix.relays && before.gateHeld)
@@ -453,6 +478,21 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
         let exit = try await first.join(signal: SIGKILL)
         #expect(exit & 0x7f == SIGKILL)
         await client.disconnect()
+        // The killed child has been joined; inspect committed rows without a live writer.
+        let killedPayment: PaymentRecord
+        do {
+            let journal = try SQLiteJournal(path: ownership.directory.appendingPathComponent("journal.sqlite").path, createIfMissing: false)
+            killedPayment = try #require(try journal.read()?.payments.first { $0.id == id })
+        }
+        let acceptedReceipt: EvidenceRecord?
+        if prefix == .promotedAcceptance {
+            #expect(killedPayment.disposition == .accepted && killedPayment.evidenceSupported)
+            let receipt = try #require(killedPayment.evidence.first { $0.chainTip == "relay" && $0.observation == nil && $0.valid })
+            let contents = try JSONDecoder().decode([String].self, from: receipt.contents)
+            try #require(contents.count == 2)
+            #expect(contents[0] == attemptID && contents[1].hasPrefix("accepted("))
+            acceptedReceipt = receipt
+        } else { acceptedReceipt = nil }
         let oraclePath = ownership.namespace.appendingPathComponent("relay-oracle.jsonl")
         let durableOracle = try FixtureProcessOwnership.readOwned(oraclePath, maximum: 16_384)
         let entries = durableOracle.split(separator: 10)
@@ -467,8 +507,15 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
         let second = try OwnedFixtureChild.launch(executable: executable)
         let restarted = try await second.bootstrap(ownership, resume: true, credential: credential)
         #expect(restarted.epoch != ready.epoch)
+        // Startup reconciliation schedules a retained retry; observe its refusal before the read baseline.
+        try await wireEventually("The fresh runtime retry must settle before observational lookup") {
+            try await second.facts().blocker == "relayNotEligible"
+        }
+        let settled = try await second.facts()
+        #expect(settled.blocker == "relayNotEligible")
         let (after, afterBytes) = try await second.snapshot()
-        let retainedState = prefix == .promotedAcceptance ? "accepted" : "uncertain"
+        // Actual startup joins fresh funding-only reconciliation; no exact payment is published.
+        let retainedState = "uncertain"
         #expect(after.paymentID == id && after.requestKey == requestKey && after.state == retainedState)
         #expect(after.ordinaryAdmissions == 1 && after.totalAdmissions == 1 && after.relayEntries == prefix.relays && after.gateHeld)
         let fullBytesEqualAfterRestart = afterBytes == beforeBytes
@@ -477,14 +524,37 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
         let result = try await processCall(next, name: "get_operation", arguments: lookup)
         #expect(result.isError != true && result.operationID == id && result.operation["state"]?.stringValue == retainedState)
         #expect(result.operation["ordinaryAdmissions"]?.stringValue == "1")
+        #expect(result.operation["identity"] == original.operation["identity"] && result.operation["request"] == original.operation["request"])
+        #expect(result.operation["transactionID"]?.stringValue == transactionID && result.operation["latestAttempt"]?.objectValue?["attemptID"]?.stringValue == attemptID)
+        #expect(result.operation["liabilityUnresolved"]?.boolValue == true && result.operation["accountRestriction"]?.stringValue == "held")
         let (lookupAfter, lookupBytes) = try await second.snapshot()
-        #expect(lookupAfter.stateDigest == after.stateDigest && lookupAfter.totalAdmissions == 1 && lookupAfter.relayEntries == prefix.relays)
+        let factsAfterLookup = try await second.facts()
+        #expect(factsAfterLookup.blocker == "relayNotEligible")
+        #expect(factsAfterLookup.keyReads == settled.keyReads && factsAfterLookup.chainQueries == settled.chainQueries)
+        #expect(lookupAfter.stateDigest == after.stateDigest)
+        #expect(lookupAfter.totalAdmissions == 1)
+        #expect(lookupAfter.relayEntries == prefix.relays)
         let fullBytesEqualAfterLookup = lookupBytes == beforeBytes
         #expect(fullBytesEqualAfterLookup && lookupAfter.gateHeld)
         #expect(try FixtureProcessOwnership.readOwned(oraclePath, maximum: 16_384) == durableOracle)
         let cleanExit = try await second.close()
         #expect(cleanExit == 0)
         await next.disconnect()
+        // The second child is also joined before reading authoritative evidence rows.
+        let reconciledPayment: PaymentRecord
+        do {
+            let journal = try SQLiteJournal(path: ownership.directory.appendingPathComponent("journal.sqlite").path, createIfMissing: false)
+            reconciledPayment = try #require(try journal.read()?.payments.first { $0.id == id })
+        }
+        #expect(reconciledPayment.disposition == .uncertain)
+        #expect(reconciledPayment.attempts == killedPayment.attempts)
+        #expect(killedPayment.evidence.allSatisfy { reconciledPayment.evidence.contains($0) })
+        if let acceptedReceipt {
+            #expect(!reconciledPayment.evidenceSupported && reconciledPayment.evidenceRevision > killedPayment.evidenceRevision)
+            #expect(reconciledPayment.evidence.first { $0.id == acceptedReceipt.id } == acceptedReceipt)
+            let removal = try #require(reconciledPayment.evidence.compactMap(\.observation).first { $0.supportRemoved })
+            #expect(removal.complete && removal.fresh && removal.exactTransactionBytes == nil)
+        }
         try appendProcessProof(scenario: "payment-" + prefix.rawValue, children: [(first.pid, ready.epoch!), (second.pid, restarted.epoch!)],
             snapshot: lookupAfter, generation: 1, bytesEqual: fullBytesEqualAfterRestart && fullBytesEqualAfterLookup,
             lookupDelta: lookupAfter.totalAdmissions - after.totalAdmissions + lookupAfter.relayEntries - after.relayEntries,
@@ -548,6 +618,49 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
         try FileManager.default.removeItem(at: ownership.namespace)
     }
 
+    @Test func gracefulStopClosesAdmissionAndRetainsWriterUntilActualRelayDrain() async throws {
+        let ownership = try ownedNamespace()
+        let child = try OwnedFixtureChild.launch(executable: fixtureExecutable())
+        let ready = try await child.bootstrap(ownership, resume: false)
+        let credential = try await child.control.receiveAsync(); try #require(credential.0 == 2 && credential.1.count == 32)
+        let scope = try #require(ready.snapshot?.account), requestKey = key(97)
+        try await withProcessSDK(child, name: "Graceful stop drains actual relay") { client in
+            let id = try await prepareProcessPayment(child, client, scope: scope, key: requestKey)
+            let lookup = try retainedLookup(scope, key: requestKey)
+            _ = try await processCall(client, name: "submit_payment", arguments: ["account": try processAccount(scope), "operationID": .string(id)])
+            _ = try await child.event("relayEntered")
+            let before = try await child.snapshot()
+            let writer = try FixtureFileIdentity.capture(ownership.directory.appendingPathComponent("writer.lock").path, directory: false)
+            #expect(before.0.state == "submitting" && before.0.totalAdmissions == 1 && before.0.relayEntries == 1 && before.0.gateHeld)
+            let oraclePath = ownership.namespace.appendingPathComponent("relay-oracle.jsonl")
+            let oracle = try FixtureProcessOwnership.readOwned(oraclePath, maximum: 16_384)
+            #expect(oracle.split(separator: 10).count == 1)
+            let stop = FixtureControlMessage(kind: "stop"); try child.control.send(stop)
+            let admissionClosed = try await child.event("admissionClosed")
+            #expect(admissionClosed.id == stop.id && admissionClosed.snapshot?.state == "submitting")
+            #expect(try !writerLeaseAvailable(ownership, identity: writer))
+            let unavailable = try await processCall(client, name: "get_operation", arguments: lookup)
+            #expect(unavailable.isError == true && unavailable.errorCode == "unavailable")
+            await client.disconnect()
+            // Losing the SDK connection cannot prove that the admitted transport had no effect.
+            #expect(try !writerLeaseAvailable(ownership, identity: writer))
+            #expect(try FixtureProcessOwnership.readOwned(oraclePath, maximum: 16_384) == oracle)
+            _ = try await child.command("releaseRelay")
+            let complete = try await child.event("shutdownComplete")
+            #expect(complete.id == stop.id)
+            #expect(try writerLeaseAvailable(ownership, identity: writer))
+            let after = try await child.snapshot(), facts = try await child.facts()
+            let bytesRetained = after.1 == before.1
+            #expect(bytesRetained && after.0.state == "uncertain" && after.0.totalAdmissions == 1 && after.0.relayEntries == 1 && after.0.gateHeld)
+            #expect(try FixtureProcessOwnership.readOwned(oraclePath, maximum: 16_384) == oracle)
+            let closed = try await child.close(); #expect(closed == 0)
+            #expect(try writerLeaseAvailable(ownership, identity: writer))
+            try appendProcessProof(scenario: "graceful-stop-held-relay-drain", children: [(child.pid, ready.epoch!)],
+                snapshot: after.0, generation: facts.generation, bytesEqual: bytesRetained, lookupDelta: 0, exits: [closed], facts: facts)
+        }
+        try FileManager.default.removeItem(at: ownership.namespace)
+    }
+
     @Test(arguments: [false, true])
     func consumedOwnerReceiptSurvivesLostReplyAndRecoveryGeneration(_ recover: Bool) async throws {
         let ownership = try ownedNamespace()
@@ -580,6 +693,8 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
         let context = try #require(originalContext)
         let second = try OwnedFixtureChild.launch(executable: fixtureExecutable())
         let restarted = try await second.bootstrap(ownership, resume: true, credential: secret.1)
+        // Trusted assembly reopen verifies synthetic custody before exposing its endpoints.
+        let assemblyStartup = try await second.facts(); #expect(assemblyStartup.keyReads > 0)
         var active = second
         var children = [(first.pid, ready.epoch!), (second.pid, restarted.epoch!)]
         var exits = [killed]
@@ -598,12 +713,17 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
             let terminated = try await second.join(signal: SIGKILL); #expect(terminated & 0x7f == SIGKILL)
             second.closePipes(); exits.append(terminated)
             let third = try OwnedFixtureChild.launch(executable: fixtureExecutable())
-            let afterRecovery = try await third.bootstrap(ownership, resume: true, credential: secret.1)
+            let afterRecovery = try await third.bootstrap(ownership, resume: true, credential: secret.1, recoveryOnly: true)
             #expect(afterRecovery.problem == "integrationUnavailable")
             active = third; children.append((third.pid, afterRecovery.epoch!))
+            // This explicitly selected owner-only path never opens a wrapping key or effect adapter.
+            let startupEffects = try await third.facts()
+            #expect(startupEffects.keyReads == 0 && startupEffects.chainQueries == 0)
             let ownerStatus = try await third.command("status")
             #expect(ownerStatus.status?.availability == .restricted && ownerStatus.status?.walletGeneration == 2)
-            let noKeys = try await third.facts(); #expect(noKeys.keyReads == 0)
+            let afterStatus = try await third.facts()
+            #expect(afterStatus.keyReads == 0 && afterStatus.chainQueries == 0)
+            #expect(afterStatus.keyReads == startupEffects.keyReads && afterStatus.chainQueries == startupEffects.chainQueries)
         }
         let baseline = try await active.snapshot(), factsBefore = try await active.facts()
         let looked = try await active.command("relayReceipt") { $0.wallet = scope.wallet; $0.requestKey = ownerKey }
@@ -618,6 +738,7 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
         let exact = after.1 == originalBytes && baseline.1 == originalBytes
         #expect(exact && after.0.stateDigest == baseline.0.stateDigest && after.0.totalAdmissions == 2 && after.0.ordinaryAdmissions == 1 && after.0.relayEntries == 2 && after.0.gateHeld)
         #expect(factsAfter.ownerReceipts == 1 && factsAfter.keyReads == factsBefore.keyReads && factsAfter.generation == (recover ? 2 : 1))
+        if recover { #expect(factsAfter.keyReads == 0 && factsAfter.chainQueries == 0) }
         let closed = try await active.close(); #expect(closed == 0); active.closePipes(); exits.append(closed)
         try appendProcessProof(scenario: recover ? "consumed-owner-receipt-restricted-generation" : "consumed-owner-receipt-restart", children: children,
             snapshot: after.0, generation: factsAfter.generation, bytesEqual: exact,
@@ -639,8 +760,9 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
             try await settleUnknown(first, client, scope: scope, key: requestKey, id: id)
             originalBytes = try await first.snapshot().1
             if rotated {
-                var rotation = FixtureControlMessage(kind: "rotateGrant"); rotation.wallet = scope.wallet
-                let result = try await first.owner(rotation, call: .rotateGrant(try GrantSelector(wallet: scope.wallet, grantID: "protocol-fixture-grant")))
+                let selector = try #require(ready.grant?.selector)
+                var rotation = FixtureControlMessage(kind: "rotateGrant"); rotation.wallet = scope.wallet; rotation.grantSelector = selector
+                let result = try await first.owner(rotation, call: .rotateGrant(selector))
                 #expect(result.grant?.credentialGeneration == 2)
                 let credential = try await first.control.receiveAsync(); try #require(credential.0 == 2 && credential.1.count == 32)
                 currentCredential = credential.1
@@ -682,13 +804,30 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
                 _ = try await second.command("continuePending")
                 _ = try await second.event("relayEntered")
                 try await wireEventually("Exactly one identical-byte retry may finish after the new delay") {
-                    let snapshot = try await second.snapshot().0
+                    let snapshot = try await second.observe()
                     return snapshot.state == "uncertain" && snapshot.ordinaryAdmissions == 2
                 }
+                _ = try await second.command("advanceClock") { $0.seconds = 119 }
+                _ = try await second.command("continuePending")
+                try await wireEventually("The third admission must retain its full 120-second delay") {
+                    try await second.facts().blocker == "relayNotEligible"
+                }
+                let beforeThird = try await second.observe()
+                #expect(beforeThird.totalAdmissions == 2 && beforeThird.ordinaryAdmissions == 2 && beforeThird.relayEntries == 2)
+                _ = try await second.command("advanceClock") { $0.seconds = 1 }
+                _ = try await second.command("continuePending")
+                _ = try await second.event("relayEntered")
+                try await wireEventually("The third actual handoff must exhaust ordinary authority") {
+                    let snapshot = try await second.observe(), facts = try await second.facts()
+                    return snapshot.state == "uncertain" && snapshot.ordinaryAdmissions == 3 && facts.blocker == "automaticRelayBudgetExhausted"
+                }
+                _ = try await second.command("advanceClock") { $0.seconds = 1_000 }
+                _ = try await processCall(next, name: "submit_payment", arguments: ["account": try processAccount(scope), "operationID": .string(id)])
+                _ = try await second.command("continuePending")
             }
             let (afterSnapshot, afterBytes): (FixtureProcessSnapshot, Data) = try await second.snapshot()
             let facts = try await second.facts()
-            let expected = rotated ? 1 : 2
+            let expected = rotated ? 1 : 3
             let originalBytesRetained = beforeBytes == originalBytes
             let restartedBytesRetained = afterBytes == originalBytes
             let exact = [originalBytesRetained, restartedBytesRetained].allSatisfy { $0 }
@@ -699,17 +838,60 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
             #expect(afterSnapshot.relayEntries == expected)
             #expect(afterSnapshot.gateHeld)
             #expect(facts.ownerReceipts == 0 && facts.receiveRequests == 0)
-            let closed = try await second.close(); #expect(closed == 0)
-            try appendProcessProof(scenario: rotated ? "rotated-origin-two-unused-slots" : "fresh-runtime-full-retry-delay", children: [(first.pid, ready.epoch!), (second.pid, restarted.epoch!)],
-                snapshot: afterSnapshot, generation: facts.generation, bytesEqual: exact,
-                lookupDelta: afterLookup.totalAdmissions - beforeSnapshot.totalAdmissions + afterLookup.relayEntries - beforeSnapshot.relayEntries,
-                exits: [firstExit, closed], facts: facts)
+            let lookupDelta = afterLookup.totalAdmissions - beforeSnapshot.totalAdmissions + afterLookup.relayEntries - beforeSnapshot.relayEntries
+            if rotated {
+                let closed = try await second.close(); #expect(closed == 0)
+                try appendProcessProof(scenario: "rotated-origin-two-unused-slots", children: [(first.pid, ready.epoch!), (second.pid, restarted.epoch!)],
+                    snapshot: afterSnapshot, generation: facts.generation, bytesEqual: exact,
+                    lookupDelta: lookupDelta, exits: [firstExit, closed], facts: facts)
+            } else {
+                #expect(facts.blocker == "automaticRelayBudgetExhausted")
+                let exhausted = try await processCall(next, name: "get_operation", arguments: lookup)
+                let exhaustedAttempt = try #require(exhausted.operation["latestAttempt"]?.objectValue?["attemptID"]?.stringValue)
+                #expect(!exhaustedAttempt.isEmpty && exhausted.operation["latestAttempt"]?.objectValue?["number"]?.stringValue == "3")
+                let oraclePath = ownership.namespace.appendingPathComponent("relay-oracle.jsonl")
+                let oracle = try FixtureProcessOwnership.readOwned(oraclePath, maximum: 16_384)
+                let entries = try oracle.split(separator: 10).map { line in
+                    try #require(try JSONSerialization.jsonObject(with: Data(line)) as? [String: Any])
+                }
+                #expect(entries.count == 3)
+                for (index, entry) in entries.enumerated() {
+                    #expect(entry["ordinal"] as? Int == index + 1 && entry["attempt"] as? Int == index + 1)
+                    #expect(entry["operationID"] as? String == id && entry["digest"] as? String == afterSnapshot.byteDigest)
+                }
+                let secondExit = try await second.join(signal: SIGKILL); #expect(secondExit & 0x7f == SIGKILL)
+                await next.disconnect()
+                let third = try OwnedFixtureChild.launch(executable: fixtureExecutable())
+                let reopened = try await third.bootstrap(ownership, resume: true, credential: currentCredential, wallTime: facts.clockWall)
+                try #require(reopened.problem == nil)
+                try await withProcessSDK(third, name: "Exhausted ordinary authority after another death") { last in
+                    let baseline = try await third.snapshot()
+                    _ = try await third.command("advanceClock") { $0.seconds = 1_000 }
+                    _ = try await processCall(last, name: "submit_payment", arguments: ["account": try processAccount(scope), "operationID": .string(id)])
+                    _ = try await third.command("continuePending")
+                    let retained = try await processCall(last, name: "get_operation", arguments: lookup)
+                    let final = try await third.snapshot(), finalFacts = try await third.facts()
+                    #expect(retained.operation["identity"] == exhausted.operation["identity"] && retained.operation["request"] == exhausted.operation["request"])
+                    #expect(retained.operation["transactionID"] == exhausted.operation["transactionID"])
+                    #expect(retained.operation["latestAttempt"]?.objectValue?["attemptID"]?.stringValue == exhaustedAttempt)
+                    #expect(retained.operation["ordinaryAdmissions"]?.stringValue == "3" && retained.operation["liabilityUnresolved"]?.boolValue == true)
+                    #expect(retained.operation["blocker"]?.stringValue == "automaticRelayBudgetExhausted" && retained.operation["accountRestriction"]?.stringValue == "held")
+                    #expect(final.0.totalAdmissions == 3 && final.0.ordinaryAdmissions == 3 && final.0.relayEntries == 3 && final.0.gateHeld)
+                    let allBytesRetained = exact && baseline.1 == originalBytes && final.1 == originalBytes
+                    #expect(allBytesRetained && finalFacts.ownerReceipts == 0 && finalFacts.blocker == "automaticRelayBudgetExhausted")
+                    #expect(try FixtureProcessOwnership.readOwned(oraclePath, maximum: 16_384) == oracle)
+                    let closed = try await third.close(); #expect(closed == 0)
+                    try appendProcessProof(scenario: "fresh-runtime-full-retry-delay", children: [(first.pid, ready.epoch!), (second.pid, restarted.epoch!), (third.pid, reopened.epoch!)],
+                        snapshot: final.0, generation: finalFacts.generation, bytesEqual: allBytesRetained,
+                        lookupDelta: lookupDelta, exits: [firstExit, secondExit, closed], facts: finalFacts)
+                }
+            }
         }
         try FileManager.default.removeItem(at: ownership.namespace)
     }
 }
 
-private enum FixtureOwnershipNegative: String, CaseIterable { case capability, adopted, symlink, profile, format }
+private enum FixtureOwnershipNegative: String, CaseIterable { case capability, adopted, symlink, profile, format, recoveryScope }
 @Test(arguments: FixtureOwnershipNegative.allCases)
 private func ownedFixtureRejectsForeignCapabilityAndStateWithoutOpeningStorage(_ failure: FixtureOwnershipNegative) throws {
     let ownership = try ownedNamespace()
@@ -725,16 +907,64 @@ private func ownedFixtureRejectsForeignCapabilityAndStateWithoutOpeningStorage(_
     }
     if failure == .adopted {
         try FileManager.default.removeItem(at: ownership.namespace.appendingPathComponent("owner.json"))
-        #expect(throws: (any Error).self) { try FixtureProcessOwnership.attach(bootstrap) }
+        #expect(throws: FixtureFailure.invalidArguments) { try FixtureProcessOwnership.attach(bootstrap) }
+        return
+    }
+    if failure == .recoveryScope {
+        try ownership.prepare(resume: false)
+        try #require(Darwin.mkdir(ownership.directory.path, 0o700) == 0)
+        let scope = WalletStoreScope(installationID: UUID(), walletID: UUID())
+        try scope.writeNew(in: ownership.directory)
+        let journal = ownership.directory.appendingPathComponent("journal.sqlite")
+        let marker = Data("invalid raw database: scope rejection must happen before resolution".utf8)
+        try FixtureProcessOwnership.writeNew(marker, to: journal)
+        try FixtureProcessOwnership.writeNew(Data(), to: ownership.directory.appendingPathComponent("writer.lock"))
+        let items = ownership.namespace.appendingPathComponent("synthetic-keychain.json")
+        let group = "synthetic.scope-guard." + ownership.runID.uuidString
+        let keys = try FixtureKeychainOperations(path: items, group: group, resume: false)
+        try FixtureProcessOwnership.writeNew(Data(), to: ownership.namespace.appendingPathComponent("relay-oracle.jsonl"))
+        try ownership.seal(walletID: scope.walletID.uuidString, installationID: scope.installationID.uuidString,
+            accountID: "fixture-account", profile: "bip39-empty/bip44-145-0/v1")
+        let manifest = try ownership.storeManifest(), originalItems = try Data(contentsOf: items)
+        let scopePath = ownership.directory.appendingPathComponent("custody.scope")
+        let identity = try FixtureFileIdentity.capture(scopePath.path, directory: false)
+        let replacement = WalletStoreScope(installationID: UUID(), walletID: UUID())
+        let staging = ownership.namespace.appendingPathComponent("replacement-scope", isDirectory: true)
+        try #require(Darwin.mkdir(staging.path, 0o700) == 0)
+        try replacement.writeNew(in: staging)
+        let bytes = try Data(contentsOf: staging.appendingPathComponent("custody.scope"))
+        try FileManager.default.removeItem(at: staging)
+        let file = try FileHandle(forWritingTo: scopePath)
+        try file.truncate(atOffset: 0); try file.write(contentsOf: bytes); try file.synchronize(); try file.close()
+        #expect(try WalletStoreScope.read(in: ownership.directory) == replacement)
+        #expect(try FixtureFileIdentity.capture(scopePath.path, directory: false) == identity)
+        // Genuine scope/manifest encodings and unchanged inodes still pass ownership metadata.
+        try FixtureProcessOwnership.attach(bootstrap).prepare(resume: true)
+        let rootFiles = try FileManager.default.contentsOfDirectory(atPath: ownership.namespace.path).sorted()
+        let policy = AuthorityPolicy(bridge: SignedPeerIdentity(teamIdentifier: "synthetic", signingIdentifier: "integration"),
+            owner: SignedPeerIdentity(teamIdentifier: "synthetic", signingIdentifier: "owner"),
+            accountIDs: [manifest.accountID], capabilities: ["read"], ownerAuthenticationAge: 30)
+        let clock = FixtureClock()
+        #expect(throws: FixtureFailure.fixtureUnavailable) {
+            _ = try FixtureRecoveryRuntime(directory: ownership.directory, group: group, keys: keys, policy: policy,
+                manifest: manifest, consent: FixtureConsent(clock: clock), clock: clock,
+                inspection: FixtureInspection(directory: ownership.directory))
+        }
+        #expect(keys.reads == 0)
+        #expect(try Data(contentsOf: items) == originalItems)
+        #expect(try Data(contentsOf: journal) == marker)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: ownership.namespace.path).sorted() == rootFiles)
         return
     }
     try ownership.prepare(resume: false)
-    let marker = Data("not a SQLite database; must remain unopened".utf8)
-    for name in ["journal.sqlite", "independent-anchor.json", "writer.lock"] {
+    let marker = Data("not a SQLite database or custody item; must remain unopened".utf8)
+    try #require(Darwin.mkdir(ownership.directory.path, 0o700) == 0)
+    for name in ["journal.sqlite", "custody.scope", "writer.lock"] {
         try FixtureProcessOwnership.writeNew(marker, to: ownership.directory.appendingPathComponent(name))
     }
+    try FixtureProcessOwnership.writeNew(marker, to: ownership.namespace.appendingPathComponent("synthetic-keychain.json"))
     try FixtureProcessOwnership.writeNew(Data(), to: ownership.namespace.appendingPathComponent("relay-oracle.jsonl"))
-    try ownership.seal(walletID: "protocol-fixture-wallet", installationID: "protocol-fixture-installation",
+    try ownership.seal(walletID: UUID().uuidString, installationID: UUID().uuidString,
         accountID: "fixture-account", profile: failure == .profile ? "foreign-profile" : "bip39-empty/bip44-145-0/v1")
     if failure == .format {
         let path = ownership.namespace.appendingPathComponent("store.json")
@@ -750,9 +980,51 @@ private func ownedFixtureRejectsForeignCapabilityAndStateWithoutOpeningStorage(_
         relocated = original
         try FileManager.default.createSymbolicLink(at: ownership.directory, withDestinationURL: original)
     }
-    let bytes = try Data(contentsOf: ownership.directory.appendingPathComponent("journal.sqlite"))
-    #expect(throws: (any Error).self) { try FixtureProcessOwnership.attach(bootstrap).prepare(resume: true) }
-    #expect(try Data(contentsOf: ownership.directory.appendingPathComponent("journal.sqlite")) == bytes && bytes == marker)
+    #expect(throws: FixtureFailure.invalidArguments) { try FixtureProcessOwnership.attach(bootstrap).prepare(resume: true) }
+    for name in ["journal.sqlite", "custody.scope", "writer.lock"] {
+        #expect(try Data(contentsOf: ownership.directory.appendingPathComponent(name)) == marker)
+    }
+    #expect(try Data(contentsOf: ownership.namespace.appendingPathComponent("synthetic-keychain.json")) == marker)
+}
+
+private enum FixtureItemPersistFailure: CaseIterable { case add, update }
+@Test(arguments: FixtureItemPersistFailure.allCases)
+private func failedSyntheticItemPersistenceNeverAcknowledgesCachedCandidate(_ mutation: FixtureItemPersistFailure) throws {
+    let ownership = try ownedNamespace()
+    defer { try? FileManager.default.removeItem(at: ownership.namespace) }
+    let path = ownership.namespace.appendingPathComponent("synthetic-keychain.json")
+    let group = "synthetic.persist-failure." + ownership.runID.uuidString
+    let operations = try FixtureKeychainOperations(path: path, group: group, resume: false)
+    let installation = UUID().uuidString, wallet = UUID().uuidString
+    let anchor = try KeychainContinuityAnchorStore(accessGroup: group, installationID: installation, walletID: wallet, operations: operations)
+    let original = ContinuityAnchor(committed: StateReference(installationID: installation, walletID: wallet,
+        network: "mainnet", generation: 1, commitID: "durable-anchor", formatVersion: 2,
+        commitment: Data(repeating: 0x31, count: 32), history: .complete))
+    try anchor.write(original)
+    let durableBytes = try Data(contentsOf: path)
+    let retained = ownership.namespace.appendingPathComponent("retained-durable-items.json")
+    try FileManager.default.moveItem(at: path, to: retained)
+    // A file cannot be renamed over this directory: the real persistence attempt returns EISDIR.
+    try #require(Darwin.mkdir(path.path, 0o700) == 0)
+    switch mutation {
+    case .add:
+        let provisioner = try KeychainWrappingKeyProvisioner(accessGroup: group, walletID: wallet, operations: operations,
+            generateKey: { SymmetricKey(data: Data(repeating: 0x63, count: 32)) })
+        #expect(throws: KeychainCustodyError.operationFailed(errSecIO)) { try provisioner.provision() }
+        let reader = try KeychainWrappingKeySource(accessGroup: group, walletID: wallet, operations: operations)
+        guard case .missing = try reader.wrappingKey() else {
+            Issue.record("A failed synthetic key add must never be returned as persisted")
+            return
+        }
+    case .update:
+        var candidate = original
+        candidate.committed?.commitID = "unpersisted-anchor"
+        candidate.committed?.commitment = Data(repeating: 0x52, count: 32)
+        #expect(throws: KeychainCustodyError.operationFailed(errSecIO)) { try anchor.write(candidate) }
+    }
+    #expect(try anchor.read() == original)
+    #expect(try Data(contentsOf: retained) == durableBytes)
+    #expect(try path.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true)
 }
 
 private enum FixtureBindingNegative: CaseIterable { case partialPath, partialHash, wrongName, wrongHash }

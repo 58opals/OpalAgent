@@ -12,7 +12,7 @@ private func withProtocolFixture(_ scenario: FixtureScenario,
                                  _ body: (FixtureRuntime, WireSession) async throws -> Void) async throws {
     let directory = fixtureDirectory()
     let runtime = try await FixtureRuntime.make(directory: directory, scenario: scenario)
-    let session = try await WireSession.connect(client: runtime.client)
+    let session = try await WireSession.connect(session: runtime.openSession())
     do {
         try await body(runtime, session)
         await session.close()
@@ -41,7 +41,7 @@ private func assertPublicWireValue(_ value: MCP.Value) {
     }
 }
 
-@Test func swiftSDKAllTwelveToolsReachActualBaseAndSQLiteWithoutReadEffects() async throws {
+@Test func swiftSDKAllTwelveToolsReachActualAssemblyBaseAndSQLiteWithoutReadEffects() async throws {
     try await withProtocolFixture(.autonomous) { fixture, wire in
         let tools = try await wire.client.listTools().tools
         #expect(Set(tools.map(\.name)) == Set(["list_wallets", "list_accounts", "get_balance", "list_transactions",
@@ -142,10 +142,19 @@ private func assertPublicWireValue(_ value: MCP.Value) {
         _ = try await waitOperation(wire, fixture, id, state: "accepted")
         let before = try #require(try fixture.state().payments.first { $0.id == id })
         #expect(before.ordinaryAdmissions == 1 && fixture.chain.counts.relays == 1)
-        _ = try await fixture.ownerClient.call(.revokeGrant(try GrantSelector(wallet: fixture.account.wallet,
-            grantID: "protocol-fixture-grant")))
+        _ = try await fixture.ownerClient.call(.revokeGrant(fixture.grant))
+        let revokedReference = try fixture.reference()
+        let revokedEffects = fixture.chain.counts
+        let revokedKeyReads = fixture.keys.reads
         let denied = try await operation(wire, fixture, id)
         #expect(denied.isError == true && denied.errorCode == "unavailable")
+        let deniedEffect = try await wire.call("create_receive_request", keyed(fixture, 12))
+        #expect(deniedEffect.isError == true && deniedEffect.errorCode == "unavailable")
+        for reply in [denied, deniedEffect] {
+            #expect(reply.fields == ["ok": .bool(false), "error": .object(["code": .string("unavailable")])])
+        }
+        await #expect(throws: AuthorizationFailure.revoked) { try await fixture.openSession() }
+        #expect(try fixture.reference() == revokedReference && fixture.chain.counts == revokedEffects && fixture.keys.reads == revokedKeyReads)
         let after = try #require(try fixture.state().payments.first { $0.id == id })
         #expect(after.canonicalBytes == before.canonicalBytes && after.attempts == before.attempts && after.liabilityUnresolved)
         #expect(try fixture.state().gates.contains { $0.liabilityIDs.contains(id) })
@@ -156,28 +165,61 @@ private func assertPublicWireValue(_ value: MCP.Value) {
 @Test func swiftSDKLostReceiveReplyReconnectsToOneRetainedAllocation() async throws {
     let directory = fixtureDirectory()
     let fixture = try await FixtureRuntime.make(directory: directory, scenario: .autonomous)
-    let first = try await WireSession.connect(client: fixture.client, dropping: "create_receive_request")
+    let first = try await WireSession.connect(session: fixture.openSession(), dropping: "create_receive_request")
+    let dropped = Task { try await first.call("create_receive_request", keyed(fixture, 20)) }
     do {
-        let dropped = Task { try await first.call("create_receive_request", keyed(fixture, 20)) }
         let drop = try #require(first.drop)
         try await wireEventually("The already-produced tool reply must be dropped") { await drop.didDrop }
+        try await wireEventually("The lost receive request must retain its completed allocation") {
+            let state = try fixture.state()
+            guard let request = state.requests.first(where: { $0.method == "create_receive_request" && $0.key == key(20) }) else { return false }
+            return try accountOperationSnapshot(request, in: state).state == .allocated
+        }
+        let retained = try fixture.state()
+        let request = try #require(retained.requests.first { $0.method == "create_receive_request" && $0.key == key(20) })
+        let boundAccount = try accountOperationRequest(request)
+        let retainedAllocation = try JSONDecoder().decode(ReceiveAllocation.self, from: request.result)
+        #expect(boundAccount.accountID == fixture.account.accountID && boundAccount.network == fixture.account.wallet.network.rawValue && boundAccount.requestKey == key(20))
+        #expect(request.originGrantID == fixture.grantID && retainedAllocation.operationID == request.id)
+        #expect(retainedAllocation.accountID == fixture.account.accountID && retainedAllocation.network == fixture.account.wallet.network.rawValue)
         // The host closes its lost-response channel. The SDK explicitly fails its pending call.
         await first.client.disconnect()
         await #expect(throws: (any Error).self) { try await dropped.value }
         await first.close()
-        let second = try await WireSession.connect(client: fixture.client)
+        #expect(!first.admission.connection.isActive)
+        let retiredReference = try fixture.reference()
+        let retiredEffects = fixture.chain.counts
+        let retiredKeyReads = fixture.keys.reads
+        await #expect(throws: ServiceProblem(.unavailable)) {
+            try await first.admission.client.call(.listWallets(try PageRequest()))
+        }
+        await #expect(throws: ServiceProblem(.unavailable)) {
+            try await first.admission.client.call(.createReceiveRequest(try KeyedAccountRequest(
+                account: fixture.account, requestKey: RequestKey(key(21)))))
+        }
+        #expect(try fixture.reference() == retiredReference && fixture.chain.counts == retiredEffects && fixture.keys.reads == retiredKeyReads)
+        let second = try await WireSession.connect(session: fixture.openSession())
         do {
+            #expect(second.admission.connection !== first.admission.connection && second.admission.connection.isActive)
+            let reference = try fixture.reference()
+            let effects = fixture.chain.counts
+            let keyReads = fixture.keys.reads
             let lookup = try await second.call("get_operation", ["account": accountValue(fixture),
                 "effect": .string("createReceiveRequest"), "requestKey": .string(key(20))])
             let id = try #require(lookup.operationID)
             let allocation = try await waitOperation(second, fixture, id, state: "allocated")
-            let reference = try fixture.reference()
-            let effects = fixture.chain.counts
+            #expect(id == request.id && allocation.operationID == id)
+            let identity = try #require(allocation.operation["identity"]?.objectValue)
+            #expect(identity["requestKey"]?.stringValue == key(20))
+            #expect(identity["selector"]?.objectValue?["account"] == accountValue(fixture))
+            #expect(allocation.operation["allocation"] == .object([
+                "address": .string(retainedAllocation.address), "index": .int(Int(retainedAllocation.index))]))
             let replay = try await second.call("create_receive_request", keyed(fixture, 20))
-            #expect(replay.operationID == id && replay.operation["allocation"] == allocation.operation["allocation"])
-            #expect(try fixture.reference() == reference && fixture.chain.counts == effects)
+            #expect(replay.operation["identity"] == allocation.operation["identity"] && replay.operation["allocation"] == allocation.operation["allocation"])
+            #expect(try fixture.reference() == reference && fixture.chain.counts == effects && fixture.keys.reads == keyReads)
             let state = try fixture.state()
             #expect(state.requests.filter { $0.method == "create_receive_request" }.count == 1)
+            #expect(state.requests == retained.requests && state.allocations == retained.allocations)
             #expect(state.allocations.first { $0.branch == "receiving" }?.issuedIndices == [0])
             #expect(fixture.chain.counts.relays == 0)
             await second.close()
@@ -186,6 +228,7 @@ private func assertPublicWireValue(_ value: MCP.Value) {
         try FileManager.default.removeItem(at: directory)
     } catch {
         await first.close()
+        _ = await dropped.result
         await fixture.shutdown()
         try? FileManager.default.removeItem(at: directory)
         throw error
@@ -200,7 +243,7 @@ private func assertPublicWireValue(_ value: MCP.Value) {
         _ = try await wire.call("submit_payment", selector(fixture, id))
         let uncertain = try await waitOperation(wire, fixture, id, state: "uncertain")
         #expect(uncertain.operation["ordinaryAdmissions"]?.stringValue == "1")
-        let foreign = try await WireSession.connect(client: fixture.foreignClient())
+        let foreign = try await WireSession.connect(session: fixture.openForeignSession())
         do {
             let unavailable = try await operation(foreign, fixture, id)
             #expect(unavailable.isError == true && unavailable.errorCode == "unavailable")
@@ -246,7 +289,7 @@ private func assertPublicWireValue(_ value: MCP.Value) {
         await #expect(throws: FixtureFailure.invalidArguments) {
             try await FixtureRuntime.make(directory: directory, scenario: .autonomous)
         }
-        let wire = try await WireSession.connect(client: fixture.client)
+        let wire = try await WireSession.connect(session: fixture.openSession())
         _ = try await wire.call("list_wallets", [:])
         await wire.close()
         await fixture.shutdown()

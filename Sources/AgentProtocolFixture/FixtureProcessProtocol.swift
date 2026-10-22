@@ -14,6 +14,7 @@ struct FixtureControlMessage: Codable, Sendable {
     var runID: UUID? = nil
     var capability: Data? = nil
     var resume: Bool? = nil
+    var recoveryOnly: Bool? = nil
     var epoch: UUID? = nil
     var wallet: WalletScope? = nil
     var expectedRevision: UInt64? = nil
@@ -158,7 +159,7 @@ final class FixtureControlSocket: @unchecked Sendable {
     static func message(_ frame: (UInt8, Data)) throws -> FixtureControlMessage {
         guard frame.0 == 1 else { throw FixtureFailure.invalidArguments }
         let value = try JSONDecoder().decode(FixtureControlMessage.self, from: frame.1)
-        let allowed: Set<String> = ["version", "id", "kind", "namespace", "runID", "capability", "resume", "epoch", "wallet", "expectedRevision", "approvalRequired", "status", "policy", "challenge", "allow", "snapshot", "problem", "phase", "seconds", "wallTime", "operation", "requestKey", "relayContext", "relayReceipt", "grant", "receive", "facts", "page", "accounts", "payments", "previewContext", "payment", "revocation", "grantSelector", "preparation", "lookup", "connection", "controller"]
+        let allowed: Set<String> = ["version", "id", "kind", "namespace", "runID", "capability", "resume", "recoveryOnly", "epoch", "wallet", "expectedRevision", "approvalRequired", "status", "policy", "challenge", "allow", "snapshot", "problem", "phase", "seconds", "wallTime", "operation", "requestKey", "relayContext", "relayReceipt", "grant", "receive", "facts", "page", "accounts", "payments", "previewContext", "payment", "revocation", "grantSelector", "preparation", "lookup", "connection", "controller"]
         guard value.version == 1,
               let object = try JSONSerialization.jsonObject(with: frame.1) as? [String: Any],
               Set(object.keys).isSubset(of: allowed) else { throw FixtureFailure.invalidArguments }
@@ -235,6 +236,8 @@ struct FixtureStoreManifest: Codable, Sendable {
     let runID: UUID
     let directory: FixtureFileIdentity
     let files: [String: FixtureFileIdentity]
+    let syntheticItems: FixtureFileIdentity
+    let grantID: String
     let walletID: String
     let installationID: String
     let accountID: String
@@ -293,55 +296,52 @@ final class FixtureProcessOwnership: @unchecked Sendable {
         guard try FixtureFileIdentity.capture(namespace.path, directory: true) == identity else { throw FixtureFailure.invalidArguments }
         let entries = try Self.names(namespaceFD)
         if !resume {
-            guard entries == ["owner.json"], mkdirat(namespaceFD, "state", 0o700) == 0 else { throw FixtureFailure.invalidArguments }
-        } else {
-            guard entries == ["owner.json", "state", "store.json", "relay-oracle.jsonl"] else { throw FixtureFailure.invalidArguments }
-            let manifest = try storeManifest()
-            let fd = openat(namespaceFD, "state", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-            guard fd >= 0 else { throw FixtureFailure.invalidArguments }
-            stateFD = fd
-            guard manifest.version == 1, manifest.runID == runID,
-                  manifest.directory == (try FixtureFileIdentity.capture(descriptor: fd, directory: true)),
-                  manifest.walletID == "protocol-fixture-wallet", manifest.installationID == "protocol-fixture-installation",
-                  manifest.profile == "bip39-empty/bip44-145-0/v1",
-                  Set(manifest.files.keys) == ["journal.sqlite", "independent-anchor.json", "writer.lock"] else {
-                throw FixtureFailure.invalidArguments
-            }
-            let actual = try Self.names(fd)
-            guard actual.isSubset(of: Set(manifest.files.keys).union(["journal.sqlite-journal"])) else { throw FixtureFailure.invalidArguments }
-            for (name, expected) in manifest.files {
-                let actual = try FixtureFileIdentity.capture(at: fd, name: name, directory: false)
-                if name == "independent-anchor.json" {
-                    // The fixture anchor atomically replaces this fixed owned file. Its bytes
-                    // must be checked by actual continuity, never certified by an old inode.
-                    guard actual.device == expected.device, actual.owner == expected.owner, actual.mode == expected.mode else { throw FixtureFailure.invalidArguments }
-                } else {
-                    guard actual == expected else { throw FixtureFailure.invalidArguments }
-                }
-            }
-            if actual.contains("journal.sqlite-journal") { _ = try FixtureFileIdentity.capture(at: fd, name: "journal.sqlite-journal", directory: false) }
+            // Actual initializeNew owns absent-directory creation. The capability only owns its parent.
+            guard entries == ["owner.json"] else { throw FixtureFailure.invalidArguments }
+            return
         }
+        guard entries == ["owner.json", "state", "store.json", "relay-oracle.jsonl", "synthetic-keychain.json"] else { throw FixtureFailure.invalidArguments }
+        let manifest = try storeManifest()
+        let fd = openat(namespaceFD, "state", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { throw FixtureFailure.invalidArguments }
+        stateFD = fd
+        guard manifest.version == 1, manifest.runID == runID,
+              manifest.directory == (try FixtureFileIdentity.capture(descriptor: fd, directory: true)),
+              UUID(uuidString: manifest.walletID) != nil, UUID(uuidString: manifest.installationID) != nil,
+              !manifest.grantID.isEmpty, manifest.profile == "bip39-empty/bip44-145-0/v1",
+              Set(manifest.files.keys) == ["journal.sqlite", "custody.scope", "writer.lock"] else {
+            throw FixtureFailure.invalidArguments
+        }
+        let actual = try Self.names(fd)
+        guard actual.isSubset(of: Set(manifest.files.keys).union(["journal.sqlite-journal"])) else { throw FixtureFailure.invalidArguments }
+        for (name, expected) in manifest.files {
+            guard try FixtureFileIdentity.capture(at: fd, name: name, directory: false) == expected else { throw FixtureFailure.invalidArguments }
+        }
+        // Synthetic custody persists by atomic replacement. Independent item content and scope
+        // are checked by the injected Security adapter and actual service startup, never an old inode.
+        let items = try FixtureFileIdentity.capture(at: namespaceFD, name: "synthetic-keychain.json", directory: false)
+        guard items.device == manifest.syntheticItems.device, items.owner == manifest.syntheticItems.owner,
+              items.mode == manifest.syntheticItems.mode else { throw FixtureFailure.invalidArguments }
+        if actual.contains("journal.sqlite-journal") { _ = try FixtureFileIdentity.capture(at: fd, name: "journal.sqlite-journal", directory: false) }
+        guard try FixtureFileIdentity.capture(descriptor: fd, directory: true) == FixtureFileIdentity.capture(directory.path, directory: true) else { throw FixtureFailure.invalidArguments }
+    }
+    func storeManifest() throws -> FixtureStoreManifest {
+        try JSONDecoder().decode(FixtureStoreManifest.self, from: Self.readAt(namespaceFD, name: "store.json", maximum: 8192))
+    }
+    func seal(walletID: String, installationID: String, accountID: String, profile: String,
+              grantID: String = "protocol-fixture-grant") throws {
+        let names = ["journal.sqlite", "custody.scope", "writer.lock"]
         if stateFD == nil {
             let fd = openat(namespaceFD, "state", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
             guard fd >= 0 else { throw FixtureFailure.invalidArguments }; stateFD = fd
         }
         guard let stateFD,
-              try FixtureFileIdentity.capture(descriptor: stateFD, directory: true) == FixtureFileIdentity.capture(directory.path, directory: true) else {
-            throw FixtureFailure.invalidArguments
-        }
-    }
-    func storeManifest() throws -> FixtureStoreManifest {
-        try JSONDecoder().decode(FixtureStoreManifest.self, from: Self.readAt(namespaceFD, name: "store.json", maximum: 8192))
-    }
-    func seal(walletID: String, installationID: String, accountID: String, profile: String) throws {
-        let names = ["journal.sqlite", "independent-anchor.json", "writer.lock"]
-        guard let stateFD else { throw FixtureFailure.invalidArguments }
+              try FixtureFileIdentity.capture(descriptor: stateFD, directory: true) == FixtureFileIdentity.capture(directory.path, directory: true) else { throw FixtureFailure.invalidArguments }
         let files = try Dictionary(uniqueKeysWithValues: names.map { ($0, try FixtureFileIdentity.capture(at: stateFD, name: $0, directory: false)) })
         let manifest = FixtureStoreManifest(version: 1, runID: runID,
             directory: try FixtureFileIdentity.capture(descriptor: stateFD, directory: true), files: files,
-            walletID: walletID, installationID: installationID, accountID: accountID, profile: profile)
-        // Immutable ownership metadata is created once. Continuity validates later atomic
-        // anchor replacements; restart/relay phases never rewrite this manifest.
+            syntheticItems: try FixtureFileIdentity.capture(at: namespaceFD, name: "synthetic-keychain.json", directory: false),
+            grantID: grantID, walletID: walletID, installationID: installationID, accountID: accountID, profile: profile)
         guard try !Self.names(namespaceFD).contains("store.json") else { throw FixtureFailure.invalidArguments }
         try writeRootNew(JSONEncoder().encode(manifest), name: "store.json")
     }

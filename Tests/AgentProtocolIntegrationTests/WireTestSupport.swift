@@ -72,21 +72,22 @@ final class WireSession: Sendable {
     let client: MCP.Client
     let server: MCPToolServer
     let drop: DropToolReplyTransport?
-    private init(client: MCP.Client, server: MCPToolServer, drop: DropToolReplyTransport?) {
-        self.client = client; self.server = server; self.drop = drop
+    let admission: FixtureClientSession
+    private init(client: MCP.Client, server: MCPToolServer, drop: DropToolReplyTransport?, admission: FixtureClientSession) {
+        self.client = client; self.server = server; self.drop = drop; self.admission = admission
     }
-    static func connect(client capability: CapabilityClient, dropping tool: String? = nil) async throws -> WireSession {
+    static func connect(session admission: FixtureClientSession, dropping tool: String? = nil) async throws -> WireSession {
         let pair = await MCP.InMemoryTransport.createConnectedPair()
-        let server = MCPToolServer(client: capability)
+        let server = MCPToolServer(client: admission.client)
         let drop = tool.map { DropToolReplyTransport(base: pair.server, tool: $0) }
-        if let drop { try await server.start(transport: drop) }
-        else { try await server.start(transport: pair.server) }
         let client = MCP.Client(name: "OpalAgent synthetic integration", version: "1.0.0")
         do {
+            if let drop { try await server.start(transport: drop) }
+            else { try await server.start(transport: pair.server) }
             let initialized = try await client.connect(transport: pair.client)
             #expect(initialized.protocolVersion == "2025-11-25")
-            return WireSession(client: client, server: server, drop: drop)
-        } catch { await client.disconnect(); await server.stop(); throw error }
+            return WireSession(client: client, server: server, drop: drop, admission: admission)
+        } catch { await admission.close(); await client.disconnect(); await server.stop(); throw error }
     }
     func call(_ name: String, _ arguments: [String: MCP.Value]) async throws -> WireReply {
         let context = try await client.send(CallTool.request(.init(name: name, arguments: arguments)))
@@ -100,6 +101,7 @@ final class WireSession: Sendable {
         return WireReply(fields: fields, isError: reply.isError)
     }
     func close() async {
+        await admission.close()
         await client.disconnect()
         await server.stop()
         await server.waitUntilCompleted()

@@ -18,12 +18,14 @@ import AgentMCP
                 tracePath: options.trace)
             let server = MCPToolServer(client: runtime.client)
             do {
-                try await server.start(transport: BoundedStdioTransport())
+                try await server.start(transport: FixtureStdioLifetime(ended: { await runtime.shutdown() }))
                 await server.waitUntilCompleted()
                 await runtime.shutdown()
             } catch {
+                let drain = await runtime.beginShutdown()
+                await runtime.releaseFixtureFaults()
+                await drain.value
                 await server.stop()
-                await runtime.shutdown()
                 throw error
             }
         } catch {

@@ -11,50 +11,74 @@ import Testing
 @testable import AgentProtocolFixture
 @testable import AgentServiceCore
 
+private enum FixtureLaunchMode {
+    case controlled
+    case ordinary(directory: URL, trace: URL)
+}
+
 private final class OwnedFixtureChild: @unchecked Sendable {
     let pid: pid_t
-    let control: FixtureControlSocket
+    private let controlSocket: FixtureControlSocket?
+    var control: FixtureControlSocket {
+        get throws {
+            guard let controlSocket else { throw WireFixtureFailure.invalidReply }
+            return controlSocket
+        }
+    }
     let input: Int32
     let output: Int32
     private let lock = NSLock()
     private var joined = false
-    private var pipesClosed = false
+    private var inputClosed = false
+    private var outputClosed = false
     private var events: [FixtureControlMessage] = []
     private var consentNonces = Set<UUID>()
-    private static let eventKinds: Set<String> = ["relayEntered", "phaseReached", "admissionClosed", "shutdownComplete"]
-    private init(pid: pid_t, control: FixtureControlSocket, input: Int32, output: Int32) {
-        self.pid = pid; self.control = control; self.input = input; self.output = output
+    private static let eventKinds: Set<String> = ["relayEntered", "phaseReached", "admissionClosed", "shutdownComplete", "assemblyDrained"]
+    private init(pid: pid_t, control: FixtureControlSocket?, input: Int32, output: Int32) {
+        self.pid = pid; self.controlSocket = control; self.input = input; self.output = output
     }
-    static func launch(executable: URL) throws -> OwnedFixtureChild {
-        var sockets: [Int32] = [0, 0], input: [Int32] = [0, 0], output: [Int32] = [0, 0]
-        guard socketpair(AF_UNIX, SOCK_STREAM, 0, &sockets) == 0, pipe(&input) == 0, pipe(&output) == 0 else {
-            throw WireFixtureFailure.invalidReply
+    static func launch(executable: URL, mode: FixtureLaunchMode = .controlled) throws -> OwnedFixtureChild {
+        var sockets: [Int32] = [-1, -1], input: [Int32] = [-1, -1], output: [Int32] = [-1, -1]
+        var sourceFDs: [Int32] = [], transferred = Set<Int32>()
+        defer {
+            for fd in sockets + input + output + sourceFDs where fd >= 0 && !transferred.contains(fd) { Darwin.close(fd) }
         }
+        let arguments: [String]
+        var targets: [Int32] = [STDIN_FILENO, STDOUT_FILENO]
+        switch mode {
+        case .controlled:
+            guard socketpair(AF_UNIX, SOCK_STREAM, 0, &sockets) == 0 else { throw WireFixtureFailure.invalidReply }
+            arguments = [executable.path, "--test-control-fd", "3"]
+            targets.append(3)
+        case .ordinary(let directory, let trace):
+            arguments = [executable.path, "--state-directory", directory.path, "--scenario", "uncertain", "--trace-file", trace.path]
+        }
+        guard pipe(&input) == 0, pipe(&output) == 0 else { throw WireFixtureFailure.invalidReply }
         // Sources >=10 keep file-action dup2 order independent of inherited descriptor numbering.
-        let sourceFDs = try [input[0], output[1], sockets[1]].map { fd -> Int32 in
+        let sources = [input[0], output[1]] + (sockets[1] >= 0 ? [sockets[1]] : [])
+        for fd in sources {
             let copy = fcntl(fd, F_DUPFD_CLOEXEC, 10)
-            guard copy >= 0 else { throw WireFixtureFailure.invalidReply }; return copy
+            guard copy >= 0 else { throw WireFixtureFailure.invalidReply }
+            sourceFDs.append(copy)
         }
-        Darwin.close(input[0]); Darwin.close(output[1]); Darwin.close(sockets[1])
         var actions: posix_spawn_file_actions_t?
         var attributes: posix_spawnattr_t?
         posix_spawn_file_actions_init(&actions); posix_spawnattr_init(&attributes)
-        defer { posix_spawn_file_actions_destroy(&actions); posix_spawnattr_destroy(&attributes); sourceFDs.forEach { Darwin.close($0) } }
-        for (source, target) in zip(sourceFDs, [STDIN_FILENO, STDOUT_FILENO, 3]) {
+        defer { posix_spawn_file_actions_destroy(&actions); posix_spawnattr_destroy(&attributes) }
+        for (source, target) in zip(sourceFDs, targets) {
             guard posix_spawn_file_actions_adddup2(&actions, source, target) == 0 else { throw WireFixtureFailure.invalidReply }
         }
         _ = posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0)
         posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_CLOEXEC_DEFAULT))
-        let arguments = [executable.path, "--test-control-fd", "3"].map { strdup($0) }
+        let argvStrings = arguments.map { strdup($0) }
         let environment = ["PATH=/usr/bin:/bin", "TMPDIR=" + FileManager.default.temporaryDirectory.resolvingSymlinksInPath().path].map { strdup($0) }
-        defer { arguments.forEach { free($0) }; environment.forEach { free($0) } }
-        var argv = arguments + [nil], env = environment + [nil], pid: pid_t = 0
-        let result = posix_spawn(&pid, executable.path, &actions, &attributes, &argv, &env)
-        guard result == 0 else {
-            for fd in [input[1], output[0], sockets[0]] { Darwin.close(fd) }
-            throw WireFixtureFailure.invalidReply
-        }
-        return try OwnedFixtureChild(pid: pid, control: FixtureControlSocket(descriptor: sockets[0]), input: input[1], output: output[0])
+        defer { argvStrings.forEach { free($0) }; environment.forEach { free($0) } }
+        var argv = argvStrings + [nil], env = environment + [nil], pid: pid_t = 0
+        let control = sockets[0] >= 0 ? try FixtureControlSocket(descriptor: sockets[0]) : nil
+        if control != nil { transferred.insert(sockets[0]) } // The socket object now owns this descriptor, including spawn failure.
+        guard posix_spawn(&pid, executable.path, &actions, &attributes, &argv, &env) == 0 else { throw WireFixtureFailure.invalidReply }
+        transferred.formUnion([input[1], output[0]])
+        return OwnedFixtureChild(pid: pid, control: control, input: input[1], output: output[0])
     }
     func bootstrap(_ ownership: FixtureProcessOwnership, resume: Bool, credential: Data? = nil, wallTime: Int64? = nil,
                    recoveryOnly: Bool = false) async throws -> FixtureControlMessage {
@@ -131,7 +155,7 @@ private final class OwnedFixtureChild: @unchecked Sendable {
             let result = waitpid(pid, &status, WNOHANG)
             if result == pid {
                 lock.withLock { joined = true }
-                control.close()
+                controlSocket?.close()
                 return status
             }
             guard result == 0 || (result < 0 && errno == EINTR) else { throw WireFixtureFailure.invalidReply }
@@ -140,8 +164,13 @@ private final class OwnedFixtureChild: @unchecked Sendable {
         throw WireFixtureFailure.deadline
     }
     func close() async throws -> Int32 { try control.send(FixtureControlMessage(kind: "close")); return try await join() }
+    /// Only the parent write end changes here; stdout and the independent control route stay open.
+    func closeInput() {
+        lock.withLock { guard !inputClosed else { return }; inputClosed = true; Darwin.close(input) }
+    }
     func closePipes() {
-        lock.withLock { guard !pipesClosed else { return }; pipesClosed = true; Darwin.close(input); Darwin.close(output) }
+        closeInput()
+        lock.withLock { guard !outputClosed else { return }; outputClosed = true; Darwin.close(output) }
     }
     func terminateIfRunning() async {
         if !lock.withLock({ joined }) { _ = try? await join(signal: SIGKILL) }
@@ -161,6 +190,72 @@ private final class OwnedFixtureChild: @unchecked Sendable {
             }
         }
         closePipes()
+    }
+}
+
+/// Serializes the final parent write with every SDK send before transferring stdin to EOF.
+/// Disconnect still joins borrowed-FD activity; it never supplies the asserted EOF trigger.
+private actor HalfClosingProcessTransport: MCP.Transport {
+    nonisolated let logger = MCP.InMemoryTransport().logger
+    private let child: OwnedFixtureChild
+    private let base: BoundedStdioTransport
+    private var inputEnding = false
+    private var activeSends = 0
+    private var sendsDrained: CheckedContinuation<Void, Never>?
+    private var reader: Task<Void, Never>?
+    init(_ child: OwnedFixtureChild) {
+        self.child = child
+        base = BoundedStdioTransport(inputDescriptor: child.output, outputDescriptor: child.input)
+    }
+    func connect() async throws { try await base.connect() }
+    func send(_ data: Data) async throws {
+        guard !inputEnding else { throw MCPError.connectionClosed }
+        activeSends += 1
+        defer {
+            activeSends -= 1
+            if activeSends == 0 { sendsDrained?.resume(); sendsDrained = nil }
+        }
+        try await base.send(data)
+    }
+    func receive() -> AsyncThrowingStream<Data, any Error> {
+        let base = self.base
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    for try await bytes in await base.receive() {
+                        try Task.checkCancellation()
+                        continuation.yield(bytes)
+                    }
+                    continuation.finish()
+                } catch { continuation.finish(throwing: error) }
+            }
+            reader = task
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+    func finishInput(unterminatedFrame: Data? = nil) async throws {
+        guard !inputEnding else { return }
+        inputEnding = true
+        if activeSends > 0 { await withCheckedContinuation { sendsDrained = $0 } }
+        if let frame = unterminatedFrame {
+            try #require(!frame.isEmpty && frame.count <= MCPBounds.inputBytes && !frame.contains(10))
+            let deadline = ContinuousClock.now + .seconds(5)
+            var offset = 0
+            while offset < frame.count {
+                try #require(ContinuousClock.now < deadline)
+                let count = frame.withUnsafeBytes { Darwin.write(child.input, $0.baseAddress!.advanced(by: offset), frame.count - offset) }
+                if count > 0 { offset += count }
+                else if count < 0 && [EAGAIN, EWOULDBLOCK, EINTR].contains(errno) { await Task.yield() }
+                else { throw WireFixtureFailure.invalidReply }
+            }
+        }
+        child.closeInput()
+    }
+    func disconnect() async {
+        reader?.cancel()
+        await base.disconnect()
+        await reader?.value
+        reader = nil
     }
 }
 
@@ -657,6 +752,187 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
             #expect(try writerLeaseAvailable(ownership, identity: writer))
             try appendProcessProof(scenario: "graceful-stop-held-relay-drain", children: [(child.pid, ready.epoch!)],
                 snapshot: after.0, generation: facts.generation, bytesEqual: bytesRetained, lookupDelta: 0, exits: [closed], facts: facts)
+        }
+        try FileManager.default.removeItem(at: ownership.namespace)
+    }
+
+    @Test(arguments: [false, true])
+    func ordinaryCLIStdinEOFCompletesAndPreservesOnlyTerminatedReceiveRequests(_ incompleteFinalFrame: Bool) async throws {
+        let parent = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+        let directory = parent.appendingPathComponent("opal-process-cli-" + UUID().uuidString)
+        let trace = directory.appendingPathComponent("trace.jsonl")
+        let child = try OwnedFixtureChild.launch(executable: fixtureExecutable(), mode: .ordinary(directory: directory, trace: trace))
+        let transport = HalfClosingProcessTransport(child)
+        try await withProcessSDK(child, name: "Ordinary CLI input EOF", transport: transport) { client in
+            let wallets = try await processCall(client, name: "list_wallets", arguments: [:])
+            let wallet = try #require(wallets.result["items"]?.arrayValue?.first?.objectValue?["scope"])
+            let accounts = try await processCall(client, name: "list_accounts", arguments: ["wallet": wallet, "page": .object([:])])
+            let account = try #require(accounts.result["page"]?.objectValue?["items"]?.arrayValue?.first?.objectValue?["scope"])
+            let scope = try JSONDecoder().decode(AccountScope.self, from: JSONEncoder().encode(account))
+            let requestKey = key(110), incompleteKey = key(111)
+            let created = try await processCall(client, name: "create_receive_request", arguments: ["account": account, "requestKey": .string(requestKey)])
+            let operationID = try #require(created.operationID)
+            let lookup = try retainedLookup(scope, key: requestKey, effect: "createReceiveRequest")
+            try await wireEventually("Ordinary CLI must retain the completed allocation before stdin EOF") {
+                try await processCall(client, name: "get_operation", arguments: lookup).operation["state"]?.stringValue == "allocated"
+            }
+            let allocated = try await processCall(client, name: "get_operation", arguments: lookup)
+            let address = try #require(allocated.operation["allocation"]?.objectValue?["address"]?.stringValue)
+            let index = try #require(allocated.operation["allocation"]?.objectValue?["index"]?.intValue)
+            let allocationIndex = try #require(UInt32(exactly: index))
+            let directoryIdentity = try FixtureFileIdentity.capture(directory.path, directory: true)
+            let candidate: MCP.Value = .object(["jsonrpc": .string("2.0"), "id": .string("unterminated-final-receive"),
+                "method": .string("tools/call"), "params": .object(["name": .string("create_receive_request"),
+                    "arguments": .object(["account": account, "requestKey": .string(incompleteKey)])])])
+            let frame = try JSONEncoder().encode(candidate)
+            // This is a valid effect request except for the missing stdio newline, not malformed JSON.
+            #expect(try JSONDecoder().decode(MCP.Value.self, from: frame) == candidate)
+            try await transport.finishInput(unterminatedFrame: incompleteFinalFrame ? frame : nil)
+            #expect(fcntl(child.output, F_GETFD) >= 0)
+            // No SDK disconnect, control request, cancellation or signal establishes this exit.
+            let exit = try await child.join()
+            #expect(exit == 0)
+            #expect(try FixtureFileIdentity.capture(directory.path, directory: true) == directoryIdentity)
+            let state: CanonicalState
+            do {
+                let journal = try SQLiteJournal(path: directory.appendingPathComponent("state/journal.sqlite").path, createIfMissing: false)
+                state = try #require(try journal.read())
+            }
+            let receives = state.requests.filter { $0.method == "create_receive_request" }
+            try #require(receives.count == 1)
+            let retained = try #require(receives.first)
+            let result = try JSONDecoder().decode(ReceiveAllocation.self, from: retained.result)
+            #expect(retained.id == operationID && retained.key == requestKey && retained.disposition == .closed)
+            #expect(result.operationID == operationID && result.accountID == scope.accountID && result.network == scope.wallet.network.rawValue)
+            #expect(result.address == address && result.index == allocationIndex)
+            #expect(!state.requests.contains { $0.key == incompleteKey })
+            let issuance = try #require(state.allocations.first { $0.accountID == scope.accountID && $0.branch == "receiving" })
+            #expect(issuance.issuedIndices == [UInt64(allocationIndex)] && issuance.issuedHighWater == UInt64(allocationIndex))
+            #expect(state.allocations.count == 1 && state.payments.isEmpty && state.gates.isEmpty)
+            let events = try String(contentsOf: trace, encoding: .utf8).split(separator: "\n").map {
+                try JSONDecoder().decode([String: MCP.Value].self, from: Data($0.utf8))
+            }
+            #expect(events.first?["event"]?.stringValue == "fixture-ready" && events.last?["event"]?.stringValue == "fixture-stop")
+            #expect(events.allSatisfy { $0["relayCount"]?.intValue == 0 })
+            #expect(events.filter { $0["method"]?.stringValue == "create_receive_request" }.count == 1)
+        }
+        try FileManager.default.removeItem(at: directory)
+    }
+
+    @Test func stdinEOFClosesAdmissionAndDrainsHeldRelayBeforeFreshReopen() async throws {
+        let ownership = try ownedNamespace(), executable = try fixtureExecutable()
+        let first = try OwnedFixtureChild.launch(executable: executable)
+        let ready = try await first.bootstrap(ownership, resume: false)
+        let credential = try await first.control.receiveAsync(); try #require(credential.0 == 2 && credential.1.count == 32)
+        let scope = try #require(ready.snapshot?.account), firstEpoch = try #require(ready.epoch), requestKey = key(112)
+        let transport = HalfClosingProcessTransport(first)
+        try await withProcessSDK(first, name: "Stdin EOF retains held relay ownership", transport: transport) { client in
+            let id = try await prepareProcessPayment(first, client, scope: scope, key: requestKey)
+            let lookup = try retainedLookup(scope, key: requestKey)
+            _ = try await processCall(client, name: "submit_payment", arguments: ["account": try processAccount(scope), "operationID": .string(id)])
+            _ = try await first.event("relayEntered")
+            let original = try await processCall(client, name: "get_operation", arguments: lookup)
+            let originalAttempt = try #require(original.operation["latestAttempt"]?.objectValue)
+            let attemptID = try #require(originalAttempt["attemptID"]?.stringValue)
+            let transactionID = try #require(original.operation["transactionID"]?.stringValue)
+            let before = try await first.snapshot()
+            #expect(before.0.paymentID == id && before.0.requestKey == requestKey && before.0.state == "submitting")
+            #expect(before.0.totalAdmissions == 1 && before.0.ordinaryAdmissions == 1 && before.0.relayEntries == 1 && before.0.gateHeld)
+            try #require(!before.1.isEmpty && !attemptID.isEmpty && !transactionID.isEmpty)
+            #expect(before.0.byteDigest == FixtureRelayOracle.digest(before.1))
+            #expect(originalAttempt["number"]?.stringValue == "1" && original.operation["liabilityUnresolved"]?.boolValue == true)
+            #expect(original.operation["accountRestriction"]?.stringValue == "held")
+            let writer = try FixtureFileIdentity.capture(ownership.directory.appendingPathComponent("writer.lock").path, directory: false)
+            let oraclePath = ownership.namespace.appendingPathComponent("relay-oracle.jsonl")
+            let oracle = try FixtureProcessOwnership.readOwned(oraclePath, maximum: 16_384)
+            let entries = oracle.split(separator: 10)
+            try #require(entries.count == 1)
+            let entry = try JSONDecoder().decode([String: MCP.Value].self, from: Data(try #require(entries.first)))
+            #expect(entry["version"]?.intValue == 1 && entry["ordinal"]?.intValue == 1 && entry["attempt"]?.intValue == 1)
+            #expect(entry["operationID"]?.stringValue == id && entry["digest"]?.stringValue == before.0.byteDigest && entry["epoch"]?.stringValue == firstEpoch.uuidString)
+            try await transport.finishInput()
+            let closed = try await first.event("admissionClosed", phase: "stdio-ended")
+            #expect(closed.epoch == firstEpoch)
+            #expect(fcntl(first.output, F_GETFD) >= 0)
+            // The same authenticated handle was valid immediately before EOF. Control stays open.
+            var probe = FixtureControlMessage(kind: "integrationLookup")
+            probe.connection = "original"; probe.lookup = .request(account: scope, effect: .preparePayment, key: try RequestKey(requestKey))
+            try first.control.send(probe)
+            let unavailable = try await first.response(id: probe.id)
+            #expect(unavailable.kind == "problem" && unavailable.problem == "unavailable")
+            let held = try await first.snapshot()
+            #expect(held.0.state == "submitting" && held.0.stateDigest == before.0.stateDigest && held.1 == before.1)
+            #expect(try !writerLeaseAvailable(ownership, identity: writer))
+            #expect(try FixtureProcessOwnership.readOwned(oraclePath, maximum: 16_384) == oracle)
+            // Only this explicit action releases the cancellation-insensitive synthetic transport.
+            _ = try await first.command("releaseRelay")
+            let drained = try await first.event("assemblyDrained", phase: "stdio-ended")
+            #expect(drained.epoch == firstEpoch)
+            #expect(try writerLeaseAvailable(ownership, identity: writer))
+            let afterDrain = try await first.snapshot(), drainedFacts = try await first.facts()
+            #expect(afterDrain.0.state == "uncertain" && afterDrain.0.paymentID == id && afterDrain.0.requestKey == requestKey)
+            #expect(afterDrain.1 == before.1 && afterDrain.0.byteDigest == before.0.byteDigest && afterDrain.0.gateHeld)
+            #expect(afterDrain.0.totalAdmissions == 1 && afterDrain.0.ordinaryAdmissions == 1 && afterDrain.0.relayEntries == 1)
+            #expect(try FixtureProcessOwnership.readOwned(oraclePath, maximum: 16_384) == oracle)
+            // Cleanup starts only after actual EOF admission closure, relay completion and writer release.
+            let firstExit = try await first.close(); #expect(firstExit == 0)
+            await client.disconnect()
+            let retained: CanonicalState
+            do {
+                let journal = try SQLiteJournal(path: ownership.directory.appendingPathComponent("journal.sqlite").path, createIfMissing: false)
+                retained = try #require(try journal.read())
+            }
+            let payment = try #require(retained.payments.first { $0.id == id })
+            #expect(payment.disposition == .uncertain && payment.liabilityUnresolved && payment.canonicalBytes == before.1)
+            #expect(payment.attempts.count == 1 && payment.attempts.first?.id == attemptID && payment.transactionID == transactionID)
+            #expect(retained.requests.filter { $0.paymentID == id && $0.method == "prepare_payment" }.count == 1)
+            let second = try OwnedFixtureChild.launch(executable: executable)
+            let restarted = try await second.bootstrap(ownership, resume: true, credential: credential.1)
+            let secondEpoch = try #require(restarted.epoch)
+            #expect(secondEpoch != firstEpoch && restarted.problem == nil)
+            try await wireEventually("Fresh EOF reopen continuation must settle before observational baselines") {
+                try await second.facts().blocker == "relayNotEligible"
+            }
+            let baseline = try await second.snapshot(), facts = try await second.facts()
+            #expect(facts.blocker == "relayNotEligible" && facts.generation == drainedFacts.generation)
+            try await withProcessSDK(second, name: "Fresh authenticated assembly after stdin EOF") { next in
+                let result = try await processCall(next, name: "get_operation", arguments: lookup)
+                #expect(result.isError != true && result.operationID == id && result.operation["state"]?.stringValue == "uncertain")
+                #expect(result.operation["identity"] == original.operation["identity"] && result.operation["request"] == original.operation["request"])
+                #expect(result.operation["transactionID"]?.stringValue == transactionID && result.operation["latestAttempt"]?.objectValue?["attemptID"]?.stringValue == attemptID)
+                #expect(result.operation["liabilityUnresolved"]?.boolValue == true && result.operation["accountRestriction"]?.stringValue == "held")
+                let after = try await second.snapshot(), afterFacts = try await second.facts()
+                #expect(after.1 == before.1 && baseline.1 == before.1 && after.0.byteDigest == before.0.byteDigest)
+                #expect(after.0.stateDigest == baseline.0.stateDigest && after.0.totalAdmissions == 1 && after.0.ordinaryAdmissions == 1 && after.0.relayEntries == 1 && after.0.gateHeld)
+                #expect(afterFacts.keyReads == facts.keyReads && afterFacts.chainQueries == facts.chainQueries && afterFacts.blocker == "relayNotEligible")
+                #expect(try FixtureProcessOwnership.readOwned(oraclePath, maximum: 16_384) == oracle)
+                let secondExit = try await second.close(); #expect(secondExit == 0)
+                await next.disconnect()
+                let reopened: CanonicalState
+                do {
+                    let journal = try SQLiteJournal(path: ownership.directory.appendingPathComponent("journal.sqlite").path, createIfMissing: false)
+                    reopened = try #require(try journal.read())
+                }
+                let row = try #require(reopened.payments.first { $0.id == id })
+                // Reconciliation may add evidence/blockers; the retained immutable payment contract cannot change.
+                #expect(row.id == payment.id && row.accountID == payment.accountID && row.network == payment.network)
+                #expect(row.originGrantID == payment.originGrantID && row.originCredentialGeneration == payment.originCredentialGeneration)
+                #expect(row.walletGeneration == payment.walletGeneration && row.policyRevision == payment.policyRevision)
+                #expect(row.request == payment.request && row.preview == payment.preview)
+                #expect(row.canonicalBytes == payment.canonicalBytes && row.transactionDigest == payment.transactionDigest && row.transactionID == payment.transactionID)
+                #expect(row.selectedInputs == payment.selectedInputs && row.change == payment.change && row.attempts == payment.attempts)
+                #expect(row.ordinaryAdmissions == payment.ordinaryAdmissions && row.disposition == .uncertain && row.liabilityUnresolved)
+                #expect(reopened.requests == retained.requests && reopened.gates == retained.gates && reopened.allocations == retained.allocations)
+                #expect(reopened.installationID == retained.installationID && reopened.authorization == retained.authorization && reopened.custody == retained.custody)
+                #expect(reopened.payments.count == retained.payments.count && payment.evidence.allSatisfy { row.evidence.contains($0) })
+                #expect(payment.closures.allSatisfy { row.closures.contains($0) })
+                #expect(try FixtureProcessOwnership.readOwned(oraclePath, maximum: 16_384) == oracle)
+                #expect(try writerLeaseAvailable(ownership, identity: writer))
+                try appendProcessProof(scenario: "stdin-eof-held-relay-drain-reopen", children: [(first.pid, firstEpoch), (second.pid, secondEpoch)],
+                    snapshot: after.0, generation: drainedFacts.generation, bytesEqual: after.1 == before.1,
+                    lookupDelta: after.0.totalAdmissions - baseline.0.totalAdmissions + after.0.relayEntries - baseline.0.relayEntries,
+                    exits: [firstExit, secondExit], facts: afterFacts)
+            }
         }
         try FileManager.default.removeItem(at: ownership.namespace)
     }

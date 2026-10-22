@@ -319,10 +319,17 @@ final class FixtureProcessSession: @unchecked Sendable {
         let server = MCPToolServer(client: runtime.client)
         try await server.start(transport: FixtureStdioLifetime(ended: {
             let drain = await self.startShutdown()
+            // Input termination also covers errors/cancellation; the parent proves OS-pipe EOF.
+            var closed = FixtureControlMessage(kind: "admissionClosed")
+            closed.epoch = self.epoch; closed.phase = "stdio-ended"
+            try? self.socket.send(closed)
             await self.consent.cancel()
             // The owned control reader can still release a held synthetic boundary.
             // EOF closes admission but does not silently satisfy that separate test action.
             await drain.value
+            var drained = FixtureControlMessage(kind: "assemblyDrained")
+            drained.epoch = self.epoch; drained.phase = "stdio-ended"
+            try? self.socket.send(drained)
         }))
         var requests: [Task<Void, Never>] = []
         do {

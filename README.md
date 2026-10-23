@@ -26,7 +26,7 @@ Requires macOS 27.0, Xcode 27 and Swift 6.4. The products are:
 
 `AgentServiceCore` is an internal target with no library product. It uses the public `OpalBaseCore` ordinary-BCH product and system SQLite through `CSQLite`. Client and bridge cannot import the engine through a public product. `AgentAppIntents` imports only the public client/values and Apple frameworks, with no engine, Base, SQLite or MCP SDK dependency. `AgentMCP` owns the official MCP SDK dependency; the public values/client and native wire targets have no SDK, Base or SQLite dependency. The bridge does not link the engine or privacy integrations.
 
-The package pins public OpalBase revision `efcb644de6dc2f0cbcca6c805367dfadb42d251e`, which provides `OpalBaseCore`. The official Swift MCP SDK is pinned to exact version `0.12.1` (revision `a0ae212ebf6eab5f754c3129608bc5557637e605`). Agent-owned observations use public OpalDiagnostics revision `97dfa7674ea3a25147a025b9c66fd65bff74fb0e`, already shared by the foundation packages. The direct `develop` requirement matches their compatible requirement; the root `Package.resolved` retains the exact canonical public dependency graph.
+The package pins public OpalBase revision `8586fbe8f3d313061a2218706170d9d8f0e928d2`, which provides `OpalBaseCore`. The official Swift MCP SDK is pinned to exact version `0.12.1` (revision `a0ae212ebf6eab5f754c3129608bc5557637e605`). Agent-owned observations use public OpalDiagnostics revision `97dfa7674ea3a25147a025b9c66fd65bff74fb0e`, already shared by the foundation packages. The direct `develop` requirement matches their compatible requirement; the root `Package.resolved` retains the exact canonical public dependency graph.
 
 ## Build and test
 

@@ -14,7 +14,7 @@ let package = Package(
         .executable(name: "AgentProtocolFixture", targets: ["AgentProtocolFixture"])
     ],
     dependencies: [
-        .package(url: "https://github.com/58opals/OpalBase.git", revision: "8586fbe8f3d313061a2218706170d9d8f0e928d2"),
+        .package(url: "https://github.com/58opals/OpalBase.git", revision: "d81c9b193a37704eca15b9235250dd02907910da"),
         .package(url: "https://github.com/58opals/OpalDiagnostics.git", branch: "develop")
     ],
     targets: [

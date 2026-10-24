@@ -23,7 +23,7 @@ import AgentMCP
             do {
                 try await server.start(transport: transport)
                 await server.waitUntilCompleted()
-                // SDK receive completion does not join every response-send task.
+                // Reader completion is followed by joining all owned request tasks.
                 await transport.disconnect()
                 await runtime.shutdown()
             } catch {

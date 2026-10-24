@@ -1,6 +1,5 @@
 import Darwin
 import Foundation
-import MCP
 import OpalDiagnostics
 import Testing
 @testable import AgentMCP
@@ -63,14 +62,14 @@ private actor BrokenOutputResults {
                 do {
                     for try await _ in await transport.receive() {}
                     await results.finishReceive(false)
-                } catch MCPError.connectionClosed { await results.finishReceive(true) }
+                } catch MCPTransportError.connectionClosed { await results.finishReceive(true) }
                 catch { await results.finishReceive(false) }
             }
             sender = Task {
                 do {
                     try await transport.send(Data("{\"id\":1}".utf8))
                     await results.finishSend(false)
-                } catch MCPError.connectionClosed { await results.finishSend(true) }
+                } catch MCPTransportError.connectionClosed { await results.finishSend(true) }
                 catch { await results.finishSend(false) }
             }
             let completed = try await results.waitForCompletion()
@@ -80,7 +79,7 @@ private actor BrokenOutputResults {
             #expect(records.count == 1)
             #expect(records.first?.event.rawValue == "transport_failed")
             #expect(records.first?.fields == [.publicField("reason", value: "write")])
-            await #expect(throws: MCPError.self) { try await transport.send(Data("{\"id\":2}".utf8)) }
+            await #expect(throws: MCPTransportError.self) { try await transport.send(Data("{\"id\":2}".utf8)) }
             #expect(OpalDiagnostics.configuration == configuration)
         } catch {
             await transport.disconnect()
@@ -93,7 +92,7 @@ private actor BrokenOutputResults {
     }
 }
 
-@Test func boundedStdioClosesOversizeUnterminatedInputBeforeSDKAccumulation() async throws {
+@Test func boundedStdioClosesOversizeUnterminatedInputBeforeProtocolAccumulation() async throws {
     let pipes = try TestPipes(); defer { pipes.closeAll() }
     let transport = BoundedStdioTransport(inputDescriptor: pipes.inputRead, outputDescriptor: pipes.outputWrite)
     try await transport.connect()

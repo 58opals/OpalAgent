@@ -2,7 +2,7 @@ import AgentClient
 import AgentMCP
 import AgentValues
 import Foundation
-import MCP
+import AgentMCPTestSupport
 import OpalBaseCore
 import Testing
 @testable import AgentProtocolFixture
@@ -25,7 +25,7 @@ private func withProtocolFixture(_ scenario: FixtureScenario,
         throw error
     }
 }
-private func assertPublicWireValue(_ value: MCP.Value) {
+private func assertPublicWireValue(_ value: MCPValue) {
     switch value {
     case .object(let fields):
         let forbidden = Set(["mnemonic", "privateKey", "publicDescriptor", "encryptedMnemonic", "canonicalBytes",
@@ -41,7 +41,7 @@ private func assertPublicWireValue(_ value: MCP.Value) {
     }
 }
 
-@Test func swiftSDKAllTwelveToolsReachActualAssemblyBaseAndSQLiteWithoutReadEffects() async throws {
+@Test func ownedWireAllTwelveToolsReachActualAssemblyBaseAndSQLiteWithoutReadEffects() async throws {
     try await withProtocolFixture(.autonomous) { fixture, wire in
         let tools = try await wire.client.listTools().tools
         #expect(Set(tools.map(\.name)) == Set(["list_wallets", "list_accounts", "get_balance", "list_transactions",
@@ -119,7 +119,7 @@ private func assertPublicWireValue(_ value: MCP.Value) {
     }
 }
 
-@Test func swiftSDKApprovalRemainsOutOfBandAndRevocationPreservesTheHeldTransaction() async throws {
+@Test func ownedWireApprovalRemainsOutOfBandAndRevocationPreservesTheHeldTransaction() async throws {
     try await withProtocolFixture(.approvalRequired) { fixture, wire in
         let prepared = try await wire.call("prepare_payment", payment(fixture, 10))
         let id = try #require(prepared.operationID)
@@ -162,7 +162,7 @@ private func assertPublicWireValue(_ value: MCP.Value) {
     }
 }
 
-@Test func swiftSDKLostReceiveReplyReconnectsToOneRetainedAllocation() async throws {
+@Test func ownedWireLostReceiveReplyReconnectsToOneRetainedAllocation() async throws {
     let directory = fixtureDirectory()
     let fixture = try await FixtureRuntime.make(directory: directory, scenario: .autonomous)
     let first = try await WireSession.connect(session: fixture.openSession(), dropping: "create_receive_request")
@@ -182,7 +182,7 @@ private func assertPublicWireValue(_ value: MCP.Value) {
         #expect(boundAccount.accountID == fixture.account.accountID && boundAccount.network == fixture.account.wallet.network.rawValue && boundAccount.requestKey == key(20))
         #expect(request.originGrantID == fixture.grantID && retainedAllocation.operationID == request.id)
         #expect(retainedAllocation.accountID == fixture.account.accountID && retainedAllocation.network == fixture.account.wallet.network.rawValue)
-        // The host closes its lost-response channel. The SDK explicitly fails its pending call.
+        // The host closes its lost-response channel. The owned wire client fails its pending call.
         await first.client.disconnect()
         await #expect(throws: (any Error).self) { try await dropped.value }
         await first.close()
@@ -235,7 +235,7 @@ private func assertPublicWireValue(_ value: MCP.Value) {
     }
 }
 
-@Test func swiftSDKForeignLookupAndStaleSnapshotCannotAuthorizeAnotherEffect() async throws {
+@Test func ownedWireForeignLookupAndStaleSnapshotCannotAuthorizeAnotherEffect() async throws {
     try await withProtocolFixture(.uncertain) { fixture, wire in
         let prepared = try await wire.call("prepare_payment", payment(fixture, 30))
         let id = try #require(prepared.operationID)
@@ -296,7 +296,7 @@ private func assertPublicWireValue(_ value: MCP.Value) {
         let events = try String(contentsOf: trace, encoding: .utf8).split(separator: "\n")
         #expect(!events.isEmpty)
         for line in events {
-            let fields = try JSONDecoder().decode([String: MCP.Value].self, from: Data(line.utf8))
+            let fields = try JSONDecoder().decode([String: MCPValue].self, from: Data(line.utf8))
             #expect(Set(fields.keys).isSubset(of: ["event", "method", "status", "relayCount"]))
             #expect(["fixture-ready", "capability-call", "fixture-stop"].contains(fields["event"]?.stringValue ?? ""))
         }

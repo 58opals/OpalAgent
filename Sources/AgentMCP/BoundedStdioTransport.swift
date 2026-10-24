@@ -1,7 +1,5 @@
 import Darwin
 import Foundation
-import Logging
-import MCP
 
 public enum MCPBounds {
     public static let inputBytes = 65_536
@@ -9,9 +7,8 @@ public enum MCPBounds {
     public static let concurrentRequests = 16
 }
 
-/// Newline framing is bounded before appending stdin bytes, independently of SDK decoding.
-public actor BoundedStdioTransport: Transport {
-    public nonisolated let logger = Logger(label: "opal.stdio", factory: { _ in SwiftLogNoOpLogHandler() })
+/// Newline framing is bounded before appending stdin bytes, independently of JSON decoding.
+public actor BoundedStdioTransport: MCPTransport {
     private let input: Int32
     private let output: Int32
     private var connected = false
@@ -33,17 +30,17 @@ public actor BoundedStdioTransport: Transport {
     }
 
     public func connect() throws {
-        guard !used else { MCPDiagnostics.transportFailed(.connection); throw MCPError.connectionClosed }
+        guard !used else { MCPDiagnostics.transportFailed(.connection); throw MCPTransportError.connectionClosed }
         used = true
         for descriptor in [input, output] {
             let flags = fcntl(descriptor, F_GETFL)
             guard flags >= 0, fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0 else {
                 MCPDiagnostics.transportFailed(.connection)
-                throw MCPError.connectionClosed
+                throw MCPTransportError.connectionClosed
             }
         }
         // Broken stdout must fail a write rather than terminate a process with SIGPIPE.
-        guard fcntl(output, F_SETNOSIGPIPE, 1) == 0 else { MCPDiagnostics.transportFailed(.connection); throw MCPError.connectionClosed }
+        guard fcntl(output, F_SETNOSIGPIPE, 1) == 0 else { MCPDiagnostics.transportFailed(.connection); throw MCPTransportError.connectionClosed }
         connected = true
         reader = Task { await readFrames() }
     }
@@ -52,7 +49,7 @@ public actor BoundedStdioTransport: Transport {
 
     public func send(_ data: Data) async throws {
         guard connected, data.count <= MCPBounds.outputBytes, !data.contains(10),
-              writes.count < MCPBounds.concurrentRequests else { MCPDiagnostics.transportFailed(.send); throw MCPError.connectionClosed }
+              writes.count < MCPBounds.concurrentRequests else { MCPDiagnostics.transportFailed(.send); throw MCPTransportError.connectionClosed }
         var framed = data
         framed.append(10)
         try await withCheckedThrowingContinuation { completion in
@@ -68,7 +65,7 @@ public actor BoundedStdioTransport: Transport {
         writer?.cancel()
         let pending = writes
         writes.removeAll()
-        for item in pending { item.completion.resume(throwing: MCPError.connectionClosed) }
+        for item in pending { item.completion.resume(throwing: MCPTransportError.connectionClosed) }
         let oldReader = reader
         let oldWriter = writer
         reader = nil
@@ -85,7 +82,7 @@ public actor BoundedStdioTransport: Transport {
             if count == 0 {
                 // A non-newline-terminated final fragment is not a complete stdio message.
                 if pending.isEmpty { continuation.finish() }
-                else { MCPDiagnostics.transportFailed(.incompleteFrame); continuation.finish(throwing: MCPError.invalidRequest("Incomplete frame")) }
+                else { MCPDiagnostics.transportFailed(.incompleteFrame); continuation.finish(throwing: MCPTransportError.invalidRequest("Incomplete frame")) }
                 return
             }
             if count < 0 {
@@ -94,7 +91,7 @@ public actor BoundedStdioTransport: Transport {
                     continue
                 }
                 MCPDiagnostics.transportFailed(.read)
-                continuation.finish(throwing: MCPError.connectionClosed)
+                continuation.finish(throwing: MCPTransportError.connectionClosed)
                 return
             }
             var start = 0
@@ -102,20 +99,20 @@ public actor BoundedStdioTransport: Transport {
                 let segment = buffer[start..<index]
                 guard pending.count <= MCPBounds.inputBytes - segment.count else {
                     MCPDiagnostics.transportFailed(.frameSize)
-                    continuation.finish(throwing: MCPError.invalidRequest("Frame too large"))
+                    continuation.finish(throwing: MCPTransportError.invalidRequest("Frame too large"))
                     return
                 }
                 pending.append(contentsOf: segment)
                 guard !pending.isEmpty else {
                     MCPDiagnostics.transportFailed(.emptyFrame)
-                    continuation.finish(throwing: MCPError.invalidRequest("Empty frame"))
+                    continuation.finish(throwing: MCPTransportError.invalidRequest("Empty frame"))
                     return
                 }
                 switch continuation.yield(pending) {
                 case .enqueued: break
                 case .dropped, .terminated:
                     MCPDiagnostics.transportFailed(.capacity)
-                    continuation.finish(throwing: MCPError.invalidRequest("Input capacity exceeded"))
+                    continuation.finish(throwing: MCPTransportError.invalidRequest("Input capacity exceeded"))
                     return
                 @unknown default: return
                 }
@@ -125,7 +122,7 @@ public actor BoundedStdioTransport: Transport {
             let remaining = buffer[start..<count]
             guard pending.count <= MCPBounds.inputBytes - remaining.count else {
                 MCPDiagnostics.transportFailed(.frameSize)
-                continuation.finish(throwing: MCPError.invalidRequest("Frame too large"))
+                continuation.finish(throwing: MCPTransportError.invalidRequest("Frame too large"))
                 return
             }
             pending.append(contentsOf: remaining)
@@ -141,26 +138,26 @@ public actor BoundedStdioTransport: Transport {
                 let deadline = ContinuousClock.now.advanced(by: .seconds(5))
                 while offset < item.bytes.count {
                     try Task.checkCancellation()
-                    guard connected, ContinuousClock.now < deadline else { throw MCPError.connectionClosed }
+                    guard connected, ContinuousClock.now < deadline else { throw MCPTransportError.connectionClosed }
                     let count = item.bytes.withUnsafeBytes { bytes in
                         Darwin.write(output, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
                     }
                     if count > 0 { offset += count }
                     else if count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
                         try await Task.sleep(for: .milliseconds(5))
-                    } else { throw MCPError.connectionClosed }
+                    } else { throw MCPTransportError.connectionClosed }
                 }
                 item.completion.resume()
             } catch {
                 MCPDiagnostics.transportFailed(.write)
-                item.completion.resume(throwing: MCPError.connectionClosed)
+                item.completion.resume(throwing: MCPTransportError.connectionClosed)
                 connected = false
-                continuation.finish(throwing: MCPError.connectionClosed)
+                continuation.finish(throwing: MCPTransportError.connectionClosed)
             }
         }
         let pending = writes
         writes.removeAll()
-        for item in pending { item.completion.resume(throwing: MCPError.connectionClosed) }
+        for item in pending { item.completion.resume(throwing: MCPTransportError.connectionClosed) }
         writer = nil
     }
 }

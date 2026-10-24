@@ -1,17 +1,16 @@
 import Foundation
-import MCP
+import AgentMCP
 import Testing
 @testable import AgentProtocolFixture
 
 /// Delivers only on demand: no lower queue, overflow, error or EOF can close the wrapper.
-private actor OpenFrameSource: MCP.Transport {
-    nonisolated let logger = MCP.InMemoryTransport().logger
+private actor OpenFrameSource: MCPTransport {
     private var emitted = 0
     private var closed = false
     private var waiting: CheckedContinuation<Data?, Never>?
 
     func connect() {}
-    func send(_ data: Data) throws { throw MCPError.connectionClosed }
+    func send(_ data: Data) throws { throw MCPTransportError.connectionClosed }
     func receive() -> AsyncThrowingStream<Data, any Error> {
         AsyncThrowingStream(unfolding: { await self.next() })
     }
@@ -52,7 +51,7 @@ private actor StdioEndObservation {
         #expect(lower.emitted == 17 && !lower.closed)
         var received = 0, capacityFailure = false
         do { for try await _ in input { received += 1 } }
-        catch MCPError.invalidRequest(_) { capacityFailure = true }
+        catch MCPTransportError.invalidRequest(_) { capacityFailure = true }
         #expect(capacityFailure && received <= 16)
         #expect(await ended.count == 1)
     } catch {

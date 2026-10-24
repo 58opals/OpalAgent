@@ -1,15 +1,14 @@
 import AgentValues
-import MCP
 import Testing
 @testable import AgentMCP
 
-private func schemaObject(_ value: Value?) throws -> [String: Value] { try #require(value?.objectValue) }
-private func schemaProperties(_ value: Value?) throws -> [String: Value] { try schemaObject(try schemaObject(value)["properties"]) }
-private func schemaSuccessResult(_ tool: Tool) throws -> Value {
+private func schemaObject(_ value: MCPValue?) throws -> [String: MCPValue] { try #require(value?.objectValue) }
+private func schemaProperties(_ value: MCPValue?) throws -> [String: MCPValue] { try schemaObject(try schemaObject(value)["properties"]) }
+private func schemaSuccessResult(_ tool: MCPTool) throws -> MCPValue {
     let branches = try #require(try schemaObject(tool.outputSchema)["oneOf"]?.arrayValue)
     return try #require(try schemaProperties(branches.first)["result"])
 }
-private func visitSchema(_ value: Value, _ inspect: (String, Value) throws -> Void) rethrows {
+private func visitSchema(_ value: MCPValue, _ inspect: (String, MCPValue) throws -> Void) rethrows {
     switch value {
     case .object(let fields):
         for (key, child) in fields { try inspect(key, child); try visitSchema(child, inspect) }

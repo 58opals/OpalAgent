@@ -5,7 +5,7 @@ import AgentValues
 import CryptoKit
 import Darwin
 import Foundation
-import MCP
+import AgentMCPTestSupport
 import Security
 import Testing
 @testable import AgentProtocolFixture
@@ -171,7 +171,7 @@ private final class OwnedFixtureChild: @unchecked Sendable {
     func closeInput() {
         lock.withLock { guard !inputClosed else { return }; inputClosed = true; Darwin.close(input) }
     }
-    /// The borrowed SDK reader must be joined before retiring only this parent read end.
+    /// The borrowed protocol reader must be joined before retiring only this parent read end.
     func closeOutput() {
         lock.withLock { guard !outputClosed else { return }; outputClosed = true; Darwin.close(output) }
     }
@@ -197,13 +197,12 @@ private final class OwnedFixtureChild: @unchecked Sendable {
     }
 }
 
-/// Gates and joins SDK writes before an OS stdio half-close or a final raw stimulus.
+/// Gates and joins client writes before an OS stdio half-close or a final raw stimulus.
 /// Disconnect joins borrowed-FD activity without closing either parent pipe descriptor.
-private actor HalfClosingProcessTransport: MCP.Transport {
-    nonisolated let logger = MCP.InMemoryTransport().logger
+private actor HalfClosingProcessTransport: MCPTransport {
     private let child: OwnedFixtureChild
     private let base: BoundedStdioTransport
-    private var sdkSendsRetired = false
+    private var clientSendsRetired = false
     private var activeSends = 0
     private var sendsDrained: CheckedContinuation<Void, Never>?
     private var reader: Task<Void, Never>?
@@ -213,7 +212,7 @@ private actor HalfClosingProcessTransport: MCP.Transport {
     }
     func connect() async throws { try await base.connect() }
     func send(_ data: Data) async throws {
-        guard !sdkSendsRetired else { throw MCPError.connectionClosed }
+        guard !clientSendsRetired else { throw MCPTransportError.connectionClosed }
         activeSends += 1
         defer {
             activeSends -= 1
@@ -237,12 +236,12 @@ private actor HalfClosingProcessTransport: MCP.Transport {
             continuation.onTermination = { _ in task.cancel() }
         }
     }
-    func retireSDKSends() async {
-        sdkSendsRetired = true
+    func retireClientSends() async {
+        clientSendsRetired = true
         if activeSends > 0 { await withCheckedContinuation { sendsDrained = $0 } }
     }
     private func writeRaw(_ frame: Data) async throws {
-        try #require(sdkSendsRetired && !frame.isEmpty && frame.count <= MCPBounds.inputBytes + 1)
+        try #require(clientSendsRetired && !frame.isEmpty && frame.count <= MCPBounds.inputBytes + 1)
         let deadline = ContinuousClock.now + .seconds(5)
         var offset = 0
         while offset < frame.count {
@@ -254,8 +253,8 @@ private actor HalfClosingProcessTransport: MCP.Transport {
         }
     }
     func finishInput(unterminatedFrame: Data? = nil) async throws {
-        guard !sdkSendsRetired else { return }
-        await retireSDKSends()
+        guard !clientSendsRetired else { return }
+        await retireClientSends()
         if let frame = unterminatedFrame {
             try #require(!frame.isEmpty && frame.count <= MCPBounds.inputBytes && !frame.contains(10))
             try await writeRaw(frame)
@@ -263,7 +262,7 @@ private actor HalfClosingProcessTransport: MCP.Transport {
         child.closeInput()
     }
     func sendRawPing() async throws {
-        let request: MCP.Value = .object(["jsonrpc": .string("2.0"), "id": .string("stdout-loss-" + UUID().uuidString), "method": .string("ping")])
+        let request: MCPValue = .object(["jsonrpc": .string("2.0"), "id": .string("stdout-loss-" + UUID().uuidString), "method": .string("ping")])
         var frame = try JSONEncoder().encode(request)
         try #require(!frame.contains(10))
         frame.append(10)
@@ -322,23 +321,22 @@ private func writerLeaseAvailable(_ ownership: FixtureProcessOwnership, identity
     try #require(errno == EWOULDBLOCK)
     return false
 }
-private func processCall(_ client: MCP.Client, name: String, arguments: [String: MCP.Value]) async throws -> WireReply {
-    let context = try await client.send(CallTool.request(.init(name: name, arguments: arguments)))
-    let reply = try await context.value
+private func processCall(_ client: MCPTestClient, name: String, arguments: [String: MCPValue]) async throws -> WireReply {
+    let reply = try await client.callTool(name: name, arguments: arguments)
     guard reply.content.count == 1, case let .text(text, _, _) = reply.content[0] else { throw WireFixtureFailure.invalidReply }
-    let fields = try JSONDecoder().decode([String: MCP.Value].self, from: Data(text.utf8))
+    let fields = try JSONDecoder().decode([String: MCPValue].self, from: Data(text.utf8))
     #expect(reply.structuredContent == .object(fields))
     return WireReply(fields: fields, isError: reply.isError)
 }
-private func processAccount(_ account: AccountScope) throws -> MCP.Value {
-    try JSONDecoder().decode(MCP.Value.self, from: JSONEncoder().encode(account))
+private func processAccount(_ account: AccountScope) throws -> MCPValue {
+    try JSONDecoder().decode(MCPValue.self, from: JSONEncoder().encode(account))
 }
-private func withProcessSDK(_ child: OwnedFixtureChild, name: String,
-                            transport suppliedTransport: (any MCP.Transport)? = nil,
-                            body: (MCP.Client) async throws -> Void) async throws {
-    let client = MCP.Client(name: name, version: "1")
+private func withProcessWire(_ child: OwnedFixtureChild, name: String,
+                            transport suppliedTransport: (any MCPTransport)? = nil,
+                            body: (MCPTestClient) async throws -> Void) async throws {
+    let client = MCPTestClient(name: name, version: "1")
     do {
-        let transport: any MCP.Transport = suppliedTransport ?? BoundedStdioTransport(inputDescriptor: child.output, outputDescriptor: child.input)
+        let transport: any MCPTransport = suppliedTransport ?? BoundedStdioTransport(inputDescriptor: child.output, outputDescriptor: child.input)
         let initialized = try await client.connect(transport: transport)
         #expect(initialized.protocolVersion == "2025-11-25")
         try await body(client)
@@ -351,18 +349,23 @@ private func withProcessSDK(_ child: OwnedFixtureChild, name: String,
     }
 }
 
-private actor DropCompletedReceiveReply: MCP.Transport {
-    nonisolated let logger = MCP.InMemoryTransport().logger
+private actor DropCompletedReceiveReply: MCPTransport {
     let base: BoundedStdioTransport
     private var armed = false
-    private var target: MCP.Value?
+    private var target: MCPValue?
+    private var reader: Task<Void, Never>?
     private(set) var dropped = false
     init(_ child: OwnedFixtureChild) { base = BoundedStdioTransport(inputDescriptor: child.output, outputDescriptor: child.input) }
     func arm() { armed = true }
     func connect() async throws { try await base.connect() }
-    func disconnect() async { await base.disconnect() }
+    func disconnect() async {
+        reader?.cancel()
+        await base.disconnect()
+        await reader?.value
+        reader = nil
+    }
     func send(_ bytes: Data) async throws {
-        if armed, let message = try? JSONDecoder().decode([String: MCP.Value].self, from: bytes),
+        if armed, let message = try? JSONDecoder().decode([String: MCPValue].self, from: bytes),
            message["method"]?.stringValue == "tools/call",
            message["params"]?.objectValue?["name"]?.stringValue == "create_receive_request" {
             target = message["id"]; armed = false
@@ -375,25 +378,26 @@ private actor DropCompletedReceiveReply: MCP.Transport {
                 do {
                     for try await bytes in await base.receive() {
                         if let target, !dropped,
-                           let message = try? JSONDecoder().decode([String: MCP.Value].self, from: bytes),
+                           let message = try? JSONDecoder().decode([String: MCPValue].self, from: bytes),
                            message["id"] == target, message["result"] != nil { dropped = true; continue }
                         continuation.yield(bytes)
                     }
                     continuation.finish()
                 } catch { continuation.finish(throwing: error) }
             }
+            reader = task
             continuation.onTermination = { _ in task.cancel() }
         }
     }
 }
-private func paymentArguments(_ scope: AccountScope, key requestKey: String) throws -> [String: MCP.Value] {
+private func paymentArguments(_ scope: AccountScope, key requestKey: String) throws -> [String: MCPValue] {
     ["account": try processAccount(scope), "requestKey": .string(requestKey),
      "destinationAddress": .string(FixtureRuntime.destination), "amountSatoshis": .string("10000")]
 }
-private func retainedLookup(_ scope: AccountScope, key requestKey: String, effect: String = "preparePayment") throws -> [String: MCP.Value] {
+private func retainedLookup(_ scope: AccountScope, key requestKey: String, effect: String = "preparePayment") throws -> [String: MCPValue] {
     ["account": try processAccount(scope), "effect": .string(effect), "requestKey": .string(requestKey)]
 }
-private func prepareProcessPayment(_ child: OwnedFixtureChild, _ client: MCP.Client, scope: AccountScope, key requestKey: String) async throws -> String {
+private func prepareProcessPayment(_ child: OwnedFixtureChild, _ client: MCPTestClient, scope: AccountScope, key requestKey: String) async throws -> String {
     let prepared = try await processCall(client, name: "prepare_payment", arguments: paymentArguments(scope, key: requestKey))
     let id = try #require(prepared.operationID)
     try await wireEventually("Actual Base preview must complete") {
@@ -401,7 +405,7 @@ private func prepareProcessPayment(_ child: OwnedFixtureChild, _ client: MCP.Cli
     }
     return id
 }
-private func settleUnknown(_ child: OwnedFixtureChild, _ client: MCP.Client, scope: AccountScope, key requestKey: String, id: String) async throws {
+private func settleUnknown(_ child: OwnedFixtureChild, _ client: MCPTestClient, scope: AccountScope, key requestKey: String, id: String) async throws {
     _ = try await processCall(client, name: "submit_payment", arguments: ["account": try processAccount(scope), "operationID": .string(id)])
     _ = try await child.event("relayEntered")
     _ = try await child.command("releaseRelay")
@@ -451,9 +455,9 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
         let ready = try await first.bootstrap(ownership, resume: false)
         let secret = try await first.control.receiveAsync(); try #require(secret.0 == 2 && secret.1.count == 32)
         let scope = try #require(ready.snapshot?.account), requestKey = key(92)
-        let args: [String: MCP.Value] = ["account": try processAccount(scope), "requestKey": .string(requestKey)]
+        let args: [String: MCPValue] = ["account": try processAccount(scope), "requestKey": .string(requestKey)]
         let drop = DropCompletedReceiveReply(first)
-        try await withProcessSDK(first, name: "Receive response loss", transport: drop) { client in
+        try await withProcessWire(first, name: "Receive response loss", transport: drop) { client in
             let pending = try await processCall(client, name: "create_receive_request", arguments: args)
             let id = try #require(pending.operationID)
             let lookup = try retainedLookup(scope, key: requestKey, effect: "createReceiveRequest")
@@ -473,7 +477,7 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
             let restarted = try await second.bootstrap(ownership, resume: true, credential: secret.1)
             let baseline = try await second.snapshot().0
             let beforeRead = try await second.facts()
-            try await withProcessSDK(second, name: "Retained receive new process") { next in
+            try await withProcessWire(second, name: "Retained receive new process") { next in
                 let restored = try await processCall(next, name: "get_operation", arguments: lookup)
                 let replay = try await processCall(next, name: "create_receive_request", arguments: args)
                 #expect(restored.operationID == id && restored.operation["state"]?.stringValue == "allocated")
@@ -502,7 +506,7 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
             request.expectedRevision = 1; request.approvalRequired = true
             _ = try await first.owner(request, call: .setApprovalPolicy(.init(wallet: scope.wallet, expectedRevision: 1, approvalRequired: true)))
         }
-        try await withProcessSDK(first, name: "Unsubmitted preview") { client in
+        try await withProcessWire(first, name: "Unsubmitted preview") { client in
             let id = try await prepareProcessPayment(first, client, scope: scope, key: requestKey)
             let lookup = try retainedLookup(scope, key: requestKey)
             if pendingApproval {
@@ -519,7 +523,7 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
             let restarted = try await second.bootstrap(ownership, resume: true, credential: credential.1)
             let baseline = try await second.snapshot().0, beforeRead = try await second.facts()
             #expect(baseline.state == "invalidated" && !baseline.gateHeld && baseline.totalAdmissions == 0 && baseline.relayEntries == 0)
-            try await withProcessSDK(second, name: "Invalidated retained preview") { next in
+            try await withProcessWire(second, name: "Invalidated retained preview") { next in
                 let retained = try await processCall(next, name: "get_operation", arguments: lookup)
                 #expect(retained.operationID == id && retained.operation["state"]?.stringValue == "closed" && retained.operation["terminalReason"]?.stringValue == "invalidated")
                 let replay = try await processCall(next, name: "prepare_payment", arguments: paymentArguments(scope, key: requestKey))
@@ -556,12 +560,12 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
             _ = try await first.command("relayOutcome") { $0.allow = true }
             _ = try await first.command("releaseRelay")
         }
-        try await withProcessSDK(first, name: "Process restart proof") { client in
+        try await withProcessWire(first, name: "Process restart proof") { client in
         let requestKey = key(91)
         let prepared = try await processCall(client, name: "prepare_payment", arguments: ["account": account,
             "requestKey": .string(requestKey), "destinationAddress": .string(FixtureRuntime.destination), "amountSatoshis": .string("10000")])
         let id = try #require(prepared.operationID)
-        let lookup: [String: MCP.Value] = ["account": account, "effect": .string("preparePayment"), "requestKey": .string(requestKey)]
+        let lookup: [String: MCPValue] = ["account": account, "effect": .string("preparePayment"), "requestKey": .string(requestKey)]
         try await wireEventually("Actual Base preparation must complete before submit") {
             try await processCall(client, name: "get_operation", arguments: lookup).operation["state"]?.stringValue == "prepared"
         }
@@ -633,7 +637,7 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
         #expect(after.ordinaryAdmissions == 1 && after.totalAdmissions == 1 && after.relayEntries == prefix.relays && after.gateHeld)
         let fullBytesEqualAfterRestart = afterBytes == beforeBytes
         #expect(fullBytesEqualAfterRestart && after.byteDigest == before.byteDigest)
-        try await withProcessSDK(second, name: "New connection original grant") { next in
+        try await withProcessWire(second, name: "New connection original grant") { next in
         let result = try await processCall(next, name: "get_operation", arguments: lookup)
         #expect(result.isError != true && result.operationID == id && result.operation["state"]?.stringValue == retainedState)
         #expect(result.operation["ordinaryAdmissions"]?.stringValue == "1")
@@ -737,7 +741,7 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
         let ready = try await child.bootstrap(ownership, resume: false)
         let credential = try await child.control.receiveAsync(); try #require(credential.0 == 2 && credential.1.count == 32)
         let scope = try #require(ready.snapshot?.account), requestKey = key(97)
-        try await withProcessSDK(child, name: "Graceful stop drains actual relay") { client in
+        try await withProcessWire(child, name: "Graceful stop drains actual relay") { client in
             let id = try await prepareProcessPayment(child, client, scope: scope, key: requestKey)
             let lookup = try retainedLookup(scope, key: requestKey)
             _ = try await processCall(client, name: "submit_payment", arguments: ["account": try processAccount(scope), "operationID": .string(id)])
@@ -755,7 +759,7 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
             let unavailable = try await processCall(client, name: "get_operation", arguments: lookup)
             #expect(unavailable.isError == true && unavailable.errorCode == "unavailable")
             await client.disconnect()
-            // Losing the SDK connection cannot prove that the admitted transport had no effect.
+            // Losing the wire connection cannot prove that the admitted transport had no effect.
             #expect(try !writerLeaseAvailable(ownership, identity: writer))
             #expect(try FixtureProcessOwnership.readOwned(oraclePath, maximum: 16_384) == oracle)
             _ = try await child.command("releaseRelay")
@@ -781,7 +785,7 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
         let trace = directory.appendingPathComponent("trace.jsonl")
         let child = try OwnedFixtureChild.launch(executable: fixtureExecutable(), mode: .ordinary(directory: directory, trace: trace))
         let transport = HalfClosingProcessTransport(child)
-        try await withProcessSDK(child, name: "Ordinary CLI stdio closure", transport: transport) { client in
+        try await withProcessWire(child, name: "Ordinary CLI stdio closure", transport: transport) { client in
             let wallets = try await processCall(client, name: "list_wallets", arguments: [:])
             let wallet = try #require(wallets.result["items"]?.arrayValue?.first?.objectValue?["scope"])
             let accounts = try await processCall(client, name: "list_accounts", arguments: ["wallet": wallet, "page": .object([:])])
@@ -799,19 +803,19 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
             let index = try #require(allocated.operation["allocation"]?.objectValue?["index"]?.intValue)
             let allocationIndex = try #require(UInt32(exactly: index))
             let directoryIdentity = try FixtureFileIdentity.capture(directory.path, directory: true)
-            let candidate: MCP.Value = .object(["jsonrpc": .string("2.0"), "id": .string("unterminated-final-receive"),
+            let candidate: MCPValue = .object(["jsonrpc": .string("2.0"), "id": .string("unterminated-final-receive"),
                 "method": .string("tools/call"), "params": .object(["name": .string("create_receive_request"),
                     "arguments": .object(["account": account, "requestKey": .string(incompleteKey)])])])
             let frame = try JSONEncoder().encode(candidate)
             // This is a valid effect request except for the missing stdio newline, not malformed JSON.
-            #expect(try JSONDecoder().decode(MCP.Value.self, from: frame) == candidate)
+            #expect(try JSONDecoder().decode(MCPValue.self, from: frame) == candidate)
             switch trigger {
             case .stdinEOF, .unterminatedStdinEOF:
                 try await transport.finishInput(unterminatedFrame: trigger == .unterminatedStdinEOF ? frame : nil)
                 #expect(fcntl(child.output, F_GETFD) >= 0)
-                // The SDK remains connected; only parent stdin EOF establishes this exit.
+                // The wire client remains connected; only parent stdin EOF establishes this exit.
             case .stdoutLoss:
-                await transport.retireSDKSends()
+                await transport.retireClientSends()
                 await client.disconnect() // Joins borrowed tasks while both OS pipe descriptors remain open.
                 try #require(fcntl(child.input, F_GETFD) >= 0 && fcntl(child.output, F_GETFD) >= 0)
                 child.closeOutput()
@@ -840,7 +844,7 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
             #expect(issuance.issuedIndices == [UInt64(allocationIndex)] && issuance.issuedHighWater == UInt64(allocationIndex))
             #expect(state.allocations.count == 1 && state.payments.isEmpty && state.gates.isEmpty)
             let events = try String(contentsOf: trace, encoding: .utf8).split(separator: "\n").map {
-                try JSONDecoder().decode([String: MCP.Value].self, from: Data($0.utf8))
+                try JSONDecoder().decode([String: MCPValue].self, from: Data($0.utf8))
             }
             if trigger == .stdoutLoss {
                 #expect(events.first?["event"]?.stringValue == "fixture-ready")
@@ -863,7 +867,7 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
         let credential = try await first.control.receiveAsync(); try #require(credential.0 == 2 && credential.1.count == 32)
         let scope = try #require(ready.snapshot?.account), firstEpoch = try #require(ready.epoch), requestKey = key(112)
         let transport = HalfClosingProcessTransport(first)
-        try await withProcessSDK(first, name: "Stdio closure retains held relay ownership", transport: transport) { client in
+        try await withProcessWire(first, name: "Stdio closure retains held relay ownership", transport: transport) { client in
             let id = try await prepareProcessPayment(first, client, scope: scope, key: requestKey)
             let lookup = try retainedLookup(scope, key: requestKey)
             _ = try await processCall(client, name: "submit_payment", arguments: ["account": try processAccount(scope), "operationID": .string(id)])
@@ -884,13 +888,13 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
             let oracle = try FixtureProcessOwnership.readOwned(oraclePath, maximum: 16_384)
             let entries = oracle.split(separator: 10)
             try #require(entries.count == 1)
-            let entry = try JSONDecoder().decode([String: MCP.Value].self, from: Data(try #require(entries.first)))
+            let entry = try JSONDecoder().decode([String: MCPValue].self, from: Data(try #require(entries.first)))
             #expect(entry["version"]?.intValue == 1 && entry["ordinal"]?.intValue == 1 && entry["attempt"]?.intValue == 1)
             #expect(entry["operationID"]?.stringValue == id && entry["digest"]?.stringValue == before.0.byteDigest && entry["epoch"]?.stringValue == firstEpoch.uuidString)
             let originalLookup = OperationLookup.request(account: scope, effect: .preparePayment, key: try RequestKey(requestKey))
             if trigger == .stdoutLoss {
-                await transport.retireSDKSends()
-                await client.disconnect() // Retire and join SDK activity before closing its borrowed read descriptor.
+                await transport.retireClientSends()
+                await client.disconnect() // Retire and join protocol activity before closing its borrowed read descriptor.
                 try #require(fcntl(first.input, F_GETFD) >= 0 && fcntl(first.output, F_GETFD) >= 0)
                 var stillAdmitted = FixtureControlMessage(kind: "integrationLookup")
                 stillAdmitted.connection = "original"; stillAdmitted.lookup = originalLookup
@@ -955,7 +959,7 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
             }
             let baseline = try await second.snapshot(), facts = try await second.facts()
             #expect(facts.blocker == "relayNotEligible" && facts.generation == drainedFacts.generation)
-            try await withProcessSDK(second, name: "Fresh authenticated assembly after stdio closure") { next in
+            try await withProcessWire(second, name: "Fresh authenticated assembly after stdio closure") { next in
                 let result = try await processCall(next, name: "get_operation", arguments: lookup)
                 #expect(result.isError != true && result.operationID == id && result.operation["state"]?.stringValue == "uncertain")
                 #expect(result.operation["identity"] == original.operation["identity"] && result.operation["request"] == original.operation["request"])
@@ -1006,7 +1010,7 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
         let secret = try await first.control.receiveAsync(); try #require(secret.0 == 2 && secret.1.count == 32)
         let scope = try #require(ready.snapshot?.account), paymentKey = key(94), ownerKey = try RequestKey(key(95))
         var killed: Int32 = 0, originalBytes = Data(), originalContext: ExactRelayReviewContext?
-        try await withProcessSDK(first, name: "Ordinary then independent owner relay") { client in
+        try await withProcessWire(first, name: "Ordinary then independent owner relay") { client in
             let id = try await prepareProcessPayment(first, client, scope: scope, key: paymentKey)
             try await settleUnknown(first, client, scope: scope, key: paymentKey, id: id)
             let before = try await first.snapshot(); #expect(before.0.ordinaryAdmissions == 1 && before.0.totalAdmissions == 1 && before.0.relayEntries == 1)
@@ -1092,7 +1096,7 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
         let originalCredential = try await first.control.receiveAsync(); try #require(originalCredential.0 == 2 && originalCredential.1.count == 32)
         let scope = try #require(ready.snapshot?.account), requestKey = key(96)
         var currentCredential = originalCredential.1, originalBytes = Data(), wall: Int64 = 1_000, id = "", firstExit: Int32 = 0
-        try await withProcessSDK(first, name: "Known original authority") { client in
+        try await withProcessWire(first, name: "Known original authority") { client in
             id = try await prepareProcessPayment(first, client, scope: scope, key: requestKey)
             try await settleUnknown(first, client, scope: scope, key: requestKey, id: id)
             originalBytes = try await first.snapshot().1
@@ -1117,7 +1121,7 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
         try #require(restarted.problem == nil)
         let clock = try await second.facts()
         #expect(clock.clockWall == wall && clock.clockMonotonic == 100 && clock.credentialGeneration == (rotated ? 2 : 1))
-        try await withProcessSDK(second, name: "New current connection original operation") { next in
+        try await withProcessWire(second, name: "New current connection original operation") { next in
             let (beforeSnapshot, beforeBytes): (FixtureProcessSnapshot, Data) = try await second.snapshot()
             let lookup = try retainedLookup(scope, key: requestKey)
             let current = try await processCall(next, name: "get_operation", arguments: lookup)
@@ -1201,7 +1205,7 @@ private func appendProcessProof(scenario: String, children: [(pid_t, UUID)], sna
                 let third = try OwnedFixtureChild.launch(executable: fixtureExecutable())
                 let reopened = try await third.bootstrap(ownership, resume: true, credential: currentCredential, wallTime: facts.clockWall)
                 try #require(reopened.problem == nil)
-                try await withProcessSDK(third, name: "Exhausted ordinary authority after another death") { last in
+                try await withProcessWire(third, name: "Exhausted ordinary authority after another death") { last in
                     let baseline = try await third.snapshot()
                     _ = try await third.command("advanceClock") { $0.seconds = 1_000 }
                     _ = try await processCall(last, name: "submit_payment", arguments: ["account": try processAccount(scope), "operationID": .string(id)])

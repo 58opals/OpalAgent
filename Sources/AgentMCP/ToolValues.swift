@@ -1,20 +1,19 @@
 import AgentValues
-import MCP
 
 /// Wallet-command parsing is independent of optional MCP capability metadata.
 enum ToolArgumentError: Error, Equatable { case invalid }
 
 private struct ToolObject {
-    let fields: [String: Value]
-    init(_ value: Value) throws {
+    let fields: [String: MCPValue]
+    init(_ value: MCPValue) throws {
         guard case .object(let fields) = value else { throw ToolArgumentError.invalid }
         self.fields = fields
     }
-    init(_ fields: [String: Value]) { self.fields = fields }
+    init(_ fields: [String: MCPValue]) { self.fields = fields }
     func only(_ allowed: Set<String>) throws {
         guard Set(fields.keys).isSubset(of: allowed) else { throw ToolArgumentError.invalid }
     }
-    func required(_ key: String) throws -> Value {
+    func required(_ key: String) throws -> MCPValue {
         guard let value = fields[key] else { throw ToolArgumentError.invalid }; return value
     }
     func string(_ key: String) throws -> String {
@@ -37,7 +36,7 @@ private struct ToolObject {
 }
 
 enum ToolInput {
-    static func call(_ method: CapabilityMethod, arguments: [String: Value]?) throws -> CapabilityCall {
+    static func call(_ method: CapabilityMethod, arguments: [String: MCPValue]?) throws -> CapabilityCall {
         let object = ToolObject(arguments ?? [:])
         switch method {
         case .listWallets: return .listWallets(try page(.object(object.fields)))
@@ -72,16 +71,16 @@ enum ToolInput {
         case .cancelOperation: return .cancelOperation(try selector(.object(object.fields)))
         }
     }
-    private static func wallet(_ value: Value) throws -> WalletScope {
+    private static func wallet(_ value: MCPValue) throws -> WalletScope {
         let object = try ToolObject(value); try object.only(["walletID", "network"])
         guard let network = WalletNetwork(rawValue: try object.string("network")) else { throw ToolArgumentError.invalid }
         return try WalletScope(walletID: object.string("walletID"), network: network)
     }
-    private static func account(_ value: Value) throws -> AccountScope {
+    private static func account(_ value: MCPValue) throws -> AccountScope {
         let object = try ToolObject(value); try object.only(["wallet", "accountID"])
         return try AccountScope(wallet: wallet(object.required("wallet")), accountID: object.string("accountID"))
     }
-    private static func page(_ value: Value) throws -> PageRequest {
+    private static func page(_ value: MCPValue) throws -> PageRequest {
         let object = try ToolObject(value); try object.only(["limit", "cursor"])
         return try PageRequest(limit: object.fields["limit"] == nil ? PageRequest.maximumCount : object.integer("limit"),
                                cursor: object.optionalString("cursor"))
@@ -94,22 +93,22 @@ enum ToolInput {
         try object.only(["account", "requestKey"])
         return try KeyedAccountRequest(account: account(object.required("account")), requestKey: RequestKey(object.string("requestKey")))
     }
-    private static func selector(_ value: Value) throws -> OperationSelector {
+    private static func selector(_ value: MCPValue) throws -> OperationSelector {
         let object = try ToolObject(value); try object.only(["account", "operationID"])
         return try OperationSelector(account: account(object.required("account")), operationID: object.string("operationID"))
     }
 }
 
-/// Explicit scalar mapping avoids SDK Codable's UInt64-to-Double fallback. Monetary
+/// Explicit scalar mapping keeps UInt64 contexts out of floating-point JSON. Monetary
 /// quantities and UInt64 context counters are decimal strings; no signing data is available here.
 enum ToolOutput {
-    static func success(_ result: CapabilityResult) throws -> Value {
+    static func success(_ result: CapabilityResult) throws -> MCPValue {
         .object(["ok": .bool(true), "method": .string(result.method.rawValue), "result": try payload(result)])
     }
-    static func failure(_ code: ServiceProblemCode) -> Value {
+    static func failure(_ code: ServiceProblemCode) -> MCPValue {
         .object(["ok": .bool(false), "error": .object(["code": .string(code.rawValue)])])
     }
-    private static func payload(_ result: CapabilityResult) throws -> Value {
+    private static func payload(_ result: CapabilityResult) throws -> MCPValue {
         switch result {
         case .listWallets(let v): return page(v) { .object(["scope": wallet($0.scope), "availability": .string($0.availability.rawValue)]) }
         case .listAccounts(let v): return .object(["wallet": wallet(v.wallet), "page": page(v.page) {
@@ -132,7 +131,7 @@ enum ToolOutput {
         case .createReceiveRequest(let v): return receive(v)
         case .preparePayment(let v), .submitPayment(let v): return try payment(v)
         case .getOperation(let v), .cancelOperation(let v):
-            let value: Value
+            let value: MCPValue
             switch v {
             case .synchronization(let item): value = try sync(item)
             case .receive(let item): value = receive(item)
@@ -141,63 +140,63 @@ enum ToolOutput {
             return .object(["effect": .string(v.effect.rawValue), "operation": value])
         }
     }
-    private static func wallet(_ v: WalletScope) -> Value { .object(["walletID": .string(v.walletID), "network": .string(v.network.rawValue)]) }
-    private static func account(_ v: AccountScope) -> Value { .object(["wallet": wallet(v.wallet), "accountID": .string(v.accountID)]) }
-    private static func selector(_ v: OperationSelector) -> Value { .object(["account": account(v.account), "operationID": .string(v.operationID)]) }
-    private static func identity(_ v: OperationIdentity) -> Value {
+    private static func wallet(_ v: WalletScope) -> MCPValue { .object(["walletID": .string(v.walletID), "network": .string(v.network.rawValue)]) }
+    private static func account(_ v: AccountScope) -> MCPValue { .object(["wallet": wallet(v.wallet), "accountID": .string(v.accountID)]) }
+    private static func selector(_ v: OperationSelector) -> MCPValue { .object(["account": account(v.account), "operationID": .string(v.operationID)]) }
+    private static func identity(_ v: OperationIdentity) -> MCPValue {
         .object(["selector": selector(v.selector), "requestKey": .string(v.requestKey.value)])
     }
-    private static func observation(_ v: SnapshotObservation) throws -> Value {
+    private static func observation(_ v: SnapshotObservation) throws -> MCPValue {
         .object(["providerID": .string(v.providerID), "viewID": .string(v.viewID), "chainTip": .string(v.chainTip),
             "sequence": .string(String(v.sequence)), "observedAt": try integer(v.observedAt),
             "generation": .string(String(v.generation)), "fresh": .bool(v.fresh), "complete": .bool(v.complete)])
     }
-    private static func readiness(_ v: AccountReadiness) -> Value {
+    private static func readiness(_ v: AccountReadiness) -> MCPValue {
         .object(["state": .string(v.state.rawValue), "blockers": .array(v.blockers.map { .string($0.rawValue) })])
     }
-    private static func outpoint(_ v: Outpoint) -> Value { .object(["transactionID": .string(v.transactionID), "outputIndex": .int(Int(v.outputIndex))]) }
-    private static func reservation(_ v: UTXOReservation) -> Value {
+    private static func outpoint(_ v: Outpoint) -> MCPValue { .object(["transactionID": .string(v.transactionID), "outputIndex": .int(Int(v.outputIndex))]) }
+    private static func reservation(_ v: UTXOReservation) -> MCPValue {
         switch v {
         case .unreserved: .object(["state": .string("unreserved")])
         case .visibleOperation(let id): .object(["state": .string("visibleOperation"), "operationID": .string(id)])
         case .otherOperation: .object(["state": .string("otherOperation")])
         }
     }
-    private static func page<T: Codable & Sendable & Equatable>(_ v: CapabilityPage<T>, _ project: (T) throws -> Value) rethrows -> Value {
+    private static func page<T: Codable & Sendable & Equatable>(_ v: CapabilityPage<T>, _ project: (T) throws -> MCPValue) rethrows -> MCPValue {
         .object(["items": .array(try v.items.map(project)), "nextCursor": optional(v.nextCursor) { .string($0) }])
     }
-    private static func accountPage<T: Codable & Sendable & Equatable>(_ v: AccountPage<T>, _ project: (T) throws -> Value) throws -> Value {
+    private static func accountPage<T: Codable & Sendable & Equatable>(_ v: AccountPage<T>, _ project: (T) throws -> MCPValue) throws -> MCPValue {
         .object(["account": account(v.account), "observation": try observation(v.observation),
             "page": try page(v.page, project), "readiness": readiness(v.readiness)])
     }
-    private static func sync(_ v: SyncOperation) throws -> Value {
+    private static func sync(_ v: SyncOperation) throws -> MCPValue {
         .object(["identity": identity(v.identity), "state": .string(v.state.rawValue),
             "observation": try optional(v.observation, observation), "closeReason": optional(v.closeReason) { .string($0.rawValue) },
             "blocker": optional(v.blocker) { .string($0.rawValue) }])
     }
-    private static func receive(_ v: ReceiveOperation) -> Value {
+    private static func receive(_ v: ReceiveOperation) -> MCPValue {
         .object(["identity": identity(v.identity), "state": .string(v.state.rawValue),
             "allocation": optional(v.allocation) { .object(["address": .string($0.address), "index": .int(Int($0.index))]) },
             "closeReason": optional(v.closeReason) { .string($0.rawValue) }, "blocker": optional(v.blocker) { .string($0.rawValue) }])
     }
-    private static func request(_ v: PreparePaymentRequest) throws -> Value {
+    private static func request(_ v: PreparePaymentRequest) throws -> MCPValue {
         .object(["account": account(v.account), "requestKey": .string(v.requestKey.value), "destinationAddress": .string(v.destinationAddress),
             "amountSatoshis": .string(String(v.amountSatoshis)), "feeRateSatoshisPerByte": .string(String(v.feeRateSatoshisPerByte)),
             "expiresAt": try optional(v.expiresAt, integer)])
     }
-    private static func preview(_ v: PaymentPreviewProjection) throws -> Value {
+    private static func preview(_ v: PaymentPreviewProjection) throws -> MCPValue {
         .object(["canonicalDestinationAddress": .string(v.canonicalDestinationAddress), "destinationScriptHex": .string(v.destinationScriptHex),
             "amountSatoshis": .string(String(v.amountSatoshis)), "feeSatoshis": .string(String(v.feeSatoshis)),
             "selectedInputs": .array(v.selectedInputs.map(outpoint)), "change": .array(v.change.map {
                 .object(["lockingScriptHex": .string($0.lockingScriptHex), "amountSatoshis": .string(String($0.amountSatoshis))])
             }), "templateDigest": .string(v.templateDigest), "leaseDeadline": try integer(v.leaseDeadline)])
     }
-    private static func attempt(_ v: RelayAttemptProjection) throws -> Value {
+    private static func attempt(_ v: RelayAttemptProjection) throws -> MCPValue {
         .object(["attemptID": .string(v.attemptID), "number": .string(String(v.number)), "route": .string(v.route.rawValue),
             "outcome": .string(v.outcome.rawValue), "admittedAt": try integer(v.admittedAt),
             "nextEligibleAt": try optional(v.nextEligibleAt, integer)])
     }
-    private static func payment(_ v: PaymentOperation) throws -> Value {
+    private static func payment(_ v: PaymentOperation) throws -> MCPValue {
         .object(["identity": identity(v.identity), "request": try request(v.request), "state": .string(v.state.rawValue),
             "preview": try optional(v.preview, preview), "terminalReason": optional(v.terminalReason) { .string($0.rawValue) },
             "closures": .array(v.closures.map { .object(["reason": .string($0.reason.rawValue),
@@ -210,10 +209,10 @@ enum ToolOutput {
             "lastReconciliationAt": try optional(v.lastReconciliationAt, integer),
             "observationSequence": .string(String(v.observationSequence)), "transactionID": optional(v.transactionID) { .string($0) }])
     }
-    private static func optional<T>(_ value: T?, _ project: (T) throws -> Value) rethrows -> Value {
+    private static func optional<T>(_ value: T?, _ project: (T) throws -> MCPValue) rethrows -> MCPValue {
         guard let value else { return .null }; return try project(value)
     }
-    private static func integer(_ value: Int64) throws -> Value {
+    private static func integer(_ value: Int64) throws -> MCPValue {
         guard let exact = Int(exactly: value) else { throw ToolArgumentError.invalid }; return .int(exact)
     }
 }
@@ -225,7 +224,7 @@ enum ToolValueBudget {
     static let maximumJSONBytes = 60_000
     static let maximumDepth = 32
     static let maximumNodes = 8_192
-    static func validate(_ value: Value) throws {
+    static func validate(_ value: MCPValue) throws {
         var budget = Consumption()
         try budget.visit(value, depth: 0)
     }
@@ -248,7 +247,7 @@ enum ToolValueBudget {
                 }
             }
         }
-        mutating func visit(_ value: Value, depth: Int) throws {
+        mutating func visit(_ value: MCPValue, depth: Int) throws {
             guard depth <= maximumDepth, nodes < maximumNodes else { throw ToolArgumentError.invalid }
             nodes += 1
             switch value {

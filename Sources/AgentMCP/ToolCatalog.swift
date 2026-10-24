@@ -1,11 +1,10 @@
 import AgentValues
-import MCP
 
 /// Discovery describes protocol shape only. Tools and annotations confer no wallet authority.
 public enum ToolCatalog {
-    public static func tools() -> [Tool] {
+    public static func tools() -> [MCPTool] {
         CapabilityMethod.allCases.map { method in
-            Tool(name: method.rawValue, description: description(method), inputSchema: ToolSchema.input(method),
+            MCPTool(name: method.rawValue, description: description(method), inputSchema: ToolSchema.input(method),
                  outputSchema: ToolSchema.output(method))
         }
     }
@@ -30,26 +29,26 @@ public enum ToolCatalog {
 }
 
 private enum ToolSchema {
-    static func object(_ properties: [String: Value], required: [String]? = nil) -> Value {
+    static func object(_ properties: [String: MCPValue], required: [String]? = nil) -> MCPValue {
         .object(["type": .string("object"), "properties": .object(properties),
-            "required": .array((required ?? properties.keys.sorted()).map(Value.string)), "additionalProperties": .bool(false)])
+            "required": .array((required ?? properties.keys.sorted()).map(MCPValue.string)), "additionalProperties": .bool(false)])
     }
-    static func string(maximum: Int = 2_048, minimum: Int = 1, pattern: String? = nil) -> Value {
-        var fields: [String: Value] = ["type": .string("string"), "minLength": .int(minimum), "maxLength": .int(maximum)]
+    static func string(maximum: Int = 2_048, minimum: Int = 1, pattern: String? = nil) -> MCPValue {
+        var fields: [String: MCPValue] = ["type": .string("string"), "minLength": .int(minimum), "maxLength": .int(maximum)]
         if let pattern { fields["pattern"] = .string(pattern) }; return .object(fields)
     }
-    static func values(_ strings: [String]) -> Value { .object(["type": .string("string"), "enum": .array(strings.map(Value.string))]) }
-    static func integer(_ minimum: Int = 0, maximum: Int? = nil) -> Value {
-        var fields: [String: Value] = ["type": .string("integer"), "minimum": .int(minimum)]
+    static func values(_ strings: [String]) -> MCPValue { .object(["type": .string("string"), "enum": .array(strings.map(MCPValue.string))]) }
+    static func integer(_ minimum: Int = 0, maximum: Int? = nil) -> MCPValue {
+        var fields: [String: MCPValue] = ["type": .string("integer"), "minimum": .int(minimum)]
         if let maximum { fields["maximum"] = .int(maximum) }; return .object(fields)
     }
-    static func array(_ item: Value, maximum: Int? = nil) -> Value {
-        var fields: [String: Value] = ["type": .string("array"), "items": item]
+    static func array(_ item: MCPValue, maximum: Int? = nil) -> MCPValue {
+        var fields: [String: MCPValue] = ["type": .string("array"), "items": item]
         if let maximum { fields["maxItems"] = .int(maximum) }; return .object(fields)
     }
-    static func nullable(_ item: Value) -> Value { .object(["anyOf": .array([item, .object(["type": .string("null")])])]) }
-    static func ref(_ name: String) -> Value { .object(["$ref": .string("#/$defs/" + name)]) }
-    static let boolean = Value.object(["type": .string("boolean")])
+    static func nullable(_ item: MCPValue) -> MCPValue { .object(["anyOf": .array([item, .object(["type": .string("null")])])]) }
+    static func ref(_ name: String) -> MCPValue { .object(["$ref": .string("#/$defs/" + name)]) }
+    static let boolean = MCPValue.object(["type": .string("boolean")])
     static let identifier = string(pattern: "^\\S+$")
     static let key = string(maximum: 32, minimum: 32, pattern: "^[0-9a-f]{32}$")
     static let positiveDecimal = string(maximum: 19, pattern: "^[1-9][0-9]*$")
@@ -65,7 +64,7 @@ private enum ToolSchema {
     static let keyed = object(["account": account, "requestKey": key])
     static let effect = values(EffectKind.allCases.map(\.rawValue))
 
-    static func input(_ method: CapabilityMethod) -> Value {
+    static func input(_ method: CapabilityMethod) -> MCPValue {
         switch method {
         case .listWallets: page
         case .listAccounts: object(["wallet": wallet, "page": page])
@@ -81,12 +80,12 @@ private enum ToolSchema {
                 object(["operation": selector]), object(["account": account, "effect": effect, "requestKey": key])])])
         }
     }
-    private static func paged(_ item: Value) -> Value { object(["items": array(item, maximum: PageRequest.maximumCount), "nextCursor": nullable(identifier)]) }
-    private static func accountPage(_ item: Value) -> Value {
+    private static func paged(_ item: MCPValue) -> MCPValue { object(["items": array(item, maximum: PageRequest.maximumCount), "nextCursor": nullable(identifier)]) }
+    private static func accountPage(_ item: MCPValue) -> MCPValue {
         object(["account": account, "observation": ref("observation"), "page": paged(item), "readiness": ref("readiness")])
     }
-    static func output(_ method: CapabilityMethod) -> Value {
-        let result: Value
+    static func output(_ method: CapabilityMethod) -> MCPValue {
+        let result: MCPValue
         switch method {
         case .listWallets: result = paged(object(["scope": wallet, "availability": values(["unavailable", "recoveryRequired", "restricted", "enabled"])]))
         case .listAccounts: result = object(["wallet": wallet, "page": paged(object(["scope": account, "readiness": ref("readiness")]))])
@@ -113,7 +112,7 @@ private enum ToolSchema {
             "transportBusy", "networkUnavailable", "keyUnavailable", "recoveryRequired", "invalidTransition", "relayNotEligible"])])])
         return .object(["type": .string("object"), "oneOf": .array([success, failure]), "$defs": .object(definitions)])
     }
-    private static var definitions: [String: Value] {
+    private static var definitions: [String: MCPValue] {
         let blocker = values(["unavailable", "authorizationUnavailable", "continuityUnavailable", "historyIncomplete", "custodyUnavailable",
             "accountRestricted", "keyUnavailable", "networkUnavailable", "staleSnapshot", "incompleteSnapshot", "approvalNeeded", "leaseExpired",
             "transportBusy", "staleContext", "staleEvidence", "inconclusiveEvidence", "automaticRelayBudgetExhausted", "evidenceDefect", "leaseCleanupFailed", "relayNotEligible"])

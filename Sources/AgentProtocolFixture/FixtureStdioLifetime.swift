@@ -1,26 +1,24 @@
 #if DEBUG
 import AgentMCP
 import Foundation
-import MCP
 
-/// Runs host-owned admission closure on input termination before the SDK joins suspended handlers.
+/// Runs host-owned admission closure on input termination before the protocol server joins suspended handlers.
 /// The host chooses explicit fixture-fault release separately and awaits factual drain.
-actor FixtureStdioLifetime: MCP.Transport {
-    nonisolated let logger = MCP.InMemoryTransport().logger
-    private let base: any MCP.Transport
+actor FixtureStdioLifetime: MCPTransport {
+    private let base: any MCPTransport
     private let ended: @Sendable () async -> Void
     private let outputSendFailed: @Sendable () async -> Void
     private var reader: Task<Void, Never>?
     private var disconnecting = false
     private var activeSends = 0
     private var sendWaiters: [CheckedContinuation<Void, Never>] = []
-    init(base: any MCP.Transport, ended: @escaping @Sendable () async -> Void,
+    init(base: any MCPTransport, ended: @escaping @Sendable () async -> Void,
          outputSendFailed: @escaping @Sendable () async -> Void = {}) {
         self.base = base; self.ended = ended; self.outputSendFailed = outputSendFailed
     }
     func connect() async throws { try await base.connect() }
     func send(_ data: Data) async throws {
-        guard !disconnecting else { throw MCPError.connectionClosed }
+        guard !disconnecting else { throw MCPTransportError.connectionClosed }
         activeSends += 1
         defer {
             activeSends -= 1
@@ -45,8 +43,8 @@ actor FixtureStdioLifetime: MCP.Transport {
                         try Task.checkCancellation()
                         switch continuation.yield(data) {
                         case .enqueued: break
-                        case .dropped, .terminated: throw MCPError.invalidRequest("Input capacity exceeded")
-                        @unknown default: throw MCPError.connectionClosed
+                        case .dropped, .terminated: throw MCPTransportError.invalidRequest("Input capacity exceeded")
+                        @unknown default: throw MCPTransportError.connectionClosed
                         }
                     }
                     await ended()
@@ -64,7 +62,7 @@ actor FixtureStdioLifetime: MCP.Transport {
         disconnecting = true
         reader?.cancel()
         // Release queued lower sends before joining their observers. A send retires
-        // before rethrowing into ProfileTransport's own disconnect, avoiding self-join.
+        // before rethrowing into the protocol server's disconnect, avoiding self-join.
         await base.disconnect()
         if activeSends > 0 {
             await withCheckedContinuation { sendWaiters.append($0) }

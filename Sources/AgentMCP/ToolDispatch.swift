@@ -1,14 +1,13 @@
 import AgentClient
 import AgentValues
 import Foundation
-import MCP
 
 /// A thin protocol adapter. The injected capability channel owns authenticated service access.
 public struct ToolDispatch: Sendable {
     private let client: CapabilityClient
     public init(client: CapabilityClient = CapabilityClient()) { self.client = client }
 
-    public func call(name: String, arguments: [String: Value]?) async -> CallTool.Result {
+    public func call(name: String, arguments: [String: MCPValue]?) async -> MCPToolResult {
         guard let method = CapabilityMethod(rawValue: name) else {
             MCPDiagnostics.toolFailed(stage: .method, reason: .invalidRequest)
             return Self.failure(.invalidRequest)
@@ -30,14 +29,14 @@ public struct ToolDispatch: Sendable {
             return Self.failure(.unavailable)
         }
     }
-    private static func failure(_ code: ServiceProblemCode) -> CallTool.Result {
+    private static func failure(_ code: ServiceProblemCode) -> MCPToolResult {
         // This fixed shape always encodes; no error description, arguments or service row is reflected.
-        (try? result(ToolOutput.failure(code), isError: true)) ?? CallTool.Result(content: [], isError: true)
+        (try? result(ToolOutput.failure(code), isError: true)) ?? MCPToolResult(content: [], isError: true)
     }
-    private static func result(_ value: Value, isError: Bool) throws -> CallTool.Result {
+    private static func result(_ value: MCPValue, isError: Bool) throws -> MCPToolResult {
         try ToolValueBudget.validate(value)
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         let text = String(decoding: try encoder.encode(value), as: UTF8.self)
-        return CallTool.Result(content: [.text(text: text, annotations: nil, _meta: nil)], structuredContent: Optional.some(value), isError: isError)
+        return MCPToolResult(content: [.text(text: text, annotations: nil, _meta: nil)], structuredContent: Optional.some(value), isError: isError)
     }
 }

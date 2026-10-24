@@ -2,7 +2,7 @@ import AgentClient
 import AgentMCP
 import AgentValues
 import Foundation
-import MCP
+import AgentMCPTestSupport
 import Testing
 @testable import AgentProtocolFixture
 @testable import AgentServiceCore
@@ -18,10 +18,10 @@ func wireEventually(_ description: String, _ predicate: () async throws -> Bool)
     throw WireFixtureFailure.deadline
 }
 struct WireReply: Sendable {
-    let fields: [String: MCP.Value]
+    let fields: [String: MCPValue]
     let isError: Bool?
-    var result: [String: MCP.Value] { fields["result"]?.objectValue ?? [:] }
-    var operation: [String: MCP.Value] { result["operation"]?.objectValue ?? result }
+    var result: [String: MCPValue] { fields["result"]?.objectValue ?? [:] }
+    var operation: [String: MCPValue] { result["operation"]?.objectValue ?? result }
     var errorCode: String? { fields["error"]?.objectValue?["code"]?.stringValue }
     var operationID: String? {
         operation["identity"]?.objectValue?["selector"]?.objectValue?["operationID"]?.stringValue
@@ -29,17 +29,22 @@ struct WireReply: Sendable {
 }
 
 /// Drops exactly one already-produced tool reply. No business inputs or service outcomes are replaced.
-actor DropToolReplyTransport: MCP.Transport {
-    nonisolated let logger = MCP.InMemoryTransport().logger
-    private let base: MCP.InMemoryTransport
+actor DropToolReplyTransport: MCPTransport {
+    private let base: TestMCPMemoryTransport
     private let tool: String
-    private var target: MCP.Value?
+    private var target: MCPValue?
+    private var reader: Task<Void, Never>?
     private(set) var didDrop = false
-    init(base: MCP.InMemoryTransport, tool: String) { self.base = base; self.tool = tool }
+    init(base: TestMCPMemoryTransport, tool: String) { self.base = base; self.tool = tool }
     func connect() async throws { try await base.connect() }
-    func disconnect() async { await base.disconnect() }
+    func disconnect() async {
+        reader?.cancel()
+        await base.disconnect()
+        await reader?.value
+        reader = nil
+    }
     func send(_ data: Data) async throws {
-        let value = try? JSONDecoder().decode([String: MCP.Value].self, from: data)
+        let value = try? JSONDecoder().decode([String: MCPValue].self, from: data)
         if !didDrop, let target, value?["id"] == target,
            value?["result"] != nil || value?["error"] != nil { didDrop = true; return }
         try await base.send(data)
@@ -57,11 +62,12 @@ actor DropToolReplyTransport: MCP.Transport {
                     continuation.finish()
                 } catch { continuation.finish(throwing: error) }
             }
+            reader = task
             continuation.onTermination = { _ in task.cancel() }
         }
     }
     private func record(_ data: Data) {
-        guard let value = try? JSONDecoder().decode([String: MCP.Value].self, from: data),
+        guard let value = try? JSONDecoder().decode([String: MCPValue].self, from: data),
               value["method"]?.stringValue == "tools/call",
               value["params"]?.objectValue?["name"]?.stringValue == tool else { return }
         target = value["id"]
@@ -69,18 +75,18 @@ actor DropToolReplyTransport: MCP.Transport {
 }
 
 final class WireSession: Sendable {
-    let client: MCP.Client
+    let client: MCPTestClient
     let server: MCPToolServer
     let drop: DropToolReplyTransport?
     let admission: FixtureClientSession
-    private init(client: MCP.Client, server: MCPToolServer, drop: DropToolReplyTransport?, admission: FixtureClientSession) {
+    private init(client: MCPTestClient, server: MCPToolServer, drop: DropToolReplyTransport?, admission: FixtureClientSession) {
         self.client = client; self.server = server; self.drop = drop; self.admission = admission
     }
     static func connect(session admission: FixtureClientSession, dropping tool: String? = nil) async throws -> WireSession {
-        let pair = await MCP.InMemoryTransport.createConnectedPair()
+        let pair = await TestMCPMemoryTransport.createConnectedPair()
         let server = MCPToolServer(client: admission.client)
         let drop = tool.map { DropToolReplyTransport(base: pair.server, tool: $0) }
-        let client = MCP.Client(name: "OpalAgent synthetic integration", version: "1.0.0")
+        let client = MCPTestClient(name: "OpalAgent synthetic integration", version: "1.0.0")
         do {
             if let drop { try await server.start(transport: drop) }
             else { try await server.start(transport: pair.server) }
@@ -89,13 +95,12 @@ final class WireSession: Sendable {
             return WireSession(client: client, server: server, drop: drop, admission: admission)
         } catch { await admission.close(); await client.disconnect(); await server.stop(); throw error }
     }
-    func call(_ name: String, _ arguments: [String: MCP.Value]) async throws -> WireReply {
-        let context = try await client.send(CallTool.request(.init(name: name, arguments: arguments)))
-        let reply = try await context.value
+    func call(_ name: String, _ arguments: [String: MCPValue]) async throws -> WireReply {
+        let reply = try await client.callTool(name: name, arguments: arguments)
         guard reply.content.count == 1, case let .text(text, _, _) = reply.content[0] else {
             throw WireFixtureFailure.invalidReply
         }
-        let fields = try JSONDecoder().decode([String: MCP.Value].self, from: Data(text.utf8))
+        let fields = try JSONDecoder().decode([String: MCPValue].self, from: Data(text.utf8))
         #expect(reply.structuredContent == .object(fields))
         if reply.isError != true { #expect(fields["method"]?.stringValue == name && fields["ok"]?.boolValue == true) }
         return WireReply(fields: fields, isError: reply.isError)
@@ -110,7 +115,7 @@ final class WireSession: Sendable {
 func fixtureDirectory() -> URL {
     FileManager.default.temporaryDirectory.appendingPathComponent("opal-agent-protocol-\(UUID().uuidString)")
 }
-func accountValue(_ fixture: FixtureRuntime) -> MCP.Value {
+func accountValue(_ fixture: FixtureRuntime) -> MCPValue {
     .object(["wallet": .object(["walletID": .string(fixture.account.wallet.walletID), "network": .string("mainnet")]),
              "accountID": .string(fixture.account.accountID)])
 }
@@ -118,13 +123,13 @@ func key(_ index: Int) -> String {
     let suffix = String(index, radix: 16)
     return String(repeating: "0", count: 32 - suffix.count) + suffix
 }
-func keyed(_ fixture: FixtureRuntime, _ index: Int) -> [String: MCP.Value] {
+func keyed(_ fixture: FixtureRuntime, _ index: Int) -> [String: MCPValue] {
     ["account": accountValue(fixture), "requestKey": .string(key(index))]
 }
-func selector(_ fixture: FixtureRuntime, _ id: String) -> [String: MCP.Value] {
+func selector(_ fixture: FixtureRuntime, _ id: String) -> [String: MCPValue] {
     ["account": accountValue(fixture), "operationID": .string(id)]
 }
-func payment(_ fixture: FixtureRuntime, _ index: Int) -> [String: MCP.Value] {
+func payment(_ fixture: FixtureRuntime, _ index: Int) -> [String: MCPValue] {
     var result = keyed(fixture, index)
     result["destinationAddress"] = .string(FixtureRuntime.destination)
     result["amountSatoshis"] = .string("10000")

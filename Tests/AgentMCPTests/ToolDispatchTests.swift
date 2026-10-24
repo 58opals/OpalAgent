@@ -1,7 +1,6 @@
 import AgentClient
 import AgentValues
 import Foundation
-import MCP
 import OpalDiagnostics
 import Testing
 @testable import AgentMCP
@@ -31,10 +30,10 @@ private struct ToolFixture: Sendable {
         key = try RequestKey(String(repeating: "a", count: 32))
         selector = try OperationSelector(account: account, operationID: "operation")
     }
-    var walletValue: Value { .object(["walletID": .string(account.wallet.walletID), "network": .string(account.wallet.network.rawValue)]) }
-    var accountValue: Value { .object(["wallet": walletValue, "accountID": .string(account.accountID)]) }
-    var selectorValue: Value { .object(["account": accountValue, "operationID": .string(selector.operationID)]) }
-    func arguments(_ method: CapabilityMethod) -> [String: Value] {
+    var walletValue: MCPValue { .object(["walletID": .string(account.wallet.walletID), "network": .string(account.wallet.network.rawValue)]) }
+    var accountValue: MCPValue { .object(["wallet": walletValue, "accountID": .string(account.accountID)]) }
+    var selectorValue: MCPValue { .object(["account": accountValue, "operationID": .string(selector.operationID)]) }
+    func arguments(_ method: CapabilityMethod) -> [String: MCPValue] {
         switch method {
         case .listWallets: ["limit": .int(2)]
         case .listAccounts: ["wallet": walletValue, "page": .object(["limit": .int(2)])]
@@ -107,8 +106,8 @@ private struct ToolFixture: Sendable {
         return CapabilityResponse(result: result)
     }
 }
-private func toolObject(_ value: Value?) throws -> [String: Value] { try #require(value?.objectValue) }
-private func toolCode(_ result: CallTool.Result) throws -> String {
+private func toolObject(_ value: MCPValue?) throws -> [String: MCPValue] { try #require(value?.objectValue) }
+private func toolCode(_ result: MCPToolResult) throws -> String {
     let outer = try toolObject(result.structuredContent)
     let error = try toolObject(outer["error"])
     return try #require(error["code"]?.stringValue)
@@ -124,7 +123,7 @@ func toolDispatchRoutesEachOfTwelveMethodsThroughCapabilityClient(_ method: Capa
     let recorded = await calls.values
     #expect(recorded.count == 1 && recorded.first?.method == method)
     guard case .text(let text, _, _) = try #require(result.content.first) else { throw CapabilityFailure.invalidResponse }
-    #expect(try JSONDecoder().decode(Value.self, from: Data(text.utf8)) == result.structuredContent)
+    #expect(try JSONDecoder().decode(MCPValue.self, from: Data(text.utf8)) == result.structuredContent)
 }
 
 @Test func toolDispatchMoneyAndUInt64ContextsNeverPassThroughDouble() async throws {
@@ -146,9 +145,9 @@ func toolDispatchRoutesEachOfTwelveMethodsThroughCapabilityClient(_ method: Capa
     #expect(try toolObject(payment["evidence"])["revision"] == .string(String(UInt64.max)))
 }
 
-@Test(arguments: [Value.int(1), .double(1), .string("1.0"), .string("1e3"), .string("01"), .string("-1"), .string("+1"),
+@Test(arguments: [MCPValue.int(1), .double(1), .string("1.0"), .string("1e3"), .string("01"), .string("-1"), .string("+1"),
     .string(" 1"), .string("1 "), .string("0"), .string(""), .string("2100000000000001"), .string("9223372036854775808")])
-func toolDispatchRejectsNoncanonicalOrOutOfRangeMoneyBeforeTransport(_ amount: Value) async throws {
+func toolDispatchRejectsNoncanonicalOrOutOfRangeMoneyBeforeTransport(_ amount: MCPValue) async throws {
     let fixture = try ToolFixture(); let (dispatch, calls) = fixture.dispatch()
     var arguments = fixture.arguments(.preparePayment); arguments["amountSatoshis"] = amount
     let result = await dispatch.call(name: "prepare_payment", arguments: arguments)
@@ -181,7 +180,7 @@ func toolDispatchRejectsNoncanonicalOrOutOfRangeMoneyBeforeTransport(_ amount: V
 
 @Test func toolDispatchRejectsUnknownNestedFieldsAndUnsupportedSelectors() async throws {
     let fixture = try ToolFixture(); let (dispatch, calls) = fixture.dispatch()
-    let invalid: [(String, [String: Value])] = [
+    let invalid: [(String, [String: MCPValue])] = [
         ("owner_approve", [:]),
         ("get_balance", ["wallet": .object(["walletID": .string("wallet"), "network": .string("mainnet"), "owner": .bool(true)]), "accountID": .string("account")]),
         ("get_balance", ["wallet": .object(["walletID": .string("wallet"), "network": .string("MAINNET")]), "accountID": .string("account")]),

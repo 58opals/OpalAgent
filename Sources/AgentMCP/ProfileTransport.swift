@@ -1,15 +1,12 @@
 import CoreFoundation
 import Foundation
-import Logging
-import MCP
 
-/// A bounded profile gate around the unmodified SDK transport/lifecycle implementation.
-actor ProfileTransport: Transport {
-    nonisolated let logger = Logger(label: "opal.profile", factory: { _ in SwiftLogNoOpLogHandler() })
+/// The single profile, initialization-handoff and request-admission state machine.
+actor ProfileTransport: MCPTransport {
     static let versions: Set<String> = ["2025-11-25", "2025-06-18"]
     private enum Phase { case initialize, initializing(String), initializedNotification, ready, closed }
     private var phase: Phase = .initialize
-    private let base: any Transport
+    private let base: any MCPTransport
     private var reader: Task<Void, Never>?
     private var active: Set<String> = []
     private var usedIDs: Set<String> = []
@@ -18,7 +15,7 @@ actor ProfileTransport: Transport {
     private let stream: AsyncThrowingStream<Data, Error>
     private let continuation: AsyncThrowingStream<Data, Error>.Continuation
 
-    init(base: any Transport) {
+    init(base: any MCPTransport) {
         self.base = base
         (stream, continuation) = AsyncThrowingStream.makeStream(bufferingPolicy: .bufferingOldest(MCPBounds.concurrentRequests))
     }
@@ -46,14 +43,14 @@ actor ProfileTransport: Transport {
         reader = nil
     }
     func send(_ data: Data) async throws {
-        if case .closed = phase { throw MCPError.connectionClosed }
+        if case .closed = phase { throw MCPTransportError.connectionClosed }
         try await sendOpen(data)
     }
     private func sendOpen(_ data: Data) async throws {
         guard data.count <= MCPBounds.outputBytes,
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let key = Self.idKey(object["id"]) else { throw MCPError.connectionClosed }
-        // SDK failures are deliberately projected without developer descriptions or supplied fields.
+              let key = Self.idKey(object["id"]) else { throw MCPTransportError.connectionClosed }
+        // Protocol failures never reflect developer descriptions or supplied fields.
         let safe: Data
         if let error = object["error"] as? [String: Any] {
             let code = (error["code"] as? NSNumber)?.intValue ?? -32603
@@ -71,7 +68,7 @@ actor ProfileTransport: Transport {
                 else { phase = .initialize }
             }
             active.remove(key)
-        } catch { await close(); throw MCPError.connectionClosed }
+        } catch { await close(); throw MCPTransportError.connectionClosed }
     }
     private func process(_ frame: Data) async {
         // Await the observable response handoff before admitting the next frame. The lower
@@ -101,7 +98,7 @@ actor ProfileTransport: Transport {
         }
         if let requestKey {
             // MCP requires session-unique IDs. Bound their retention and require reconnect
-            // at the session limit rather than risking SDK handler-map aliasing.
+            // at the session limit rather than risking handler-map aliasing.
             guard usedIDs.count < 4096, usedIDs.insert(requestKey).inserted else {
                 try? await reject(id, code: -32600); await close(); return
             }
@@ -111,10 +108,10 @@ actor ProfileTransport: Transport {
         do {
             if method == "initialize" {
                 guard case .initialize = phase, let requestKey else { try await reject(id, code: -32600); return }
-                guard var parameters = params,
+                guard let parameters = params,
                       Set(parameters.keys).isSubset(of: ["protocolVersion", "capabilities", "clientInfo", "_meta"]),
                       let version = parameters["protocolVersion"] as? String,
-                      var capabilities = parameters["capabilities"] as? [String: Any],
+                      let capabilities = parameters["capabilities"] as? [String: Any],
                       let info = parameters["clientInfo"] as? [String: Any],
                       Self.validClientInfo(info), Self.validKnownCapabilities(capabilities),
                       parameters["_meta"] == nil || parameters["_meta"] is [String: Any] else {
@@ -125,12 +122,10 @@ actor ProfileTransport: Transport {
                     await close()
                     return
                 }
-                // Only the reproduced optional object-valued experimental map is ignored.
-                if let experimental = capabilities["experimental"] as? [String: Any],
-                   !experimental.isEmpty, experimental.values.allSatisfy({ $0 is [String: Any] }) {
-                    capabilities.removeValue(forKey: "experimental")
-                    parameters["capabilities"] = capabilities
-                    object["params"] = parameters
+                // The former typed SDK decoder rejected malformed optional metadata with
+                // a sanitized internal error. Keep that wire contract without its decoder.
+                guard Self.validOptionalClientInfo(info) else {
+                    try await reject(id, code: -32603); return
                 }
                 phase = .initializing(requestKey)
             } else if method == "notifications/initialized" {
@@ -158,7 +153,7 @@ actor ProfileTransport: Transport {
                           params["_meta"] == nil || params["_meta"] is [String: Any],
                           Self.idKey(params["requestId"]) != nil,
                           params["reason"] == nil || params["reason"] is String else { return }
-                    // Cancelled SDK requests need not reply. Retain their slot until reconnect,
+                    // Cancelled requests need not reply. Retain their slot until reconnect,
                     // preventing repeated cancellation from admitting unbounded handler tasks.
                 default:
                     if id != nil { try await reject(id, code: -32601) }
@@ -223,8 +218,29 @@ actor ProfileTransport: Transport {
     private static func validClientInfo(_ info: [String: Any]) -> Bool {
         guard let name = info["name"] as? String, let version = info["version"] as? String,
               !name.isEmpty, name.utf8.count <= 256, version.utf8.count <= 128 else { return false }
-        // Implementation metadata never identifies a principal. SDK decoding validates optional fields.
+        // Implementation metadata never identifies a principal.
         return true
+    }
+    private static func validOptionalClientInfo(_ info: [String: Any]) -> Bool {
+        func optional(_ value: Any?, matches predicate: (Any) -> Bool) -> Bool {
+            guard let value, !(value is NSNull) else { return true }
+            return predicate(value)
+        }
+        for key in ["title", "description", "websiteUrl"] {
+            guard optional(info[key], matches: { $0 is String }) else { return false }
+        }
+        return optional(info["icons"]) { value in
+            guard let icons = value as? [[String: Any]] else { return false }
+            return icons.allSatisfy { icon in
+                guard icon["src"] is String,
+                      optional(icon["mimeType"], matches: { $0 is String }),
+                      optional(icon["sizes"], matches: { $0 is [String] }),
+                      optional(icon["theme"], matches: { ($0 as? String).map { ["light", "dark"].contains($0) } == true }) else {
+                    return false
+                }
+                return true
+            }
+        }
     }
     private static func validKnownCapabilities(_ caps: [String: Any]) -> Bool {
         func emptyObjects(_ value: Any, keys: Set<String>) -> Bool {

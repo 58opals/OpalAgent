@@ -1,15 +1,15 @@
 import AgentClient
 import AgentValues
 import Foundation
-import MCP
+import AgentMCPTestSupport
 import Testing
 @testable import AgentMCP
 
 private actor WireInbox {
-    private let transport: InMemoryTransport
+    private let transport: TestMCPMemoryTransport
     private var frames: [Data] = []
     private var task: Task<Void, Never>?
-    init(_ transport: InMemoryTransport) { self.transport = transport }
+    init(_ transport: TestMCPMemoryTransport) { self.transport = transport }
     func start() async throws {
         try await transport.connect()
         task = Task {
@@ -17,14 +17,14 @@ private actor WireInbox {
         }
         await Task.yield()
     }
-    func send(_ object: [String: MCP.Value]) async throws {
+    func send(_ object: [String: MCPValue]) async throws {
         try await transport.send(JSONEncoder().encode(object))
     }
     func raw(_ text: String) async throws { try await transport.send(Data(text.utf8)) }
     func next() async throws -> Data {
         let deadline = ContinuousClock.now.advanced(by: .seconds(3))
         while frames.isEmpty {
-            guard ContinuousClock.now < deadline else { throw MCPError.connectionClosed }
+            guard ContinuousClock.now < deadline else { throw MCPTransportError.connectionClosed }
             try await Task.sleep(for: .milliseconds(2))
         }
         return frames.removeFirst()
@@ -35,13 +35,13 @@ private actor WireInbox {
         await task?.value
     }
 }
-private func initialize(_ version: String = "2025-11-25", capabilities: MCP.Value = .object([:])) -> [String: MCP.Value] {
+private func initialize(_ version: String = "2025-11-25", capabilities: MCPValue = .object([:])) -> [String: MCPValue] {
     ["jsonrpc": "2.0", "id": "init", "method": "initialize", "params": .object([
         "protocolVersion": .string(version), "capabilities": capabilities,
         "clientInfo": .object(["name": "profile-test", "version": "1"])
     ])]
 }
-private func parse(_ data: Data) throws -> [String: MCP.Value] { try JSONDecoder().decode([String: MCP.Value].self, from: data) }
+private func parse(_ data: Data) throws -> [String: MCPValue] { try JSONDecoder().decode([String: MCPValue].self, from: data) }
 private func ready(_ inbox: WireInbox) async throws {
     try await inbox.send(initialize())
     #expect(try parse(await inbox.next())["result"] != nil)
@@ -50,12 +50,18 @@ private func ready(_ inbox: WireInbox) async throws {
 
 @Test(arguments: ["2025-11-25", "2025-06-18"])
 func profilePreservesOnlyQualifiedVersionsAndListsTwelve(_ version: String) async throws {
-    let (client, base) = await InMemoryTransport.createConnectedPair()
-    let inbox = WireInbox(client); try await inbox.start()
-    let server = MCPToolServer(); try await server.start(transport: base)
+    let pair = await TestMCPMemoryTransport.createConnectedPair()
+    let inbox = WireInbox(pair.client); try await inbox.start()
+    let server = MCPToolServer(); try await server.start(transport: pair.server)
+    try await inbox.send(["jsonrpc": "2.0", "id": 7, "method": "ping"])
+    #expect(try parse(await inbox.next()) == ["jsonrpc": "2.0", "id": 7, "result": .object([:])])
     try await inbox.send(initialize(version))
-    let result = try parse(await inbox.next())["result"]?.objectValue
-    #expect(result?["protocolVersion"] == .string(version))
+    let response = try parse(await inbox.next())
+    #expect(response == ["jsonrpc": "2.0", "id": "init", "result": .object([
+        "protocolVersion": .string(version),
+        "capabilities": .object(["tools": .object([:])]),
+        "serverInfo": .object(["name": "OpalAgent", "version": "0.1.0"])
+    ])])
     try await inbox.send(["jsonrpc": "2.0", "method": "notifications/initialized"])
     try await inbox.send(["jsonrpc": "2.0", "id": "list", "method": "tools/list"])
     let listed = try parse(await inbox.next())["result"]?.objectValue?["tools"]?.arrayValue
@@ -64,9 +70,9 @@ func profilePreservesOnlyQualifiedVersionsAndListsTwelve(_ version: String) asyn
 }
 @Test(arguments: ["2024-11-05", "2025-03-26", "2099-01-01"])
 func profileRejectsOtherSDKAndUnknownVersionsWithoutNegotiating(_ version: String) async throws {
-    let (client, base) = await InMemoryTransport.createConnectedPair()
-    let inbox = WireInbox(client); try await inbox.start()
-    let server = MCPToolServer(); try await server.start(transport: base)
+    let pair = await TestMCPMemoryTransport.createConnectedPair()
+    let inbox = WireInbox(pair.client); try await inbox.start()
+    let server = MCPToolServer(); try await server.start(transport: pair.server)
     try await inbox.send(initialize(version))
     let response = try parse(await inbox.next())
     #expect(response["id"] == .string("init"))
@@ -75,31 +81,31 @@ func profileRejectsOtherSDKAndUnknownVersionsWithoutNegotiating(_ version: Strin
     await server.waitUntilCompleted(); await inbox.stop()
 }
 @Test func profileIgnoresOnlyOptionalObjectExperimentalCapability() async throws {
-    let (client, base) = await InMemoryTransport.createConnectedPair()
-    let inbox = WireInbox(client); try await inbox.start()
-    let server = MCPToolServer(); try await server.start(transport: base)
+    let pair = await TestMCPMemoryTransport.createConnectedPair()
+    let inbox = WireInbox(pair.client); try await inbox.start()
+    let server = MCPToolServer(); try await server.start(transport: pair.server)
     try await inbox.send(initialize(capabilities: .object(["experimental": .object(["host/optional": .object([:])])])))
     #expect(try parse(await inbox.next())["result"] != nil)
     await server.stop(); await inbox.stop()
 }
 @Test(arguments: [
-    MCP.Value.object(["roots": .object(["listChanged": .string("true")])]),
+    MCPValue.object(["roots": .object(["listChanged": .string("true")])]),
     .object(["sampling": .object(["tools": .bool(true)])]),
     .object(["elicitation": .object(["form": .object(["owner": .bool(true)])])]),
     .object(["experimental": .object(["a": .object([:]), "b": .string("mixed")])])
 ])
-func profileKeepsKnownAndMixedCapabilityFieldsStrict(_ capabilities: MCP.Value) async throws {
-    let (client, base) = await InMemoryTransport.createConnectedPair()
-    let inbox = WireInbox(client); try await inbox.start()
-    let server = MCPToolServer(); try await server.start(transport: base)
+func profileKeepsKnownAndMixedCapabilityFieldsStrict(_ capabilities: MCPValue) async throws {
+    let pair = await TestMCPMemoryTransport.createConnectedPair()
+    let inbox = WireInbox(pair.client); try await inbox.start()
+    let server = MCPToolServer(); try await server.start(transport: pair.server)
     try await inbox.send(initialize(capabilities: capabilities))
     #expect(try parse(await inbox.next())["error"]?.objectValue?["code"] == .int(-32602))
     await server.stop(); await inbox.stop()
 }
 @Test func profileRejectsMalformedUnknownAndOutOfOrderCallsWithFixedErrors() async throws {
-    let (client, base) = await InMemoryTransport.createConnectedPair()
-    let inbox = WireInbox(client); try await inbox.start()
-    let server = MCPToolServer(); try await server.start(transport: base)
+    let pair = await TestMCPMemoryTransport.createConnectedPair()
+    let inbox = WireInbox(pair.client); try await inbox.start()
+    let server = MCPToolServer(); try await server.start(transport: pair.server)
     try await inbox.raw("{malformed")
     #expect(try parse(await inbox.next())["error"]?.objectValue?["code"] == .int(-32700))
     try await inbox.raw("{}")
@@ -130,20 +136,20 @@ private actor CancellableClientBoundary: CapabilityTransport {
     }
     func waitStarted() async throws {
         let end = ContinuousClock.now.advanced(by: .seconds(3))
-        while started == 0 { guard ContinuousClock.now < end else { throw MCPError.connectionClosed }; try await Task.sleep(for: .milliseconds(2)) }
+        while started == 0 { guard ContinuousClock.now < end else { throw MCPTransportError.connectionClosed }; try await Task.sleep(for: .milliseconds(2)) }
     }
     func waitCancelled() async throws {
         let end = ContinuousClock.now.advanced(by: .seconds(3))
-        while cancelled == 0 { guard ContinuousClock.now < end else { throw MCPError.connectionClosed }; try await Task.sleep(for: .milliseconds(2)) }
+        while cancelled == 0 { guard ContinuousClock.now < end else { throw MCPTransportError.connectionClosed }; try await Task.sleep(for: .milliseconds(2)) }
     }
 }
 enum ProfileCancellationCause: Sendable, CaseIterable { case notification, inputEOF }
 @Test(arguments: ProfileCancellationCause.allCases)
 func profileCancellationAndEOFJoinOwnedToolWork(_ cause: ProfileCancellationCause) async throws {
-    let (client, base) = await InMemoryTransport.createConnectedPair()
-    let inbox = WireInbox(client); try await inbox.start()
+    let pair = await TestMCPMemoryTransport.createConnectedPair()
+    let inbox = WireInbox(pair.client); try await inbox.start()
     let boundary = CancellableClientBoundary()
-    let server = MCPToolServer(client: CapabilityClient(transport: boundary)); try await server.start(transport: base)
+    let server = MCPToolServer(client: CapabilityClient(transport: boundary)); try await server.start(transport: pair.server)
     do {
         try await ready(inbox)
         try await inbox.send(["jsonrpc": "2.0", "id": "held", "method": "tools/call", "params": .object(["name": "list_wallets", "arguments": .object([:])])])
@@ -164,10 +170,38 @@ func profileCancellationAndEOFJoinOwnedToolWork(_ cause: ProfileCancellationCaus
     }
 }
 
+@Test func profileDataURLShapedRequestIDsRemainStringsAndCancelOwnedToolWork() async throws {
+    let pair = await TestMCPMemoryTransport.createConnectedPair()
+    let inbox = WireInbox(pair.client); try await inbox.start()
+    let boundary = CancellableClientBoundary()
+    let server = MCPToolServer(client: CapabilityClient(transport: boundary)); try await server.start(transport: pair.server)
+    do {
+        try await inbox.raw("{\"jsonrpc\":\"2.0\",\"id\":\"data:text/plain;base64,aWQ=\",\"method\":\"ping\"}")
+        // Generic value decoders can interpret data URLs as media; request IDs must stay strings.
+        let replyData = try await inbox.next()
+        let reply = try #require(try JSONSerialization.jsonObject(with: replyData) as? [String: Any])
+        #expect(reply["id"] as? String == "data:text/plain;base64,aWQ=")
+        #expect((reply["result"] as? [String: Any])?.isEmpty == true)
+        #expect(reply["error"] == nil)
+        try await ready(inbox)
+        try await inbox.raw("{\"jsonrpc\":\"2.0\",\"id\":\"data:text/plain;base64,aGVsZA==\",\"method\":\"tools/call\",\"params\":{\"name\":\"list_wallets\",\"arguments\":{}}}")
+        try await boundary.waitStarted()
+        try await inbox.raw("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":\"data:text/plain;base64,aGVsZA==\"}}")
+        // Observe notification-specific cancellation before stop/EOF can cancel the work.
+        try await boundary.waitCancelled()
+        #expect(await boundary.started == 1)
+        #expect(await boundary.cancelled == 1)
+    } catch {
+        await inbox.stop(); await server.stop()
+        throw error
+    }
+    await server.stop(); await inbox.stop()
+}
+
 @Test func profileInvalidNotificationsNeverEmitUnsolicitedNullIDResponse() async throws {
-    let (client, base) = await InMemoryTransport.createConnectedPair()
-    let inbox = WireInbox(client); try await inbox.start()
-    let server = MCPToolServer(); try await server.start(transport: base)
+    let pair = await TestMCPMemoryTransport.createConnectedPair()
+    let inbox = WireInbox(pair.client); try await inbox.start()
+    let server = MCPToolServer(); try await server.start(transport: pair.server)
     try await inbox.send(["jsonrpc": "2.0", "method": "notifications/initialized", "params": .object(["unexpected": .bool(true)])])
     try await ready(inbox)
     try await inbox.send(["jsonrpc": "2.0", "method": "notifications/initialized", "params": .object(["unexpected": .bool(true)])])
@@ -180,10 +214,10 @@ func profileCancellationAndEOFJoinOwnedToolWork(_ cause: ProfileCancellationCaus
     await server.stop(); await inbox.stop()
 }
 
-@Test func profileIntegralNumericIDUsesTheSDKIntegerIdentity() async throws {
-    let (client, base) = await InMemoryTransport.createConnectedPair()
-    let inbox = WireInbox(client); try await inbox.start()
-    let server = MCPToolServer(); try await server.start(transport: base)
+@Test func profileIntegralNumericIDUsesTheIntegerIdentity() async throws {
+    let pair = await TestMCPMemoryTransport.createConnectedPair()
+    let inbox = WireInbox(pair.client); try await inbox.start()
+    let server = MCPToolServer(); try await server.start(transport: pair.server)
     try await inbox.raw("{\"jsonrpc\":\"2.0\",\"id\":1.0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"numeric-id\",\"version\":\"1\"}}}")
     #expect(try parse(await inbox.next())["id"] == .int(1))
     try await inbox.send(["jsonrpc": "2.0", "method": "notifications/initialized"])
@@ -195,10 +229,10 @@ func profileCancellationAndEOFJoinOwnedToolWork(_ cause: ProfileCancellationCaus
 
 @Test(arguments: ["2025-11-25", "2025-06-18"])
 func profileDiscoveryAcceptsInformationalProtocolMetadata(_ version: String) async throws {
-    let (client, base) = await InMemoryTransport.createConnectedPair()
-    let inbox = WireInbox(client); try await inbox.start()
-    let server = MCPToolServer(); try await server.start(transport: base)
-    let metadata: MCP.Value = .object(["traceparent": "00-00000000000000000000000000000001-0000000000000001-01", "owner": .bool(true)])
+    let pair = await TestMCPMemoryTransport.createConnectedPair()
+    let inbox = WireInbox(pair.client); try await inbox.start()
+    let server = MCPToolServer(); try await server.start(transport: pair.server)
+    let metadata: MCPValue = .object(["traceparent": "00-00000000000000000000000000000001-0000000000000001-01", "owner": .bool(true)])
     try await inbox.send(initialize(version))
     #expect(try parse(await inbox.next())["result"] != nil)
     try await inbox.send(["jsonrpc": "2.0", "method": "notifications/initialized", "params": .object(["_meta": metadata])])
@@ -214,21 +248,96 @@ func profileDiscoveryAcceptsInformationalProtocolMetadata(_ version: String) asy
 }
 
 @Test(arguments: [
-    MCP.Value.object(["_meta": .bool(true)]),
+    MCPValue.object(["_meta": .bool(true)]),
     .object(["_meta": .null]),
     .object(["_meta": .array([])]),
     .object(["owner": .bool(true)]),
     .object(["cursor": .string("unissued")]),
     .object(["cursor": .null])
 ])
-func profileDiscoveryKeepsMetadataShapeAndSinglePageCursorStrict(_ params: MCP.Value) async throws {
-    let (client, base) = await InMemoryTransport.createConnectedPair()
-    let inbox = WireInbox(client); try await inbox.start()
-    let server = MCPToolServer(); try await server.start(transport: base)
+func profileDiscoveryKeepsMetadataShapeAndSinglePageCursorStrict(_ params: MCPValue) async throws {
+    let pair = await TestMCPMemoryTransport.createConnectedPair()
+    let inbox = WireInbox(pair.client); try await inbox.start()
+    let server = MCPToolServer(); try await server.start(transport: pair.server)
     try await ready(inbox)
     try await inbox.send(["jsonrpc": "2.0", "id": "invalid-metadata", "method": "tools/list", "params": params])
     #expect(try parse(await inbox.next())["error"]?.objectValue?["code"] == .int(-32602))
     try await inbox.send(["jsonrpc": "2.0", "id": "after-invalid-metadata", "method": "tools/list"])
     #expect(try parse(await inbox.next())["result"]?.objectValue?["tools"]?.arrayValue?.count == 12)
+    await server.stop(); await inbox.stop()
+}
+
+@Test(arguments: [
+    "\"title\":true",
+    "\"description\":7",
+    "\"websiteUrl\":[]",
+    "\"icons\":false",
+    "\"icons\":[{}]",
+    "\"icons\":[{\"src\":7}]",
+    "\"icons\":[{\"src\":\"unused\",\"mimeType\":true}]",
+    "\"icons\":[{\"src\":\"unused\",\"sizes\":[1]}]",
+    "\"icons\":[{\"src\":\"unused\",\"theme\":\"unrecognized\"}]"
+])
+func profileRejectsMalformedOptionalClientMetadataWithoutPoisoningInitialization(_ field: String) async throws {
+    let pair = await TestMCPMemoryTransport.createConnectedPair()
+    let inbox = WireInbox(pair.client); try await inbox.start()
+    let server = MCPToolServer(); try await server.start(transport: pair.server)
+    // Literal wire fields are independent of the owned metadata representation. The prior
+    // SDK typed decode projected these optional-field failures as a fixed -32603 response.
+    try await inbox.raw("{\"jsonrpc\":\"2.0\",\"id\":\"bad-init\",\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"metadata-test\",\"version\":\"1\",\(field)}}}")
+    let rejected = try parse(await inbox.next())
+    #expect(rejected["id"] == .string("bad-init"))
+    #expect(rejected["error"]?.objectValue?["code"] == .int(-32603))
+    #expect(rejected["error"]?.objectValue?["message"] == .string("Request failed"))
+    #expect(rejected["result"] == nil)
+    try await ready(inbox)
+    try await inbox.send(["jsonrpc": "2.0", "id": "after-invalid-client-info", "method": "tools/list"])
+    #expect(try parse(await inbox.next())["result"]?.objectValue?["tools"]?.arrayValue?.count == 12)
+    await server.stop(); await inbox.stop()
+}
+
+@Test(arguments: [
+    "\"title\":null,\"description\":null,\"websiteUrl\":null,\"icons\":null,\"unknown\":{\"owner\":true}",
+    "\"title\":\"Client display name\",\"description\":\"Informational\",\"websiteUrl\":\"not authority\",\"icons\":[{\"src\":\"unused\",\"mimeType\":null,\"sizes\":[\"any\"],\"theme\":\"dark\",\"unknown\":true}]"
+])
+func profileAcceptsOptionalClientMetadataWithoutTreatingItAsAuthority(_ fields: String) async throws {
+    let pair = await TestMCPMemoryTransport.createConnectedPair()
+    let inbox = WireInbox(pair.client); try await inbox.start()
+    let server = MCPToolServer(); try await server.start(transport: pair.server)
+    try await inbox.raw("{\"jsonrpc\":\"2.0\",\"id\":\"init\",\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"metadata-test\",\"version\":\"1\",\(fields)}}}")
+    #expect(try parse(await inbox.next())["result"]?.objectValue?["protocolVersion"] == .string("2025-11-25"))
+    try await inbox.send(["jsonrpc": "2.0", "method": "notifications/initialized"])
+    try await inbox.send(["jsonrpc": "2.0", "id": "after-client-metadata", "method": "tools/call", "params": .object(["name": "list_wallets", "arguments": .object([:])])])
+    let call = try parse(await inbox.next())["result"]?.objectValue
+    #expect(call?["isError"] == .bool(true))
+    #expect(call?["structuredContent"]?.objectValue?["error"]?.objectValue?["code"] == .string("unavailable"))
+    await server.stop(); await inbox.stop()
+}
+
+@Test(arguments: ["null", "false", "1.5", "9007199254740992", "-9007199254740992",
+                  "\"" + String(repeating: "界", count: 43) + "\""])
+func profileRejectsNoncanonicalOrOversizeRequestIDs(_ wireID: String) async throws {
+    let pair = await TestMCPMemoryTransport.createConnectedPair()
+    let inbox = WireInbox(pair.client); try await inbox.start()
+    let server = MCPToolServer(); try await server.start(transport: pair.server)
+    try await inbox.raw("{\"jsonrpc\":\"2.0\",\"id\":\(wireID),\"method\":\"ping\"}")
+    let rejected = try parse(await inbox.next())
+    #expect(rejected["id"] == .null)
+    #expect(rejected["error"]?.objectValue?["code"] == .int(-32600))
+    await server.stop(); await inbox.stop()
+}
+
+@Test(arguments: ["9007199254740991", "-9007199254740991",
+                  "\"" + String(repeating: "a", count: 128) + "\""])
+func profileAcceptsExactRequestIDBounds(_ wireID: String) async throws {
+    let pair = await TestMCPMemoryTransport.createConnectedPair()
+    let inbox = WireInbox(pair.client); try await inbox.start()
+    let server = MCPToolServer(); try await server.start(transport: pair.server)
+    try await inbox.raw("{\"jsonrpc\":\"2.0\",\"id\":\(wireID),\"method\":\"ping\"}")
+    let reply = try parse(await inbox.next())
+    let expectedID = try JSONDecoder().decode(MCPValue.self, from: Data(wireID.utf8))
+    #expect(reply["id"] == expectedID)
+    #expect(reply["result"] == .object([:]))
+    #expect(reply["error"] == nil)
     await server.stop(); await inbox.stop()
 }

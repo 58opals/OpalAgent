@@ -1,14 +1,11 @@
 import AgentClient
 import AgentValues
 import Foundation
-import Logging
-import MCP
 import Testing
 @testable import AgentMCP
 
 /// Holds the actual outbound transport call, rather than delaying receipt of an already-sent frame.
-private actor HeldOutputTransport: Transport {
-    nonisolated let logger = Logger(label: "profile-handoff-test", factory: { _ in SwiftLogNoOpLogHandler() })
+private actor HeldOutputTransport: MCPTransport {
     private let input: AsyncThrowingStream<Data, Error>
     private let incoming: AsyncThrowingStream<Data, Error>.Continuation
     private var connected = false
@@ -25,20 +22,20 @@ private actor HeldOutputTransport: Transport {
     func disconnect() {
         connected = false
         incoming.finish()
-        finishHeld(.failure(MCPError.connectionClosed))
+        finishHeld(.failure(MCPTransportError.connectionClosed))
     }
     func holdNextResponse(id: String) { holdID = id }
-    func feed(_ object: [String: Value]) throws {
-        guard connected else { throw MCPError.connectionClosed }
+    func feed(_ object: [String: MCPValue]) throws {
+        guard connected else { throw MCPTransportError.connectionClosed }
         switch incoming.yield(try JSONEncoder().encode(object)) {
         case .enqueued: break
-        case .dropped, .terminated: throw MCPError.connectionClosed
-        @unknown default: throw MCPError.connectionClosed
+        case .dropped, .terminated: throw MCPTransportError.connectionClosed
+        @unknown default: throw MCPTransportError.connectionClosed
         }
     }
     func send(_ data: Data) async throws {
-        guard connected else { throw MCPError.connectionClosed }
-        let object = try JSONDecoder().decode([String: Value].self, from: data)
+        guard connected else { throw MCPTransportError.connectionClosed }
+        let object = try JSONDecoder().decode([String: MCPValue].self, from: data)
         if let id = object["id"]?.stringValue, holdID == id {
             holdID = nil
             heldCount += 1
@@ -47,7 +44,7 @@ private actor HeldOutputTransport: Transport {
             } onCancel: { Task { await self.cancelHeld() } }
         }
         try Task.checkCancellation()
-        guard connected else { throw MCPError.connectionClosed }
+        guard connected else { throw MCPTransportError.connectionClosed }
         output.append(data)
         if let id = object["id"]?.stringValue { handedOff.insert(id) }
     }
@@ -64,17 +61,17 @@ private actor HeldOutputTransport: Transport {
     func waitHeld() async throws {
         let end = ContinuousClock.now.advanced(by: .seconds(3))
         while held == nil {
-            guard ContinuousClock.now < end else { throw MCPError.connectionClosed }
+            guard ContinuousClock.now < end else { throw MCPTransportError.connectionClosed }
             try await Task.sleep(for: .milliseconds(2))
         }
     }
-    func next() async throws -> [String: Value] {
+    func next() async throws -> [String: MCPValue] {
         let end = ContinuousClock.now.advanced(by: .seconds(3))
         while output.isEmpty {
-            guard ContinuousClock.now < end else { throw MCPError.connectionClosed }
+            guard ContinuousClock.now < end else { throw MCPTransportError.connectionClosed }
             try await Task.sleep(for: .milliseconds(2))
         }
-        return try JSONDecoder().decode([String: Value].self, from: output.removeFirst())
+        return try JSONDecoder().decode([String: MCPValue].self, from: output.removeFirst())
     }
 }
 
@@ -96,18 +93,18 @@ private actor HandoffCompletion {
     func wait() async throws {
         let end = ContinuousClock.now.advanced(by: .seconds(3))
         while !completed {
-            guard ContinuousClock.now < end else { throw MCPError.connectionClosed }
+            guard ContinuousClock.now < end else { throw MCPTransportError.connectionClosed }
             try await Task.sleep(for: .milliseconds(2))
         }
     }
 }
-private func handoffInitialize() -> [String: Value] {
+private func handoffInitialize() -> [String: MCPValue] {
     ["jsonrpc": "2.0", "id": "init", "method": "initialize", "params": .object([
         "protocolVersion": "2025-11-25", "capabilities": .object([:]),
         "clientInfo": .object(["name": "held-handoff", "version": "1"])
     ])]
 }
-private func handoffCall(id: String) -> [String: Value] {
+private func handoffCall(id: String) -> [String: MCPValue] {
     ["jsonrpc": "2.0", "id": .string(id), "method": "tools/call", "params": .object([
         "name": "list_wallets", "arguments": .object([:])
     ])]
@@ -129,7 +126,7 @@ private func handoffReady(_ output: HeldOutputTransport) async throws {
         try await output.waitHeld()
         try await output.feed(["jsonrpc": "2.0", "method": "notifications/initialized"])
         try await output.feed(handoffCall(id: "after-init"))
-        // Give the real reader/SDK tasks an opportunity to consume the pipelined input while
+        // Give the real protocol reader tasks an opportunity to consume the pipelined input while
         // the transport call is held. The final historical counter also covers its release.
         try await Task.sleep(for: .milliseconds(50))
         #expect(await boundary.calls == 0)
@@ -187,7 +184,7 @@ func profileDisconnectReleasesHeldResponseAndOwnedReader(_ end: ProfileHandoffEn
     #expect(await boundary.calls == 0)
 }
 
-@Test func profileReusedIDCannotAliasAnSDKHandlerAfterHeldHandoff() async throws {
+@Test func profileReusedIDCannotAliasAHandlerAfterHeldHandoff() async throws {
     let output = HeldOutputTransport()
     let boundary = HandoffClientBoundary(output: output)
     let server = MCPToolServer(client: CapabilityClient(transport: boundary))
@@ -214,6 +211,87 @@ func profileDisconnectReleasesHeldResponseAndOwnedReader(_ end: ProfileHandoffEn
         #expect(await boundary.callsBeforeInitializationHandoff == 0)
     } catch {
         await output.disconnect()
+        await server.stop()
+        throw error
+    }
+}
+
+/// Allows disconnect to finish while connect remains suspended, then connects when released.
+private actor SuspendedConnectTransport: MCPTransport {
+    private let input: AsyncThrowingStream<Data, Error>
+    private let incoming: AsyncThrowingStream<Data, Error>.Continuation
+    private var connectGate: CheckedContinuation<Void, Never>?
+    private var released = false
+    private(set) var connected = false
+    private(set) var sent = 0
+    var isConnectHeld: Bool { connectGate != nil }
+
+    init() {
+        (input, incoming) = AsyncThrowingStream.makeStream(bufferingPolicy: .bufferingOldest(4))
+        // Work is already queued so terminal startup must prevent any later dispatch.
+        incoming.yield(Data("{\"jsonrpc\":\"2.0\",\"id\":\"init\",\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"suspended-connect\",\"version\":\"1\"}}}".utf8))
+        incoming.yield(Data("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}".utf8))
+        incoming.yield(Data("{\"jsonrpc\":\"2.0\",\"id\":\"never-dispatched\",\"method\":\"tools/call\",\"params\":{\"name\":\"list_wallets\",\"arguments\":{}}}".utf8))
+    }
+
+    func connect() async {
+        if !released { await withCheckedContinuation { connectGate = $0 } }
+        connected = true
+    }
+    func disconnect() {
+        connected = false
+        incoming.finish()
+    }
+    func send(_ data: Data) throws {
+        guard connected else { throw MCPTransportError.connectionClosed }
+        sent += 1
+    }
+    func receive() -> AsyncThrowingStream<Data, Error> { input }
+    func releaseConnect() {
+        released = true
+        connectGate?.resume()
+        connectGate = nil
+    }
+    func waitConnectHeld() async throws {
+        let end = ContinuousClock.now.advanced(by: .seconds(3))
+        while connectGate == nil {
+            guard ContinuousClock.now < end else { throw MCPTransportError.connectionClosed }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+    }
+}
+
+private actor StartupClientBoundary: CapabilityTransport {
+    private(set) var calls = 0
+    func send(_ request: CapabilityRequest) async throws -> CapabilityResponse {
+        calls += 1
+        throw ClientFailure.unavailable
+    }
+}
+
+@Test func profileStopDuringSuspendedConnectCannotPublishLateReaderWork() async throws {
+    let output = SuspendedConnectTransport()
+    let boundary = StartupClientBoundary()
+    let server = MCPToolServer(client: CapabilityClient(transport: boundary))
+    let starting = Task { try await server.start(transport: output) }
+    do {
+        try await output.waitConnectHeld()
+        let completed = HandoffCompletion()
+        let stopping = Task { await server.stop(); await completed.finish() }
+        try await completed.wait()
+        await stopping.value
+        #expect(await output.isConnectHeld)
+        #expect(await output.connected == false)
+        await output.releaseConnect()
+        await #expect(throws: MCPTransportError.connectionClosed) { try await starting.value }
+        await server.waitUntilCompleted()
+        await server.stop()
+        #expect(await output.connected == false)
+        #expect(await output.sent == 0)
+        #expect(await boundary.calls == 0)
+    } catch {
+        await output.releaseConnect()
+        _ = try? await starting.value
         await server.stop()
         throw error
     }

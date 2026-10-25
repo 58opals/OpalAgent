@@ -45,7 +45,6 @@ private final class PaymentBoundaryFixture: PaymentExecutionBoundary, @unchecked
     private var sent: [SignedPayment] = []
     private var outcome: PaymentTransportResult = .unknown(source: "fixture")
     private var observation: PaymentObservation?
-    private var cleanupFails = false
     private var delayObservation = false
     private var observations = 0
     private var inputOverride: String?
@@ -68,7 +67,6 @@ private final class PaymentBoundaryFixture: PaymentExecutionBoundary, @unchecked
     func setAdmissionFailure(_ value: PaymentFailure?) { lock.withLock { admissionFailure = value } }
     func setPreflightFailure(_ value: PaymentFailure?) { lock.withLock { preflightFailure = value } }
     func setInput(_ value: String?) { lock.withLock { inputOverride = value } }
-    func setCleanupFailure(_ value: Bool) { lock.withLock { cleanupFails = value } }
     func prepare(_ request: PaymentPreparationInput) async throws -> PaymentPreview {
         await preparationLatch.wait()
         lock.withLock { preparations += 1 }
@@ -104,7 +102,6 @@ private final class PaymentBoundaryFixture: PaymentExecutionBoundary, @unchecked
     }
     func dispose(operationID: String) async throws {
         lock.withLock { disposals += 1 }
-        if lock.withLock({ cleanupFails }) { throw PaymentFailure.networkUnavailable }
     }
     func observe(_ payment: PaymentRecord) async throws -> PaymentObservation {
         let captured = lock.withLock { () -> (PaymentObservation?, Bool) in

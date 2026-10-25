@@ -26,7 +26,7 @@ Requires macOS 27.0, the Xcode 27 family and a compiler supporting Swift tools 6
 
 `AgentServiceCore` is an internal target with no library product. It uses the public `OpalBaseCore` ordinary-BCH product and system SQLite through `CSQLite`. Client and bridge cannot import the engine through a public product. `AgentAppIntents` imports only the public client/values and Apple frameworks, with no engine, Base, SQLite or MCP SDK dependency. `AgentMCP` owns its transport protocol, JSON values, tool models and request tasks without SDK imports. The root package and its tests have no MCP SDK or SwiftLog dependency. Its resolved graph contains only OpalBase, OpalCrypto, OpalDiagnostics, OpalFusion and SwiftFulcrum. The public values/client and native wire targets have no SDK, Base or SQLite dependency. The bridge does not link the engine or privacy integrations.
 
-The package pins public OpalBase revision `d81c9b193a37704eca15b9235250dd02907910da`, which provides `OpalBaseCore`. Agent-owned observations use public OpalDiagnostics revision `aa56dec5d6c8581beb2b3cef43b03dd577ccd9f1`, already shared by the foundation packages. The direct `develop` requirement matches their compatible requirement; the root `Package.resolved` retains the exact canonical public dependency graph.
+The package pins public OpalBase revision `d7038c2d18f89d4805059b0a4f7a84ca525849a1`, which provides `OpalBaseCore`. Agent-owned observations pin public OpalDiagnostics revision `aa56dec5d6c8581beb2b3cef43b03dd577ccd9f1`, already shared by the foundation packages. Both direct requirements use exact revisions; the root `Package.resolved` retains the canonical public dependency graph.
 
 ## Build and test
 
@@ -35,9 +35,13 @@ Run from the package root using an absolute scratch directory outside the source
 ```sh
 swift package --scratch-path "<external-directory>" dump-package
 swift package --scratch-path "<external-directory>" describe
+swift package --scratch-path "<external-directory>" resolve
+git diff --exit-code -- Package.resolved
 swift build --scratch-path "<external-directory>"
 swift test --no-parallel --scratch-path "<external-directory>"
 ```
+
+Resolve the published dependency graph and require the tracked lock to remain unchanged before compilation. The dependency-resolution CI job runs this inexpensive gate on pushes and pull requests.
 
 After the selected developer directory, Xcode build, Swift compiler, SDK or Metal component changes, follow the [toolchain update procedure](Documentation/Toolchains.md) and use a new external build lane. Preserve the existing dependency lock and earlier build/test receipts; an IDE update does not authorize a package update or establish a new validation result.
 

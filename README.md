@@ -30,18 +30,19 @@ The package pins public OpalBase revision `d7038c2d18f89d4805059b0a4f7a84ca52584
 
 ## Build and test
 
-Run from the package root using an absolute scratch directory outside the source tree:
+Run from the package root:
 
 ```sh
-swift package --scratch-path "<external-directory>" dump-package
-swift package --scratch-path "<external-directory>" describe
-swift package --scratch-path "<external-directory>" resolve
-git diff --exit-code -- Package.resolved
-swift build --scratch-path "<external-directory>"
-swift test --no-parallel --scratch-path "<external-directory>"
+scripts/validate.sh
+scripts/validate.sh focused AuthorizationTests
+scripts/validate.sh assurance
 ```
 
-Resolve the published dependency graph and require the tracked lock to remain unchanged before compilation. The dependency-resolution CI job runs this inexpensive gate on pushes and pull requests.
+The default `develop` lane covers the public client, native wire, owned MCP, App Intents and authorization contracts. It is focused feedback, not the complete engine, process-lifecycle or recovery suite. `focused` accepts a literal substring of a discovered test identifier, rejects empty/no-match selections and reports selected/total definitions. `assurance` keeps the complete serial offline suite, including actual SQLite, injected custody and disposable fixture subprocesses. Add leading `--list` to inspect any lane without executing tests.
+
+Discovery compiles the test products and their executable fixtures once using the tracked `Package.resolved`; selected execution reuses those products within that invocation. There is no separate `swift build` prerequisite. SwiftPM checks incremental inputs on subsequent invocations and the script rejects lock changes. The dependency-resolution CI job separately resolves the published graph and checks the lock on pushes and pull requests. Focused validation does not establish full publication, installed-service or custody acceptance.
+
+Build products default to `.build/validation`. Set absolute `OPAL_VALIDATION_SCRATCH_PATH` to select an external or fresh toolchain lane. Do not copy the internal `--skip-build` command for use after source, dependency or toolchain changes.
 
 After the selected developer directory, Xcode build, Swift compiler, SDK or Metal component changes, follow the [toolchain update procedure](Documentation/Toolchains.md) and use a new external build lane. Preserve the existing dependency lock and earlier build/test receipts; an IDE update does not authorize a package update or establish a new validation result.
 
